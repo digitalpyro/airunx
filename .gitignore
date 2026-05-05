@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Environment
+*.env
+*.env.*
+!.env.example
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Worktrees (generated at runtime)
+.worktrees/
+
+# Runtime state (generated during execution)
+.airunx-state/
+
+# Legacy config directories (for backwards compatibility testing)
+.agentos/
+.agents/
+
+# User project config (may be generated during testing)
+# Note: .airunx/ is NOT ignored - it's the project config directory
+# Users should commit their .airunx/settings.json
+
+# Logs
+logs/
+*.log
+.worktrees
+docs/plans/

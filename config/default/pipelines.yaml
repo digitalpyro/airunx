@@ -1,0 +1,160 @@
+# Pipelines Configuration
+#
+# Each pipeline produces a pull request as its deliverable.
+
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
+global:
+  verdict_enum: [ITERATE, PROCEED, BLOCK, FAIL]
+  handoff_schema_version: '1.0'
+  default_tools: [codebase_read]
+
+pipelines:
+  # =============================================================================
+  # THIN PIPELINE - Quick iterations (7 stages, fast fidelity, up to 2 iterations)
+  # Stage order: orchestrate -> strategize -> test -> review -> implement -> analyze -> judge
+  #
+  # Post-graph finalization (handled by pipeline-executor.ts, not graph stages):
+  #   - test verification
+  #   - commit & PR creation (AutoCommit + PRGenerator)
+  #   - CI verification gate (if enabled)
+  #   - issue checkbox marking
+  # =============================================================================
+  thin:
+    name: 'Thin Pipeline'
+    description: 'Quick iterations for small fixes and prototypes'
+    deliverable: pull_request
+    default_fidelity: fast
+    max_iterations: 2
+    timeout_minutes: 30
+    stages:
+      - name: orchestrate
+        agent: orchestrator
+        tools: [gh]
+        ignore_context: true  # Orchestrator coordinates — doesn't need codebase context
+        fidelity: fast  # Short structured output — doesn't need 4096 maxTokens
+
+      - name: strategize
+        agent: developer
+        tools: [codebase_read, docs_search]
+        ignore_context: true  # Strategy uses targeted tool calls instead of full codebase context
+        description: 'Strategic design and architecture decisions'
+
+      - name: test_design
+        agent: test-creator
+        tools: [vitest, phpunit]
+        description: 'Design tests based on strategy'
+
+      - name: review
+        agent: code-reviewer
+        tools: [codebase_read, static_analysis]
+        description: 'Review implementation plan (1 pass for fast)'
+
+      - name: implement
+        agent: developer
+        tools: [codebase_edit, test_runner, build_tools]
+        description: 'Implement with reviewer feedback incorporated'
+
+      - name: analyze
+        agent: static-analyzer
+        tools: [eslint, typescript, phpcs, phpstan, security_scanners]
+        description: 'Static analysis and test failure interpretation'
+
+      - name: judge
+        agent: code-judge
+        tools: [all_outputs, gh]
+        decision: iterate_or_proceed
+        evaluates_stage: implement
+        fidelity: fast  # Short verdict output — doesn't need 4096 maxTokens
+
+  # =============================================================================
+  # STANDARD PIPELINE - Full development lifecycle (8 stages, standard fidelity, up to 2 iterations)
+  # Inherits from thin pipeline with additional docs-generator stage
+  # =============================================================================
+  standard:
+    name: 'Standard Pipeline'
+    description: 'Full development lifecycle for regular development'
+    deliverable: pull_request
+    default_fidelity: standard
+    max_iterations: 2
+    timeout_minutes: 60
+    stages_inherit: thin
+    stage_overrides:
+      - name: orchestrate
+        tools: [gh]
+        ignore_context: true
+
+      - name: review
+        description: 'Review code (3-5 passes for standard)'
+
+      - name: document
+        agent: docs-generator
+        tools: [markdown, changelog]
+        insert_after: judge
+        skip_condition: '!checkbox.generate_documentation'
+        optional: true
+        input: |
+          Generate documentation for this implementation.
+          Write docs to the directory specified by docs_location in Tool Configuration
+          (defaults to docs/ if not configured).
+          Filename format: {feature-summary}-{issueNumOrHash}-YYYYMMDD.md
+          Where:
+            - {feature-summary}: kebab-case, 3-5 words (e.g., user-auth-jwt)
+            - {issueNumOrHash}: GitHub issue number or first 7 chars of commit hash
+            - {YYYYMMDD}: today's date
+          Create the output directory if it doesn't exist.
+          Do NOT write to the project source directory.
+          Do NOT modify existing README.md files.
+        description: 'Generate documentation (opt-in via issue checkbox)'
+
+  # =============================================================================
+  # FEATURE PIPELINE - Production-ready features (9 stages, thorough fidelity, up to 5 iterations)
+  # Inherits from standard pipeline with enhanced_review stage
+  # =============================================================================
+  feature:
+    name: 'Feature Pipeline'
+    description: 'Production-ready features with enhanced review'
+    deliverable: pull_request
+    default_fidelity: thorough
+    max_iterations: 5
+    timeout_minutes: 120
+    stages_inherit: standard
+    stage_overrides:
+      - name: review
+        description: 'Review code (7-10 passes for thorough)'
+
+      - name: enhanced_review
+        agent: code-reviewer
+        tools: [codebase_read, static_analysis, security]
+        insert_after: analyze
+        description: 'Enhanced review for production readiness'
+
+      - name: static_analysis
+        agent: static-analyzer
+        tools: [codebase_read, static_analysis]
+        insert_after: enhanced_review
+        skip_condition: 'iteration.interim'
+        description: 'Static analysis (skipped on interim iterations, runs on first and last only)'
+
+  # =============================================================================
+  # MISSION-CRITICAL PIPELINE - Highest quality (10 stages, ultra fidelity, up to 15 iterations)
+  # Inherits from feature pipeline with security_review stage
+  # =============================================================================
+  mission-critical:
+    name: 'Mission Critical Pipeline'
+    description: 'Highest quality for security and critical infrastructure'
+    deliverable: pull_request
+    default_fidelity: ultra
+    max_iterations: 15
+    timeout_minutes: 480
+    stages_inherit: feature
+    stage_overrides:
+      - name: review
+        description: 'Review code (15-20+ passes for ultra)'
+
+      - name: security_review
+        agent: code-reviewer
+        tools: [security, codebase_read]
+        insert_after: enhanced_review
+        description: 'Dedicated security-focused review'

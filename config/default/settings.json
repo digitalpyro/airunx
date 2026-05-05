@@ -1,0 +1,19 @@
+{
+  "$schema": "./settings.schema.json",
+  "context_location": null,
+  "mcp_json_location": null,
+  "agents_md_location": null,
+  "pipelines_yaml_location": null,
+  "default_project_location": null,
+  "default_fidelity": "standard",
+  "default_backend": "claude-code",
+  "skip_version_check": false,
+  "approval_mode": "auto",
+  "gh_pr_title_rules": null,
+  "gh_pr_label_rules": null,
+  "airunx_signature": true,
+  "workspace_location": "~/.airunx/repos",
+  "env_file_location": null,
+  "ci_verification_gate": false,
+  "mark_issue_checkboxes": true
+}

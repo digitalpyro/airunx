@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+<!--
+  PHP_CodeSniffer (PHPCS) Configuration Template for AIRunX
+
+  This template provides a PSR-12 compliant configuration that works with
+  AIRunX's PHP support. Copy this to your project root as phpcs.xml.
+
+  For documentation on PHPCS configuration:
+  https://github.com/squizlabs/PHP_CodeSniffer/wiki/Configuration-Options
+-->
+<ruleset name="AIRunX PSR-12 Standard">
+    <description>PSR-12 coding standard with AIRunX defaults</description>
+
+    <!-- Arguments -->
+    <arg name="colors"/>
+    <arg value="sp"/>
+    <arg name="extensions" value="php"/>
+    <arg name="parallel" value="8"/>
+
+    <!-- Paths to check -->
+    <file>./src</file>
+    <file>./app</file>
+    <file>./tests</file>
+
+    <!-- Paths to exclude -->
+    <exclude-pattern>*/vendor/*</exclude-pattern>
+    <exclude-pattern>*/node_modules/*</exclude-pattern>
+    <exclude-pattern>*/storage/*</exclude-pattern>
+    <exclude-pattern>*/cache/*</exclude-pattern>
+    <exclude-pattern>*/bootstrap/cache/*</exclude-pattern>
+    <exclude-pattern>*.blade.php</exclude-pattern>
+
+    <!-- Use PSR-12 as the base standard -->
+    <rule ref="PSR12">
+        <!-- Optional: Exclude specific rules if needed -->
+        <!-- <exclude name="PSR12.Files.FileHeader"/> -->
+    </rule>
+
+    <!-- Additional security-focused rules -->
+
+    <!-- Disallow eval() usage -->
+    <rule ref="Generic.PHP.ForbiddenFunctions">
+        <properties>
+            <property name="forbiddenFunctions" type="array">
+                <element key="eval" value="null"/>
+                <element key="exec" value="null"/>
+                <element key="shell_exec" value="null"/>
+                <element key="system" value="null"/>
+                <element key="passthru" value="null"/>
+                <element key="popen" value="null"/>
+                <element key="proc_open" value="null"/>
+                <element key="var_dump" value="null"/>
+                <element key="print_r" value="null"/>
+                <element key="debug_print_backtrace" value="null"/>
+                <element key="mysql_query" value="null"/>
+                <element key="mysql_connect" value="null"/>
+                <element key="create_function" value="null"/>
+                <element key="assert" value="null"/>
+            </property>
+        </properties>
+    </rule>
+
+    <!-- Require lowercase PHP language constants (true, false, null) -->
+    <rule ref="Generic.PHP.LowerCaseConstant"/>
+
+    <!-- Require lowercase PHP keywords -->
+    <rule ref="Generic.PHP.LowerCaseKeyword"/>
+
+    <!-- Disallow deprecated PHP functions -->
+    <rule ref="Generic.PHP.DeprecatedFunctions"/>
+
+    <!-- Line length settings -->
+    <rule ref="Generic.Files.LineLength">
+        <properties>
+            <property name="lineLimit" value="120"/>
+            <property name="absoluteLineLimit" value="150"/>
+        </properties>
+    </rule>
+
+    <!-- Array syntax -->
+    <rule ref="Generic.Arrays.DisallowLongArraySyntax"/>
+
+    <!-- Whitespace rules -->
+    <rule ref="Squiz.WhiteSpace.SuperfluousWhitespace"/>
+
+    <!-- Comment rules -->
+    <rule ref="Squiz.Commenting.DocCommentAlignment"/>
+
+    <!-- String rules -->
+    <rule ref="Squiz.Strings.DoubleQuoteUsage">
+        <exclude name="Squiz.Strings.DoubleQuoteUsage.ContainsVar"/>
+    </rule>
+
+    <!-- Operator spacing -->
+    <rule ref="Squiz.WhiteSpace.OperatorSpacing">
+        <properties>
+            <property name="ignoreNewlines" value="true"/>
+        </properties>
+    </rule>
+
+    <!-- Concatenation spacing -->
+    <rule ref="Squiz.Strings.ConcatenationSpacing">
+        <properties>
+            <property name="spacing" value="1"/>
+            <property name="ignoreNewlines" value="true"/>
+        </properties>
+    </rule>
+</ruleset>

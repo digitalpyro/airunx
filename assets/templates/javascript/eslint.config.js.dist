@@ -1,0 +1,70 @@
+/**
+ * ESLint Flat Config Template for JavaScript Projects
+ *
+ * This template provides a baseline ESLint configuration that works with
+ * AIRunX's JavaScript support. Copy this to your project root as eslint.config.js.
+ *
+ * For documentation on ESLint flat config:
+ * https://eslint.org/docs/latest/use/configure/configuration-files-new
+ *
+ * Required dependencies:
+ *   npm install --save-dev eslint @eslint/js eslint-config-prettier
+ */
+import eslint from '@eslint/js';
+import prettier from 'eslint-config-prettier';
+
+export default [
+  // Base ESLint recommended rules
+  eslint.configs.recommended,
+
+  // JavaScript-specific configuration
+  {
+    files: ['**/*.js', '**/*.mjs', '**/*.cjs'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: {
+        // Node.js globals
+        console: 'readonly',
+        process: 'readonly',
+        Buffer: 'readonly',
+        __dirname: 'readonly',
+        __filename: 'readonly',
+        module: 'readonly',
+        require: 'readonly',
+        exports: 'readonly',
+        // Node.js 18+ built-in globals
+        fetch: 'readonly',
+        AbortController: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+      },
+    },
+    rules: {
+      // General rules
+      'no-console': 'off',
+      'prefer-const': 'error',
+      'no-var': 'error',
+      'no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
+      'eqeqeq': ['error', 'always'],
+      'curly': ['error', 'all'],
+      'no-throw-literal': 'error',
+    },
+  },
+
+  // Test file configuration (relaxed rules)
+  {
+    files: ['**/*.spec.js', '**/*.test.js', 'tests/**/*.js'],
+    rules: {
+      'no-unused-vars': 'off',
+    },
+  },
+
+  // Prettier compatibility (must be last)
+  prettier,
+];

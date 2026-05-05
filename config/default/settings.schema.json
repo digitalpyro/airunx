@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AIRunX Settings",
+  "description": "Configuration settings for AIRunX agent orchestrator",
+  "type": "object",
+  "properties": {
+    "context_location": {
+      "type": ["string", "null"],
+      "description": "Path to context file (e.g., .ai/context.md). Relative paths are resolved from the settings file location."
+    },
+    "mcp_json_location": {
+      "type": ["string", "null"],
+      "description": "Path to MCP servers configuration file (mcp.json). Relative paths are resolved from the settings file location."
+    },
+    "agents_md_location": {
+      "type": ["string", "null"],
+      "description": "Path to AGENTS.md file defining agent roles. Relative paths are resolved from the settings file location. If null, uses the default AGENTS.md."
+    },
+    "pipelines_yaml_location": {
+      "type": ["string", "null"],
+      "description": "Path to pipelines.yaml file defining workflow stages. Relative paths are resolved from the settings file location. If null, uses the default pipelines.yaml."
+    },
+    "default_project_location": {
+      "type": ["string", "null"],
+      "description": "Default project directory to operate in. If null, uses current working directory."
+    },
+    "folders": {
+      "type": "array",
+      "description": "Array of project folders for multi-project support (VSCode workspace compatible). Each entry can be a string path or an object with name and path.",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "Absolute path to project folder",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Display name/alias for the project (defaults to directory basename)",
+                "minLength": 1
+              },
+              "path": {
+                "type": "string",
+                "description": "Absolute path to project folder",
+                "minLength": 1
+              }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "default_fidelity": {
+      "type": "string",
+      "enum": ["fast", "standard", "thorough", "ultra"],
+      "default": "standard",
+      "description": "Default execution fidelity level"
+    },
+    "default_backend": {
+      "type": "string",
+      "enum": ["claude-code", "cursor", "codex"],
+      "default": "claude-code",
+      "description": "Default backend to use for agent execution. Backend details are configured in config.yml."
+    },
+    "tool_configs": {
+      "type": ["object", "null"],
+      "description": "Override default tool configuration paths for linting, testing, formatting, etc.",
+      "properties": {
+        "linter_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom linter config (e.g., eslint.config.js, phpcs.xml)"
+        },
+        "type_checker_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom type checker config (e.g., tsconfig.json)"
+        },
+        "test_runner_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom test runner config (e.g., vitest.config.ts, phpunit.xml)"
+        },
+        "coverage_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom coverage config (often same as test runner config)"
+        },
+        "formatter_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom formatter config (e.g., .prettierrc)"
+        },
+        "security_scanner_config": {
+          "type": ["string", "null"],
+          "description": "Path to custom security scanner config"
+        }
+      },
+      "additionalProperties": false
+    },
+    "approval_mode": {
+      "type": "string",
+      "enum": ["manual", "auto", "yolo"],
+      "default": "auto",
+      "description": "Approval mode for CLI adapters. Controls permission prompts and sandboxing. 'manual' = interactive prompts, 'auto' = auto-approve all actions, 'yolo' = skip all approvals and sandboxing (DANGEROUS)"
+    },
+    "gh_pr_title_rules": {
+      "type": ["object", "null"],
+      "description": "Custom PR title type inference rules. Keys are commit types, values are keyword arrays. Use 'default' key for fallback type.",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "examples": [
+        {
+          "fix": ["fix", "bug", "broken"],
+          "feat": ["add", "implement", "feature"],
+          "default": "feat"
+        }
+      ]
+    },
+    "gh_pr_label_rules": {
+      "type": ["object", "null"],
+      "description": "Custom PR label generation rules",
+      "properties": {
+        "always": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Labels always applied to PRs",
+          "default": ["ai-generated"]
+        },
+        "include_backend": {
+          "type": "boolean",
+          "description": "Add backend-{name} label",
+          "default": true
+        },
+        "include_fidelity": {
+          "type": "boolean",
+          "description": "Add fidelity-{level} label",
+          "default": true
+        },
+        "custom": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional custom labels to apply",
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "airunx_signature": {
+      "type": "boolean",
+      "default": true,
+      "description": "Include airunx signature badge in PR descriptions"
+    },
+    "ci_verification_gate": {
+      "type": "boolean",
+      "default": false,
+      "description": "After creating a PR, poll GitHub Actions and iterate on CI failures (up to 3 attempts). Requires workflows in the repo; no-ops otherwise. When false, PRs can be marked complete with failing CI."
+    },
+    "mark_issue_checkboxes": {
+      "type": "boolean",
+      "default": true,
+      "description": "Mark completed checkboxes on source GitHub issues after pipeline completion. The judge agent identifies which checkboxes were satisfied."
+    }
+  },
+  "additionalProperties": false
+}

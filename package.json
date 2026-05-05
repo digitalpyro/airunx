@@ -1,0 +1,89 @@
+{
+  "name": "airunx",
+  "version": "0.1.0",
+  "description": "Vendor-neutral Agent Orchestrator for developer workflows with LangGraph, AGENTS.md, and multi-agent pipelines",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "airunx": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "config/default",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint src --ext .ts && prettier --check src",
+    "lint:fix": "eslint src --ext .ts --fix && prettier --write src",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "ai:sync": "node scripts/sync-vendor-configs.js",
+    "prepublishOnly": "npm run build && npm test && npm run lint"
+  },
+  "keywords": [
+    "agent",
+    "orchestrator",
+    "langgraph",
+    "cli",
+    "workflow",
+    "automation",
+    "dev-tools",
+    "mcp"
+  ],
+  "author": "DigitalPyro",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/digitalpyro/airunx.git"
+  },
+  "homepage": "https://github.com/digitalpyro/airunx#readme",
+  "bugs": {
+    "url": "https://github.com/digitalpyro/airunx/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.28",
+    "@langchain/langgraph": "^0.2.32",
+    "boxen": "^8.0.1",
+    "chalk": "^5.4.1",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "figlet": "^1.9.4",
+    "gradient-string": "^3.0.0",
+    "handlebars": "^4.7.8",
+    "inquirer": "^12.2.0",
+    "jsonc-parser": "^3.3.1",
+    "ora": "^8.1.1",
+    "proper-lockfile": "^4.1.2",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.1"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-code": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/claude-code": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/figlet": "^1.7.0",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^22.19.1",
+    "@types/proper-lockfile": "^4.1.4",
+    "@typescript-eslint/eslint-plugin": "^8.21.0",
+    "@typescript-eslint/parser": "^8.21.0",
+    "@vitest/coverage-v8": "^4.0.16",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "vitest": "^4.0.16"
+  }
+}

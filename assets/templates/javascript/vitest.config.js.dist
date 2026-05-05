@@ -1,0 +1,56 @@
+/**
+ * Vitest Configuration Template for JavaScript Projects
+ *
+ * This template provides a baseline Vitest configuration that works with
+ * AIRunX's JavaScript support. Copy this to your project root as vitest.config.js.
+ *
+ * For documentation on Vitest configuration:
+ * https://vitest.dev/config/
+ */
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    // Use global test functions (describe, it, expect)
+    globals: true,
+
+    // Node environment for backend testing
+    environment: 'node',
+
+    // Test file patterns
+    include: ['tests/**/*.spec.js', 'tests/**/*.test.js', 'src/**/*.spec.js'],
+
+    // Files to exclude from testing
+    exclude: ['node_modules/', 'dist/', 'coverage/'],
+
+    // Coverage configuration
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html', 'clover'],
+      reportsDirectory: './coverage',
+      exclude: [
+        'node_modules/',
+        'dist/',
+        '**/*.spec.js',
+        '**/*.test.js',
+        '**/*.config.js',
+      ],
+      // Coverage thresholds (adjust based on project requirements)
+      thresholds: {
+        lines: 80,
+        functions: 80,
+        branches: 80,
+        statements: 80,
+      },
+    },
+
+    // Timeout for tests (in ms)
+    testTimeout: 10000,
+
+    // Watch mode settings
+    watch: false,
+
+    // Reporter configuration
+    reporters: ['default'],
+  },
+});
