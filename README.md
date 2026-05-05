@@ -4,10 +4,17 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
+[![CI](https://github.com/digitalpyro/airunx/actions/workflows/ci.yml/badge.svg)](https://github.com/digitalpyro/airunx/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/airunx)](https://www.npmjs.com/package/airunx)
+[![AIRunX Powered](https://img.shields.io/badge/AIRunX-Powered-black?style=flat-square&labelColor=1E3A8A)](https://github.com/digitalpyro/airunx)
 
 ## Overview
 
 AIRunX is a thin, powerful CLI tool that orchestrates multi-agent development workflows. It executes end-to-end development tasks from GitHub issues, PRDs, or developer prompts using intelligent agent pipelines.
+
+<p align="center">
+  <img src="assets/images/airunx-init-v0.1.0.png" alt="AIRunX Init" width="700">
+</p>
 
 ### Key Features
 
