@@ -23,8 +23,28 @@ AIRunX is a thin, powerful CLI tool that orchestrates multi-agent development wo
 - 💓 **Heartbeat Mode**: Continuous agent that polls GitHub Issues as a task queue
 - 🌳 **Git Worktrees**: Spawn parallel PRs from a single machine
 - 📊 **Dashboard**: Real-time status, runtime, tokens used, heartbeat
-- 🔌 **Vendor-Neutral**: Works with Cursor, Claude, Cline, LangGraph
+- 🔌 **Vendor-Neutral**: Works with Claude Code, Codex, Cursor
 - 💰 **Execution Fidelity**: Balance quality vs. cost with 4 fidelity levels (fast, standard, thorough, ultra)
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Pipelines](#pipelines)
+- [Heartbeat Execution Mode](#heartbeat-execution-mode)
+- [Compound Engineering](#compound-engineering)
+- [Architecture](#architecture)
+- [Execution Fidelity](#execution-fidelity)
+- [Approval Modes](#approval-modes)
+- [PR Customization](#pr-customization)
+- [Multi-Provider Architecture](#multi-provider-architecture)
+- [Runtime Configuration Flags](#runtime-configuration-flags)
+- [Configuration](#configuration)
+- [Development](#development)
+- [MCP Integration](#mcp-integration)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 
 ## Installation
 
@@ -70,12 +90,10 @@ Authentication options:
 - **Subscription**: `codex login` (uses your ChatGPT Plus/Team quota)
 - **API Key**: `export OPENAI_API_KEY=sk-...` (pay-per-token)
 
-**Option C: Cursor CLI**
+**Option C: Cursor CLI (experimental — least tested backend)**
 
 ```bash
-curl -o install_cursor.sh https://cursor.com/install
-# ⚠️ SECURITY WARNING: Always inspect scripts before executing
-bash install_cursor.sh
+curl https://cursor.com/install -fsS | bash
 ```
 
 Authentication options:
@@ -150,7 +168,13 @@ airunx doctor
 
 3. **Configure GitHub authentication**:
 
-**Option 1: Environment Variable (recommended for CI/CD and servers)**
+**Option 1: GitHub CLI (recommended for local development)**
+
+```bash
+gh auth login
+```
+
+**Option 2: Environment Variable (recommended for CI/CD and servers)**
 
 ```bash
 export GITHUB_TOKEN=ghp_your_token_here
@@ -158,12 +182,6 @@ export GITHUB_TOKEN=ghp_your_token_here
 
 Required scopes: `repo`, `read:org`
 Create a token at: https://github.com/settings/tokens/new?scopes=repo,read:org
-
-**Option 2: GitHub CLI (recommended for local development)**
-
-```bash
-gh auth login
-```
 
 When both are configured, `GITHUB_TOKEN` takes precedence.
 
@@ -668,6 +686,13 @@ airunx heartbeat recover
 | `airunx:completed` | Successfully finished |
 | `airunx:failed` | Execution failed |
 
+**Priority Labels (optional):**
+| Label | Priority |
+|-------|----------|
+| `airunx:priority:p1` | Critical — processed first |
+| `airunx:priority:p2` | High |
+| `airunx:priority:p3` | Normal (default when no label) |
+
 **Creating Tasks:**
 Create a GitHub Issue with the `airunx:pending` label. Optionally specify a pipeline:
 
@@ -703,9 +728,11 @@ AIRunX uses an autonomous pipeline architecture where each pipeline runs end-to-
 | Pipeline             | Deliverable  | Fidelity | Max Iterations | Timeout | Use Case                   |
 | -------------------- | ------------ | -------- | -------------- | ------- | -------------------------- |
 | **thin**             | Pull Request | fast     | 2              | 30 min  | Quick fixes, prototypes    |
-| **standard**         | Pull Request | standard | 5              | 60 min  | Regular development        |
-| **feature**          | Pull Request | thorough | 8              | 120 min | Important features         |
+| **standard**         | Pull Request | standard | 2              | 60 min  | Regular development        |
+| **feature**          | Pull Request | thorough | 5              | 120 min | Important features         |
 | **mission-critical** | Pull Request | ultra    | 15             | 480 min | Security, critical systems |
+
+> **Pipelines vs. Fidelity:** Pipelines define _which stages run_ and _how many iterations are allowed_. Fidelity controls _how deeply each stage works_ (model selection, verification depth, review rigor). A pipeline's `max_iterations` caps the fidelity's review iteration count. For example, the standard pipeline (max 2 iterations) with thorough fidelity (8 review iterations) will run at most 2 iterations.
 
 ### Execution Pipelines
 
@@ -716,15 +743,15 @@ GitHub Issue/PRD/Prompt
     ↓
 Orchestrator → Plans implementation
     ↓
-Dev Strategic → Designs architecture
+Dev (Strategic) → Designs architecture
     ↓
-Dev Implementation → Writes code
+Test Creator → Designs test strategy
     ↓
 Reviewer → Quality assurance
     ↓
-Static Analyzer → Lint, type check
+Dev (Implementation) → Writes code
     ↓
-Test Creator → Unit/integration tests
+Static Analyzer → Lint, type check
     ↓
 Judge → ITERATE or PROCEED decision
     ↓
@@ -766,7 +793,7 @@ orchestrator  developer    test-creator  code-     developer  static-  code-judg
                                         reviewer             analyzer
 ```
 
-**Standard Pipeline** (standard fidelity, max 3 iterations):
+**Standard Pipeline** (standard fidelity, max 2 iterations):
 
 ```
 Same as thin + docs-generator (document) stage after judge
@@ -914,30 +941,15 @@ The heartbeat includes a circuit breaker to handle backend failures gracefully:
 
 Backoff uses exponential delay with jitter to prevent thundering herd.
 
-## Compound Engineering Influence
+## Compound Engineering
 
-AIRunX incorporates patterns from the [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) methodology developed by [Every](https://every.to). The core philosophy: **each unit of engineering work should make subsequent units easier—not harder**.
+AIRunX uses the [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) plugin by [Every](https://every.to) directly. The CE plugin provides 17+ specialized review agents, workflow skills, and multi-agent delegation for Claude Code sessions. AIRunX also reimplements CE's sub-agent delegation patterns in its own adapter layer (`CompoundEngineeringAdapter`) so they work within automated pipelines.
 
-### How Compound Engineering Works
+The core philosophy: **each unit of engineering work should make subsequent units easier — not harder**. See the [CE plugin repo](https://github.com/EveryInc/compound-engineering-plugin) for full documentation on the methodology.
 
-The Compound Engineering workflow operates through a 4-phase iterative loop:
+### How AIRunX Applies CE Patterns
 
-```
-Plan → Delegate → Assess → Codify → (repeat)
-```
-
-Each phase feeds knowledge into the next cycle, creating systematic improvement:
-
-| Phase        | Purpose                                         | AIRunX Implementation                     |
-| ------------ | ----------------------------------------------- | ----------------------------------------- |
-| **Plan**     | Research-driven planning with codebase analysis | External tooling (Claude Code, PRDs)      |
-| **Delegate** | Break work into trackable todos with validation | TodoManager with status lifecycle         |
-| **Assess**   | Multi-agent review for quality assurance        | Judge agent + Review Coordinator          |
-| **Codify**   | Capture learnings as reusable patterns          | State persistence + workflow resumability |
-
-### Research-Driven Planning
-
-Before implementation, the system conducts multi-layered research:
+**Research-Driven Planning** — Before implementation, the system conducts multi-layered research:
 
 - **Codebase analysis**: Identifies existing patterns and conventions
 - **Documentation review**: Analyzes framework guidance and best practices
@@ -945,129 +957,51 @@ Before implementation, the system conducts multi-layered research:
 
 In AIRunX, scoping and planning are handled externally via Claude Code's planning workflows or PRDs, which are then fed into execution pipelines as GitHub issues.
 
-### Todo System for Compound Effects
-
-The todo system is central to achieving compounding effects. AIRunX implements a filesystem-based task tracker in `.airunx-state/todos/`:
-
-**Task States:**
+**Todo System** — AIRunX implements a filesystem-based task tracker in `.airunx-state/todos/`:
 
 ```
 pending → in_progress → completed
                      ↘ blocked
 ```
 
-**Key Features:**
+Review findings become trackable todos, each iteration captures learnings, and completed work informs future planning. Features include hierarchical task decomposition, thread-safe file locking, rollup generation for PR descriptions, and metadata tracking.
 
-- Hierarchical task decomposition
-- Thread-safe operations with file locking
-- Rollup generation for PR descriptions
-- Metadata tracking (timestamps, priorities)
-
-Each review finding becomes a trackable todo, each iteration captures learnings, and completed work informs future planning.
-
-### Multi-Agent Quality Compounding
-
-Similar to Compound Engineering's 17 specialized agents, AIRunX deploys purpose-built agents at each pipeline stage:
-
-| Agent Type           | Compound Engineering    | AIRunX Equivalent              |
-| -------------------- | ----------------------- | ------------------------------ |
-| Security Review      | security-sentinel       | code-reviewer (security focus) |
-| Performance Analysis | performance-oracle      | static-analyzer                |
-| Architecture Review  | architecture-strategist | developer                      |
-| Quality Decision     | feedback-codifier       | code-judge                     |
-
-### Iteration Loops for Higher Fidelity
-
-The iteration loop ensures quality compounds over time:
-
-```
-Implementation → Review → Judge Decision
-       ↑                      ↓
-       └── ITERATE ←── (gaps found)
-                              ↓
-                      PROCEED (quality met)
-```
-
-Fidelity levels control iteration depth:
-
-- **fast**: 1 pass (prototyping)
-- **standard**: 5 passes (full focused rotation)
-- **thorough**: 8 passes (rotation + deep dives)
-- **ultra**: 15 passes + multi-model consensus (critical systems)
-
-### Iteration History
-
-The orchestrator maintains a history of iteration attempts to help agents avoid repeating failed approaches.
-
-**Flow:**
+**Iteration History** — The orchestrator records each iteration attempt so agents avoid repeating failed approaches:
 
 1. Agent executes implementation
 2. Judge evaluates and returns `{decision, reason, gaps}`
 3. `IterationHistory.record()` captures the attempt
-4. If iterating, agent can query history via `iteration_history` tool
-5. Agent sees what didn't work and recurring gaps
+4. On subsequent iterations, agents query history via the `iteration_history` tool
+5. Recurring gaps are surfaced for priority resolution
 
-**Example history output:**
+**Sub-Agent Delegation** — When using the Claude Code backend, agents can delegate research to specialized sub-agents (architecture-strategist, pattern-recognition-specialist, framework-docs-researcher). This is configurable per-agent via `Provider-Config` in AGENTS.md. Disable globally with `disable_compound_engineering: true` in `settings.json`.
 
-```
-## Previous Iterations (2)
-
-### Approaches That Didn't Work
-- Iteration 1 (ITERATE): Added basic validation
-  Gaps: missing edge case tests, no error handling
-- Iteration 2 (ITERATE): Added error handling
-  Gaps: missing edge case tests
-
-### Recurring Gaps (Address First)
-- missing edge case tests (2x)
-```
-
-This helps agents learn from failed approaches and prioritize recurring issues.
-
-### Git Worktrees for Isolation
-
-Both systems use git worktrees to:
-
-- Develop features in isolated branches
-- Run parallel PR workflows from a single machine
-- Enable clean review processes without context switching
+**Git Worktrees** — Develop features in isolated branches and run parallel PR workflows from a single machine:
 
 ```bash
-# AIRunX automatically creates worktrees
 airunx run "Add feature" --worktree feature-auth
 ```
-
-### The Compounding Effect
-
-Over time, the system improves through:
-
-1. **Knowledge Codification**: Review findings become trackable todos
-2. **Pattern Reuse**: Research agents apply discovered conventions to new work
-3. **Quality Compounding**: Each improved feature makes subsequent features easier
-4. **Systematic Documentation**: Issues, todos, and reviews create institutional memory
-
-This inverts traditional technical debt accumulation—instead of code becoming harder to maintain, it becomes progressively easier as patterns and learnings compound.
 
 ## Architecture
 
 ### Agent Pipeline
 
 ```
-Orchestrator
+Orchestrator ← Plans implementation
     ↓
 Dev (Strategic) ← Problem solving, architecture
     ↓
-Dev (Implementation) ← Code changes
+Test Creator ← Test strategy design
     ↓
 Reviewer ← Quality assurance
     ↓
-Static Analyzer ← Linting, type checking
+Dev (Implementation) ← Code changes
     ↓
-Test Creator ← Unit/integration tests
+Static Analyzer ← Linting, type checking
     ↓
 Judge ← Quality evaluation, iterate decision
     ↓
-Docs ← Documentation updates
+Docs ← Documentation updates (standard+ only)
     ↓
 PR Creation
 ```
@@ -1079,7 +1013,7 @@ PR Creation
 - **TypeScript**: Type-safe implementation
 - **Commander**: CLI framework
 - **Vitest**: Testing framework
-- **MCP**: Multi-channel protocol integrations
+- **MCP**: Model Context Protocol integrations
 
 ## Execution Fidelity
 
@@ -1087,12 +1021,12 @@ AIRunX supports 4 fidelity levels to balance quality with cost:
 
 | Level        | Cost vs. Standard | Use Case                            | Review Iterations | Verification                    |
 | ------------ | ----------------- | ----------------------------------- | ----------------- | ------------------------------- |
-| **fast**     | -65%              | Quick changes, docs, prototyping    | 1                 | Disabled                        |
+| **fast**     | -70%              | Quick changes, docs, prototyping    | 1                 | Disabled                        |
 | **standard** | Baseline          | Regular development, bug fixes      | 5                 | Enabled                         |
 | **thorough** | +50%              | Important features, production code | 8                 | Enabled                         |
-| **ultra**    | +175%             | Critical infrastructure, security   | 15                | Enabled + Multi-model consensus |
+| **ultra**    | +200%             | Critical infrastructure, security   | 15                | Enabled + Multi-model consensus |
 
-> **Note:** Review Iterations is the maximum number of review passes the fidelity level allows. The actual iteration count is capped by the pipeline's `max_iterations` setting. For example, the standard pipeline (max 3 iterations) with thorough fidelity (8 review iterations) will run at most 3 iterations.
+> **Note:** Review Iterations is the maximum number of review passes the fidelity level allows. The actual iteration count is capped by the pipeline's `max_iterations` setting. For example, the standard pipeline (max 2 iterations) with thorough fidelity (8 review iterations) will run at most 2 iterations.
 
 ### Usage
 
@@ -1107,7 +1041,7 @@ airunx run --fidelity ultra "Update payment processing"
 airunx doctor
 ```
 
-See the [Execution Fidelity Guide](./docs/execution-fidelity.md) for detailed configuration options.
+Fidelity can be configured globally via `default_fidelity` in `settings.json` or per-run with `--fidelity`.
 
 ## Approval Modes
 
@@ -1440,8 +1374,6 @@ backends:
 2. AGENTS.md `Model` field (per-agent preferences)
 3. Adapter default model (lowest)
 ```
-
-See the [Multi-Provider Architecture Guide](./docs/multi-provider-architecture.md) for detailed configuration options.
 
 ## Runtime Configuration Flags
 
@@ -2109,7 +2041,7 @@ your-project/
 
 ### Prerequisites
 
-- **Node.js**: >= 18.0.0
+- **Node.js**: >= 18.0.0 (Node 20+ recommended — coverage requires `node:inspector/promises` which is unavailable on Node 18)
 - **npm**: >= 8.0.0
 
 ### Setup & Install
@@ -2185,7 +2117,7 @@ npm install && npm run build && npm test && npm run lint
 
 ## MCP Integration
 
-AIRunX integrates with MCP (Model Context Protocol) servers for rich context gathering.
+AIRunX supports pointing to MCP (Model Context Protocol) configuration via `mcp_json_location` for backends that support it (e.g., Claude Code). The MCP servers are managed by the backend CLI, not by AIRunX itself.
 
 ### Configuring MCPs
 
@@ -2292,8 +2224,8 @@ MIT © [DigitalPyro](https://github.com/digitalpyro)
 
 ## Credits
 
-Built with inspiration from:
+Built with:
 
-- [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) by [Every](https://every.to) - The philosophy that each unit of engineering work should make subsequent units easier
-- [LangGraph](https://github.com/langchain-ai/langgraph) - Orchestration backbone
-- [Claude Code](https://claude.ai) - AI-powered development
+- [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin) by [Every](https://every.to) — Claude Code plugin for multi-agent workflows and quality compounding. AIRunX uses CE patterns in its adapter layer and the CE plugin directly for development sessions.
+- [LangGraph](https://github.com/langchain-ai/langgraph) — Orchestration backbone (DAG/state management)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — AI-powered development CLI
