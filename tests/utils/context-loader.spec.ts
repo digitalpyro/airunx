@@ -184,55 +184,38 @@ describe('Context Loader', () => {
 
   describe('mergeContexts', () => {
     it('should return empty context when no paths provided', async () => {
-      const result = await mergeContexts(null, null, { resolveReferences: false });
+      const result = await mergeContexts(null, null);
 
-      expect(result.projectContext).toBe('');
-      expect(result.runtimeContext).toBe('');
       expect(result.combined).toBe('');
       expect(result.sources).toHaveLength(0);
-      expect(result.resolvedReferences).toHaveLength(0);
-      expect(result.failedReferences).toHaveLength(0);
     });
 
-    it('should load only project context when provided', async () => {
+    it('should create file directive for project context path', async () => {
       vi.mocked(stat).mockResolvedValue(createFileStat() as Stats);
-      vi.mocked(readFile).mockResolvedValue('# Project Context');
 
-      const result = await mergeContexts('/project/context.md', null, { resolveReferences: false });
+      const result = await mergeContexts('/project/context.md', null);
 
-      expect(result.projectContext).toBe('# Project Context');
-      expect(result.runtimeContext).toBe('');
-      expect(result.combined).toBe('# Project Context');
+      expect(result.combined).toContain('Context file: `/project/context.md`');
+      expect(result.combined).toContain('Read this file');
       expect(result.sources).toEqual(['/project/context.md']);
-      expect(result.resolvedReferences).toHaveLength(0);
     });
 
-    it('should load only runtime context when provided', async () => {
+    it('should create file directive for runtime context path', async () => {
       vi.mocked(stat).mockResolvedValue(createFileStat() as Stats);
-      vi.mocked(readFile).mockResolvedValue('# Runtime Context');
 
-      const result = await mergeContexts(null, '/runtime/context.md', { resolveReferences: false });
+      const result = await mergeContexts(null, '/runtime/context.md');
 
-      expect(result.projectContext).toBe('');
-      expect(result.runtimeContext).toBe('# Runtime Context');
-      expect(result.combined).toBe('# Runtime Context');
+      expect(result.combined).toContain('Context file: `/runtime/context.md`');
       expect(result.sources).toEqual(['/runtime/context.md']);
     });
 
-    it('should merge both contexts with separator', async () => {
+    it('should create directives for both paths', async () => {
       vi.mocked(stat).mockResolvedValue(createFileStat() as Stats);
-      vi.mocked(readFile)
-        .mockResolvedValueOnce('# Project Context')
-        .mockResolvedValueOnce('# Runtime Context');
 
-      const result = await mergeContexts('/project/context.md', '/runtime/context.md', { resolveReferences: false });
+      const result = await mergeContexts('/project/context.md', '/runtime/context.md');
 
-      expect(result.projectContext).toBe('# Project Context');
-      expect(result.runtimeContext).toBe('# Runtime Context');
-      expect(result.combined).toContain('# Project Context');
-      expect(result.combined).toContain('# Runtime Context');
-      expect(result.combined).toContain('---');
-      expect(result.combined).toContain('# Additional Runtime Context');
+      expect(result.combined).toContain('/project/context.md');
+      expect(result.combined).toContain('/runtime/context.md');
       expect(result.sources).toEqual(['/project/context.md', '/runtime/context.md']);
     });
 
@@ -243,12 +226,11 @@ describe('Context Loader', () => {
         }
         throw new Error('ENOENT');
       });
-      vi.mocked(readFile).mockResolvedValue('# Runtime Only');
 
-      const result = await mergeContexts('/missing/project.md', '/runtime/context.md', { resolveReferences: false });
+      const result = await mergeContexts('/missing/project.md', '/runtime/context.md');
 
-      expect(result.projectContext).toBe('');
-      expect(result.runtimeContext).toBe('# Runtime Only');
+      expect(result.combined).toContain('/runtime/context.md');
+      expect(result.combined).not.toContain('/missing/project.md');
       expect(result.sources).toEqual(['/runtime/context.md']);
     });
 
@@ -256,7 +238,7 @@ describe('Context Loader', () => {
       vi.mocked(stat).mockRejectedValue(new Error('ENOENT'));
 
       await expect(
-        mergeContexts(null, '/missing/runtime.md', { requireRuntimeContext: true, resolveReferences: false })
+        mergeContexts(null, '/missing/runtime.md', { requireRuntimeContext: true })
       ).rejects.toThrow(ContextLoaderError);
     });
 
@@ -265,102 +247,46 @@ describe('Context Loader', () => {
 
       const result = await mergeContexts(null, '/missing/runtime.md', {
         requireRuntimeContext: false,
-        resolveReferences: false,
       });
 
-      expect(result.runtimeContext).toBe('');
+      expect(result.combined).toBe('');
       expect(result.sources).toHaveLength(0);
     });
 
-    it('should handle directory as context source', async () => {
-      // First call for project context (file)
-      // Second call for runtime context (directory)
-      vi.mocked(stat)
-        .mockResolvedValueOnce(createFileStat() as Stats)
-        .mockResolvedValueOnce(createDirStat() as Stats);
+    it('should create directory directive for directory context', async () => {
+      vi.mocked(stat).mockReset();
+      vi.mocked(stat).mockImplementation(async (path) => {
+        if (path === '/project/context.md') return createFileStat() as Stats;
+        if (path === '/runtime/dir') return createDirStat() as Stats;
+        throw new Error('ENOENT');
+      });
 
-      vi.mocked(readFile)
-        .mockResolvedValueOnce('# Project Context')
-        .mockResolvedValueOnce('Content from dir file');
+      const result = await mergeContexts('/project/context.md', '/runtime/dir');
 
-      vi.mocked(readdir).mockResolvedValue([
-        createFileDirent('context.md'),
-      ] as Dirent[]);
-
-      const result = await mergeContexts('/project/context.md', '/runtime/dir', { resolveReferences: false });
-
-      expect(result.projectContext).toBe('# Project Context');
-      expect(result.runtimeContext).toContain('Content from dir file');
-      expect(result.sources.length).toBeGreaterThanOrEqual(2);
+      expect(result.combined).toContain('Context file: `/project/context.md`');
+      expect(result.combined).toContain('Context directory: `/runtime/dir`');
+      expect(result.combined).toContain('Read the index file');
+      expect(result.sources).toEqual(['/project/context.md', '/runtime/dir']);
     });
   });
 
-  describe('mergeContexts with @mention resolution', () => {
-    it('should resolve @mentions in loaded context', async () => {
-      // Mock the static context file with @mentions
-      vi.mocked(stat).mockImplementation(async (path) => {
-        // Context file exists
-        if (path === '/project/context.md') {
-          return createFileStat() as Stats;
-        }
-        // Referenced file exists
-        if (path === '/project/src/types.ts') {
-          return createFileStat() as Stats;
-        }
-        throw new Error('ENOENT');
-      });
-
-      vi.mocked(readFile).mockImplementation(async (path) => {
-        if (path === '/project/context.md') {
-          return '# Project Context\n\nSee @src/types.ts for type definitions.';
-        }
-        if (path === '/project/src/types.ts') {
-          return 'export type User = { id: string; name: string; };';
-        }
-        throw new Error('ENOENT');
-      });
-
-      const result = await mergeContexts('/project/context.md', null, {
-        workingDirectory: '/project',
-        resolveReferences: true,
-      });
-
-      expect(result.resolvedReferences).toContain('src/types.ts');
-      expect(result.combined).toContain('# Resolved @mentions');
-      expect(result.combined).toContain('export type User');
-    });
-
-    it('should track failed @mention resolutions', async () => {
-      vi.mocked(stat).mockImplementation(async (path) => {
-        if (path === '/project/context.md') {
-          return createFileStat() as Stats;
-        }
-        throw new Error('ENOENT');
-      });
-
-      vi.mocked(readFile).mockResolvedValue(
-        '# Context\n\nSee @src/missing-file.ts for details.'
-      );
-
-      const result = await mergeContexts('/project/context.md', null, {
-        workingDirectory: '/project',
-        resolveReferences: true,
-      });
-
-      expect(result.failedReferences).toHaveLength(1);
-      expect(result.failedReferences[0].path).toBe('src/missing-file.ts');
-    });
-
-    it('should not resolve @mentions when disabled', async () => {
+  describe('mergeContexts — no eager loading', () => {
+    it('should not read any file content', async () => {
       vi.mocked(stat).mockResolvedValue(createFileStat() as Stats);
-      vi.mocked(readFile).mockResolvedValue('# Context with @src/file.ts reference');
 
-      const result = await mergeContexts('/project/context.md', null, {
-        resolveReferences: false,
-      });
+      await mergeContexts('/project/context.md', null);
+
+      // readFile should NOT be called — agent reads files on demand
+      expect(readFile).not.toHaveBeenCalled();
+    });
+
+    it('should not resolve @mentions (agent handles this)', async () => {
+      vi.mocked(stat).mockResolvedValue(createFileStat() as Stats);
+
+      const result = await mergeContexts('/project/context.md', null);
 
       expect(result.resolvedReferences).toHaveLength(0);
-      expect(result.combined).not.toContain('# Resolved @mentions');
+      expect(result.failedReferences).toHaveLength(0);
     });
   });
 

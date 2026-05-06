@@ -1173,6 +1173,7 @@ export interface ParsedAgentDef {
   fallbackProvider?: BackendType;
   model?: string;
   modelRationale?: string;
+  providerConfig?: ProviderConfig;
 }
 
 /**
@@ -1205,6 +1206,7 @@ function toAgentDef(def: ParsedAgentDefinition): ParsedAgentDef | null {
       : undefined,
     model: def.isValidModel ? def.model : undefined,
     modelRationale: def.modelRationale,
+    providerConfig: def.providerConfig,
   };
 }
 

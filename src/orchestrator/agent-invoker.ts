@@ -505,6 +505,7 @@ export class AgentInvoker {
         preferredModel: loadedDef.model,
         provider: loadedDef.provider,
         fallbackProvider: loadedDef.fallbackProvider,
+        providerConfig: loadedDef.providerConfig,
       };
     }
 

@@ -604,8 +604,10 @@ export class LangGraphRunner {
     }
 
     // Build task with user's original request + stage context
-    // CRITICAL: The user's request must be passed to agents, not just generic instructions
-    const userRequest = this.workflowContext.input;
+    // CRITICAL: Use taskDescription (full PRD/issue body/prompt) not input (short title).
+    // input is just the parsed first line — for PRDs it can be "---" (YAML frontmatter).
+    const userRequest =
+      this.workflowContext.taskDescription || this.workflowContext.input;
     const stageDescription = stage.description || `Execute stage: ${stageName}`;
     const stageInput = stage.input || '';
 
