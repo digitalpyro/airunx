@@ -273,28 +273,6 @@ async function loadContextDirectory(
 }
 
 /**
- * Load context from a path, returning empty result if not found
- * (silent failure for optional context)
- *
- * @param contextPath - Path to context file or directory
- * @returns Context content and sources, or empty result
- */
-async function loadContextSilentWithSources(
-  contextPath: string | null | undefined
-): Promise<LoadContextResult> {
-  if (!contextPath) {
-    return { content: '', sources: [] };
-  }
-
-  try {
-    return await loadContextWithSources(contextPath);
-  } catch {
-    logger.debug(`Optional context not found at: ${contextPath}`);
-    return { content: '', sources: [] };
-  }
-}
-
-/**
  * Options for merging contexts
  */
 export interface MergeContextOptions {
@@ -327,94 +305,76 @@ export async function mergeContexts(
   runtimeContextPath: string | null | undefined,
   options: MergeContextOptions = {}
 ): Promise<MergedContext> {
-  const {
-    requireRuntimeContext = true,
-    workingDirectory = process.cwd(),
-    resolveReferences = true,
-    contextResolver,
-  } = options;
-  const sources: string[] = [];
+  const { requireRuntimeContext = true } = options;
+  const contextPaths: string[] = [];
 
-  // Load project context (silent failure - optional)
-  const projectResult = await loadContextSilentWithSources(projectContextPath);
-  const projectContext = projectResult.content;
-  sources.push(...projectResult.sources);
+  // Validate project context path (silent failure - optional)
+  if (projectContextPath) {
+    const pathStat = await stat(projectContextPath).catch(() => null);
+    if (pathStat) {
+      contextPaths.push(projectContextPath);
+    }
+  }
 
-  // Load runtime context
-  let runtimeContext = '';
+  // Validate runtime context path
   if (runtimeContextPath) {
-    try {
-      const runtimeResult = await loadContextWithSources(runtimeContextPath);
-      runtimeContext = runtimeResult.content;
-      sources.push(...runtimeResult.sources);
-    } catch (error) {
-      // Runtime context was explicitly requested, so throw if not found
-      if (requireRuntimeContext) {
-        throw error;
-      }
-      logger.debug(
-        `Optional runtime context not found at: ${runtimeContextPath}`
+    const pathStat = await stat(runtimeContextPath).catch(() => null);
+    if (pathStat) {
+      contextPaths.push(runtimeContextPath);
+    } else if (requireRuntimeContext) {
+      throw new ContextLoaderError(
+        `Context path not found: ${runtimeContextPath}`,
+        runtimeContextPath
       );
     }
   }
 
-  // Merge static contexts
-  const parts = [projectContext, runtimeContext].filter(Boolean);
-  let staticCombined: string;
-
-  if (parts.length === 0) {
-    staticCombined = '';
-  } else if (parts.length === 1) {
-    staticCombined = parts[0];
-  } else {
-    // Add separator between contexts
-    staticCombined = parts.join('\n\n---\n\n# Additional Runtime Context\n\n');
+  if (contextPaths.length === 0) {
+    return {
+      projectContext: '',
+      runtimeContext: '',
+      combined: '',
+      sources: [],
+      resolvedReferences: [],
+      failedReferences: [],
+    };
   }
 
-  // Resolve @mentions in the combined static context
-  let resolvedReferences: string[] = [];
-  let failedReferences: Array<{ path: string; error: string }> = [];
-  let combined = staticCombined;
+  // Build directives for each context path — agents read files on demand
+  const directives: string[] = [];
 
-  if (resolveReferences && staticCombined) {
-    // Use provided resolver for cache sharing, or create new one
-    const resolver = contextResolver ?? new ContextResolver(workingDirectory);
-    const resolveResult = await resolver.resolve(staticCombined);
+  for (const contextPath of contextPaths) {
+    const pathStat = await stat(contextPath);
 
-    if (resolveResult.resolved.length > 0) {
-      resolvedReferences = resolveResult.resolved.map((r) => r.reference.path);
-      logger.info(
-        `Resolved ${resolveResult.resolved.length} @mention(s) in context`
+    if (pathStat.isDirectory()) {
+      directives.push(
+        `Context directory: \`${contextPath}\`\n` +
+          `Read the index file (context.md, README.md, or first .md) then load relevant files based on your task.`
       );
-
-      // Append resolved content to combined context
-      combined =
-        staticCombined +
-        '\n\n---\n\n# Resolved @mentions\n\n' +
-        resolveResult.context;
-    }
-
-    if (resolveResult.failed.length > 0) {
-      failedReferences = resolveResult.failed.map((f) => ({
-        path: f.reference.path,
-        error: f.error,
-      }));
-      logger.warn(
-        `Failed to resolve ${resolveResult.failed.length} @mention(s): ${failedReferences.map((f) => f.path).join(', ')}`
+    } else {
+      directives.push(
+        `Context file: \`${contextPath}\`\n` +
+          `Read this file for project context. Follow any links to related files as needed.`
       );
     }
   }
 
-  logger.debug(
-    `Merged ${sources.length} static source(s), ${resolvedReferences.length} @mention(s) (${combined.length} bytes total)`
+  const combined =
+    '## Project Context\n\n' +
+    directives.join('\n\n') +
+    '\n\nUse the Read tool to load these context files before starting work. ' +
+    'Only read what is relevant to your current task.';
+
+  logger.info(
+    `Context discovery: ${contextPaths.length} path(s) passed to agents`
   );
 
   return {
-    projectContext,
-    runtimeContext,
+    projectContext: '',
+    runtimeContext: '',
     combined,
-    sources,
-    resolvedReferences,
-    failedReferences,
+    sources: contextPaths,
+    resolvedReferences: [],
+    failedReferences: [],
   };
 }

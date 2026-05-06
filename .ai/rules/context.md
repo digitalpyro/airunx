@@ -44,6 +44,7 @@ AIRunX is a **vendor-neutral Agent Orchestrator** that automates developer workf
 | File | Use When |
 |------|----------|
 | [context-infrastructure.md](./context-infrastructure.md) | Setup, dependencies, build system, project structure |
+| [context-tests.md](./context-tests.md) | Writing tests, test design, CI matrix constraints |
 | [context-tools-mcps.md](./context-tools-mcps.md) | GitHub CLI operations, MCP server integration |
 | [context-updater.md](./context-updater.md) | Creating or editing context docs in `.ai/rules/` |
 
