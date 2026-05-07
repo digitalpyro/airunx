@@ -1,0 +1,440 @@
+/* AIRunX Marketing Site — Brand Tokens & Global Styles */
+
+:root {
+  --color-blue: #1E3A8A;
+  --color-silver: #C0C0C0;
+  --color-bg: #0F172A;
+  --color-surface: #1E293B;
+  --color-text: #E2E8F0;
+  --color-text-dim: #94A3B8;
+  --color-border: #334155;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', 'Consolas', monospace;
+}
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  font-size: 16px;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+a {
+  color: var(--color-silver);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+a:hover {
+  color: #fff;
+}
+
+/* ── Fade-in Animation ── */
+
+.fade-in {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+}
+
+.fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ── Hero ── */
+
+.hero {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 4rem 1.5rem 6rem;
+  background: radial-gradient(ellipse at 50% 0%, rgba(30, 58, 138, 0.25) 0%, transparent 60%),
+              var(--color-bg);
+}
+
+.ascii-logo {
+  font-family: var(--font-mono);
+  font-size: clamp(0.35rem, 1.6vw, 0.9rem);
+  line-height: 1.2;
+  background: linear-gradient(135deg, var(--color-blue), var(--color-silver));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 2rem;
+  white-space: pre;
+  display: inline-block;
+}
+
+.tagline {
+  font-size: clamp(1.8rem, 5vw, 3.5rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin-bottom: 1rem;
+  background: linear-gradient(135deg, #fff 0%, var(--color-silver) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  color: var(--color-text-dim);
+  max-width: 600px;
+  margin: 0 auto 2.5rem;
+  line-height: 1.7;
+}
+
+.hero-cta {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.75rem 2rem;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  transition: transform 0.15s, box-shadow 0.15s;
+  cursor: pointer;
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--color-blue), #2563EB);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(30, 58, 138, 0.4);
+}
+
+.btn-primary:hover {
+  color: #fff;
+  box-shadow: 0 6px 28px rgba(30, 58, 138, 0.6);
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--color-silver);
+  border: 1px solid var(--color-border);
+}
+
+.btn-secondary:hover {
+  color: #fff;
+  border-color: var(--color-silver);
+}
+
+/* ── Value Propositions ── */
+
+.value-props {
+  padding: 6rem 1.5rem;
+}
+
+.value-prop {
+  max-width: 800px;
+  margin: 0 auto 5rem;
+  text-align: center;
+}
+
+.value-prop:last-child {
+  margin-bottom: 0;
+}
+
+.value-prop h2 {
+  font-size: clamp(2rem, 5vw, 4rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin-bottom: 1rem;
+  background: linear-gradient(135deg, var(--color-blue), var(--color-silver));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.value-prop p {
+  font-size: clamp(1rem, 2vw, 1.2rem);
+  color: var(--color-text-dim);
+  max-width: 550px;
+  margin: 0 auto;
+  line-height: 1.7;
+}
+
+/* ── Section Titles ── */
+
+.section-title {
+  font-size: clamp(1.8rem, 4vw, 2.5rem);
+  font-weight: 800;
+  text-align: center;
+  margin-bottom: 3rem;
+  letter-spacing: -0.01em;
+}
+
+/* ── Key Features Grid ── */
+
+.features {
+  padding: 6rem 1.5rem;
+  background: linear-gradient(180deg, transparent 0%, rgba(30, 41, 59, 0.3) 50%, transparent 100%);
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.5rem;
+}
+
+.feature-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 2rem;
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.feature-card:hover {
+  border-color: var(--color-blue);
+  box-shadow: 0 0 24px rgba(30, 58, 138, 0.2);
+}
+
+.feature-icon {
+  font-size: 2rem;
+  display: block;
+  margin-bottom: 1rem;
+}
+
+.feature-card h3 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.feature-card p {
+  font-size: 0.95rem;
+  color: var(--color-text-dim);
+  line-height: 1.6;
+}
+
+/* ── How It Works ── */
+
+.how-it-works {
+  padding: 6rem 1.5rem;
+}
+
+.pipeline {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.pipeline-step {
+  text-align: center;
+  padding: 1.5rem 1rem;
+  min-width: 100px;
+}
+
+.step-icon {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+}
+
+.step-label {
+  font-weight: 700;
+  font-size: 1rem;
+  margin-bottom: 0.25rem;
+}
+
+.step-desc {
+  font-size: 0.8rem;
+  color: var(--color-text-dim);
+}
+
+.pipeline-arrow {
+  width: 40px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--color-blue), var(--color-silver));
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pipeline-arrow::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  top: -4px;
+  border: 5px solid transparent;
+  border-left: 6px solid var(--color-silver);
+}
+
+/* ── Quick Start ── */
+
+.quick-start {
+  padding: 6rem 1.5rem;
+  background: linear-gradient(180deg, transparent 0%, rgba(30, 41, 59, 0.3) 50%, transparent 100%);
+}
+
+.terminal {
+  max-width: 640px;
+  margin: 0 auto;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  background: #0A0A0A;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.terminal-header {
+  background: #1A1A1A;
+  padding: 0.75rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.terminal-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.terminal-dot.red { background: #FF5F56; }
+.terminal-dot.yellow { background: #FFBD2E; }
+.terminal-dot.green { background: #27C93F; }
+
+.terminal-title {
+  color: var(--color-text-dim);
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  margin-left: 0.5rem;
+}
+
+.terminal-body {
+  padding: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  line-height: 2;
+}
+
+.terminal-body code {
+  display: block;
+}
+
+.prompt {
+  color: #27C93F;
+  margin-right: 0.5rem;
+}
+
+.cmd {
+  color: var(--color-text);
+}
+
+.str {
+  color: #FFBD2E;
+}
+
+/* ── Footer ── */
+
+.site-footer {
+  padding: 4rem 1.5rem 3rem;
+  text-align: center;
+  border-top: 1px solid var(--color-border);
+}
+
+.footer-badges {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 2rem;
+}
+
+.footer-badges img {
+  height: 20px;
+  width: auto;
+}
+
+.footer-credits {
+  color: var(--color-text-dim);
+  font-size: 0.9rem;
+  line-height: 2;
+}
+
+.footer-credits a {
+  color: var(--color-silver);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 1024px) {
+  .features-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .features-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pipeline {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .pipeline-arrow {
+    width: 2px;
+    height: 30px;
+    background: linear-gradient(180deg, var(--color-blue), var(--color-silver));
+  }
+
+  .pipeline-arrow::after {
+    right: -4px;
+    top: auto;
+    bottom: -1px;
+    border: 5px solid transparent;
+    border-top: 6px solid var(--color-silver);
+    border-left: 5px solid transparent;
+  }
+
+  .hero {
+    min-height: auto;
+    padding: 6rem 1.5rem 4rem;
+  }
+
+  .value-prop {
+    margin-bottom: 3rem;
+  }
+
+  .value-props,
+  .features,
+  .how-it-works,
+  .quick-start {
+    padding: 4rem 1.5rem;
+  }
+}
