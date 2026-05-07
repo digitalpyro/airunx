@@ -8,19 +8,19 @@
   --color-text: #E2E8F0;
   --color-text-dim: #94A3B8;
   --color-border: #334155;
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-  --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', 'Consolas', monospace;
+  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
 }
 
+/* ===== Reset & Base ===== */
 *, *::before, *::after {
+  box-sizing: border-box;
   margin: 0;
   padding: 0;
-  box-sizing: border-box;
 }
 
 html {
   scroll-behavior: smooth;
-  font-size: 16px;
 }
 
 body {
@@ -28,13 +28,7 @@ body {
   background-color: var(--color-bg);
   color: var(--color-text);
   line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-}
-
-.container {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 0 1.5rem;
+  overflow-x: hidden;
 }
 
 a {
@@ -47,54 +41,46 @@ a:hover {
   color: #fff;
 }
 
-/* ── Fade-in Animation ── */
-
-.fade-in {
-  opacity: 0;
-  transform: translateY(24px);
-  transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
 }
 
-.fade-in.visible {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-/* ── Hero ── */
-
+/* ===== Hero ===== */
 .hero {
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 4rem 1.5rem 6rem;
-  background: radial-gradient(ellipse at 50% 0%, rgba(30, 58, 138, 0.25) 0%, transparent 60%),
-              var(--color-bg);
+  padding: 4rem 1.5rem;
+  background: radial-gradient(ellipse at 50% 0%, rgba(30, 58, 138, 0.15) 0%, transparent 60%);
 }
 
 .ascii-logo {
-  font-family: var(--font-mono);
-  font-size: clamp(0.35rem, 1.6vw, 0.9rem);
-  line-height: 1.2;
-  background: linear-gradient(135deg, var(--color-blue), var(--color-silver));
+  font-family: 'Courier New', Courier, monospace;
+  font-size: clamp(0.4rem, 1.4vw, 0.8rem);
+  line-height: 1.0;
+  background: linear-gradient(to right, var(--color-blue), var(--color-silver));
   -webkit-background-clip: text;
-  background-clip: text;
   -webkit-text-fill-color: transparent;
+  background-clip: text;
   margin-bottom: 2rem;
   white-space: pre;
   display: inline-block;
+  transform: scaleY(1.1);
 }
 
 .tagline {
   font-size: clamp(1.8rem, 5vw, 3.5rem);
   font-weight: 800;
   letter-spacing: -0.02em;
-  margin-bottom: 1rem;
-  background: linear-gradient(135deg, #fff 0%, var(--color-silver) 100%);
+  margin-bottom: 0.75rem;
+  background: linear-gradient(to right, #fff, var(--color-silver));
   -webkit-background-clip: text;
-  background-clip: text;
   -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .subtitle {
@@ -102,10 +88,9 @@ a:hover {
   color: var(--color-text-dim);
   max-width: 600px;
   margin: 0 auto 2.5rem;
-  line-height: 1.7;
 }
 
-.hero-cta {
+.cta-buttons {
   display: flex;
   gap: 1rem;
   justify-content: center;
@@ -114,12 +99,11 @@ a:hover {
 
 .btn {
   display: inline-block;
-  padding: 0.75rem 2rem;
+  padding: 0.85rem 2rem;
   border-radius: 8px;
-  font-size: 1rem;
   font-weight: 600;
-  transition: transform 0.15s, box-shadow 0.15s;
-  cursor: pointer;
+  font-size: 1rem;
+  transition: transform 0.2s, box-shadow 0.2s;
 }
 
 .btn:hover {
@@ -134,12 +118,12 @@ a:hover {
 
 .btn-primary:hover {
   color: #fff;
-  box-shadow: 0 6px 28px rgba(30, 58, 138, 0.6);
+  box-shadow: 0 6px 30px rgba(30, 58, 138, 0.6);
 }
 
 .btn-secondary {
-  background: transparent;
-  color: var(--color-silver);
+  background: var(--color-surface);
+  color: var(--color-text);
   border: 1px solid var(--color-border);
 }
 
@@ -148,15 +132,14 @@ a:hover {
   border-color: var(--color-silver);
 }
 
-/* ── Value Propositions ── */
-
+/* ===== Value Propositions ===== */
 .value-props {
-  padding: 6rem 1.5rem;
+  padding: 8rem 1.5rem;
 }
 
 .value-prop {
   max-width: 800px;
-  margin: 0 auto 5rem;
+  margin: 0 auto 6rem;
   text-align: center;
 }
 
@@ -168,41 +151,36 @@ a:hover {
   font-size: clamp(2rem, 5vw, 4rem);
   font-weight: 800;
   letter-spacing: -0.02em;
-  margin-bottom: 1rem;
-  background: linear-gradient(135deg, var(--color-blue), var(--color-silver));
+  margin-bottom: 0.75rem;
+  background: linear-gradient(135deg, var(--color-text), var(--color-silver));
   -webkit-background-clip: text;
-  background-clip: text;
   -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .value-prop p {
-  font-size: clamp(1rem, 2vw, 1.2rem);
+  font-size: clamp(1rem, 2vw, 1.25rem);
   color: var(--color-text-dim);
   max-width: 550px;
   margin: 0 auto;
-  line-height: 1.7;
 }
 
-/* ── Section Titles ── */
-
-.section-title {
-  font-size: clamp(1.8rem, 4vw, 2.5rem);
-  font-weight: 800;
-  text-align: center;
-  margin-bottom: 3rem;
-  letter-spacing: -0.01em;
-}
-
-/* ── Key Features Grid ── */
-
+/* ===== Features Grid ===== */
 .features {
   padding: 6rem 1.5rem;
-  background: linear-gradient(180deg, transparent 0%, rgba(30, 41, 59, 0.3) 50%, transparent 100%);
+  background: linear-gradient(180deg, transparent, rgba(30, 58, 138, 0.05) 50%, transparent);
+}
+
+.section-title {
+  font-size: clamp(1.5rem, 3vw, 2.5rem);
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 3rem;
 }
 
 .features-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 1.5rem;
 }
 
@@ -216,36 +194,34 @@ a:hover {
 
 .feature-card:hover {
   border-color: var(--color-blue);
-  box-shadow: 0 0 24px rgba(30, 58, 138, 0.2);
+  box-shadow: 0 0 20px rgba(30, 58, 138, 0.2);
 }
 
 .feature-icon {
   font-size: 2rem;
   display: block;
-  margin-bottom: 1rem;
+  margin-bottom: 0.75rem;
 }
 
 .feature-card h3 {
-  font-size: 1.2rem;
+  font-size: 1.25rem;
   font-weight: 700;
   margin-bottom: 0.5rem;
 }
 
 .feature-card p {
-  font-size: 0.95rem;
   color: var(--color-text-dim);
-  line-height: 1.6;
+  font-size: 0.95rem;
 }
 
-/* ── How It Works ── */
-
+/* ===== How It Works ===== */
 .how-it-works {
   padding: 6rem 1.5rem;
 }
 
 .pipeline {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   gap: 0.5rem;
   flex-wrap: wrap;
@@ -253,7 +229,7 @@ a:hover {
 
 .pipeline-step {
   text-align: center;
-  padding: 1.5rem 1rem;
+  flex: 0 0 auto;
   min-width: 100px;
 }
 
@@ -271,44 +247,39 @@ a:hover {
 .step-desc {
   font-size: 0.8rem;
   color: var(--color-text-dim);
+  max-width: 120px;
+  margin: 0 auto;
 }
 
 .pipeline-arrow {
-  width: 40px;
-  height: 2px;
-  background: linear-gradient(90deg, var(--color-blue), var(--color-silver));
-  position: relative;
-  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding-top: 1rem;
+  color: var(--color-silver);
 }
 
 .pipeline-arrow::after {
-  content: '';
-  position: absolute;
-  right: -1px;
-  top: -4px;
-  border: 5px solid transparent;
-  border-left: 6px solid var(--color-silver);
+  content: '\2192';
+  font-size: 1.5rem;
+  color: var(--color-blue);
 }
 
-/* ── Quick Start ── */
-
+/* ===== Quick Start ===== */
 .quick-start {
   padding: 6rem 1.5rem;
-  background: linear-gradient(180deg, transparent 0%, rgba(30, 41, 59, 0.3) 50%, transparent 100%);
 }
 
 .terminal {
-  max-width: 640px;
+  max-width: 650px;
   margin: 0 auto;
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid var(--color-border);
-  background: #0A0A0A;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
 }
 
 .terminal-header {
-  background: #1A1A1A;
+  background: #1a1a2e;
   padding: 0.75rem 1rem;
   display: flex;
   align-items: center;
@@ -321,18 +292,19 @@ a:hover {
   border-radius: 50%;
 }
 
-.terminal-dot.red { background: #FF5F56; }
-.terminal-dot.yellow { background: #FFBD2E; }
-.terminal-dot.green { background: #27C93F; }
+.terminal-dot.red { background: #ff5f56; }
+.terminal-dot.yellow { background: #ffbd2e; }
+.terminal-dot.green { background: #27c93f; }
 
 .terminal-title {
-  color: var(--color-text-dim);
-  font-size: 0.8rem;
-  font-family: var(--font-mono);
   margin-left: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--color-text-dim);
+  font-family: var(--font-mono);
 }
 
 .terminal-body {
+  background: #0a0a0a;
   padding: 1.5rem;
   font-family: var(--font-mono);
   font-size: 0.9rem;
@@ -341,32 +313,28 @@ a:hover {
 
 .terminal-body code {
   display: block;
+  white-space: pre;
 }
 
 .prompt {
-  color: #27C93F;
+  color: #27c93f;
   margin-right: 0.5rem;
 }
 
-.cmd {
-  color: var(--color-text);
+.string {
+  color: #ffbd2e;
 }
 
-.str {
-  color: #FFBD2E;
-}
-
-/* ── Footer ── */
-
+/* ===== Footer ===== */
 .site-footer {
-  padding: 4rem 1.5rem 3rem;
-  text-align: center;
+  padding: 4rem 1.5rem;
   border-top: 1px solid var(--color-border);
+  text-align: center;
 }
 
 .footer-badges {
   display: flex;
-  gap: 0.75rem;
+  gap: 0.5rem;
   justify-content: center;
   flex-wrap: wrap;
   margin-bottom: 2rem;
@@ -374,67 +342,55 @@ a:hover {
 
 .footer-badges img {
   height: 20px;
-  width: auto;
 }
 
-.footer-credits {
+.footer-credits p {
   color: var(--color-text-dim);
   font-size: 0.9rem;
-  line-height: 2;
+  margin-bottom: 0.5rem;
 }
 
 .footer-credits a {
   color: var(--color-silver);
-  text-decoration: underline;
-  text-underline-offset: 2px;
 }
 
-/* ── Responsive ── */
-
-@media (max-width: 1024px) {
-  .features-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
+.footer-credits a:hover {
+  color: #fff;
 }
 
+/* ===== Animations ===== */
+.fade-in {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+}
+
+.fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ===== Responsive ===== */
 @media (max-width: 768px) {
+  .pipeline {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .pipeline-arrow {
+    transform: rotate(90deg);
+    padding-top: 0;
+  }
+
   .features-grid {
     grid-template-columns: 1fr;
   }
 
-  .pipeline {
-    flex-direction: column;
-    gap: 0;
-  }
-
-  .pipeline-arrow {
-    width: 2px;
-    height: 30px;
-    background: linear-gradient(180deg, var(--color-blue), var(--color-silver));
-  }
-
-  .pipeline-arrow::after {
-    right: -4px;
-    top: auto;
-    bottom: -1px;
-    border: 5px solid transparent;
-    border-top: 6px solid var(--color-silver);
-    border-left: 5px solid transparent;
-  }
-
-  .hero {
-    min-height: auto;
-    padding: 6rem 1.5rem 4rem;
+  .value-props {
+    padding: 5rem 1.5rem;
   }
 
   .value-prop {
-    margin-bottom: 3rem;
-  }
-
-  .value-props,
-  .features,
-  .how-it-works,
-  .quick-start {
-    padding: 4rem 1.5rem;
+    margin-bottom: 4rem;
   }
 }
