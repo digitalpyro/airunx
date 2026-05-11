@@ -56,7 +56,7 @@ export class QualityGates {
    * Load quality gates from config file
    */
   static async loadFromFile(
-    configPath: string = '.agentos/config.yml'
+    configPath: string = '.airunx/config.yml'
   ): Promise<QualityGates> {
     if (!existsSync(configPath)) {
       logger.info(`Config file not found: ${configPath}, using defaults`);

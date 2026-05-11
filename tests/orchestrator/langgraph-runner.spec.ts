@@ -153,7 +153,7 @@ describe('LangGraph Runner', () => {
     };
 
     // Create state manager
-    stateManager = new StateManager('.agentos/test-langgraph-state');
+    stateManager = new StateManager('.airunx-test/test-langgraph-state');
 
     // Create test pipeline
     testPipeline = {

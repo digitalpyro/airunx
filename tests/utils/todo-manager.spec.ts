@@ -11,7 +11,7 @@ import { rm, readdir, readFile } from 'fs/promises';
 import path from 'path';
 
 describe.sequential('Todo Manager', () => {
-  const TEST_TODOS_DIR = '.agentos/test-todos';
+  const TEST_TODOS_DIR = '.airunx-test/test-todos';
   let todoManager: TodoManager;
 
   beforeEach(async () => {
@@ -516,7 +516,7 @@ describe.sequential('Todo Manager', () => {
   });
 
   describe('Namespacing', () => {
-    const NAMESPACE_BASE_DIR = '.agentos/test-todos-namespace';
+    const NAMESPACE_BASE_DIR = '.airunx-test/test-todos-namespace';
     const NAMESPACE_1 = 'issue-123';
     const NAMESPACE_2 = 'issue-456';
 

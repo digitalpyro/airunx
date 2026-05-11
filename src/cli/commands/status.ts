@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import { existsSync } from 'fs';
 import { readdir } from 'fs/promises';
 import { StateManager } from '../../orchestrator/state-manager.js';
+import { DEFAULT_STATE_DIR } from '../../orchestrator/constants.js';
 import type { WorkflowContext } from '../../core/types.js';
 
 interface StatusOptions {
@@ -65,7 +66,7 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
 async function findWorkflows(
   stateManager: StateManager
 ): Promise<WorkflowContext[]> {
-  const stateDir = '.agentos/state';
+  const stateDir = DEFAULT_STATE_DIR;
 
   if (!existsSync(stateDir)) {
     return [];

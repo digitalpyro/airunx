@@ -107,7 +107,7 @@ pipelines:
 describe('Pipeline Executor', () => {
   let mockAdapter: ExecutionAdapter;
   let pipelineExecutor: PipelineExecutor;
-  const TEST_CONFIG_DIR = path.join('.agentos', 'test-pipeline-executor');
+  const TEST_CONFIG_DIR = path.join('.airunx-test', 'test-pipeline-executor');
   const TEST_CONFIG_PATH = path.join(TEST_CONFIG_DIR, 'test-pipelines.yaml');
   const TEST_STATE_DIR = path.join(TEST_CONFIG_DIR, 'state');
   const TEST_TODOS_DIR = path.join(TEST_CONFIG_DIR, 'todos');
@@ -504,7 +504,7 @@ Task requirements:
 
   describe('Test Verification Gate', () => {
     const TEST_WORKTREE = path.join(
-      '.agentos',
+      '.airunx-test',
       'test-pipeline-executor',
       'worktree'
     );
@@ -606,7 +606,7 @@ pipelines:
     });
 
     it('should skip test gate when no test framework is detected', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -635,7 +635,7 @@ pipelines:
     });
 
     it('should pass when tests succeed (package.json)', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -672,7 +672,7 @@ pipelines:
     });
 
     it('should detect composer test command', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -703,7 +703,7 @@ pipelines:
     });
 
     it('should detect phpunit from require-dev', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -735,7 +735,7 @@ pipelines:
     });
 
     it('should downgrade when tests fail and no implement stage to retry', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_NO_IMPLEMENT, 'utf-8');
@@ -767,7 +767,7 @@ pipelines:
     });
 
     it('should iterate back to implement when tests fail', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -820,7 +820,7 @@ pipelines:
     });
 
     it('should downgrade when tests still fail after retry', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');
@@ -859,7 +859,7 @@ pipelines:
     });
 
     it('should skip default npm test placeholder', async () => {
-      await mkdir(path.join('.agentos', 'test-pipeline-executor'), {
+      await mkdir(path.join('.airunx-test', 'test-pipeline-executor'), {
         recursive: true,
       });
       await writeFile(TEST_CONFIG_PATH, PIPELINE_WITH_IMPLEMENT, 'utf-8');

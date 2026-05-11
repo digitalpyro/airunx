@@ -11,7 +11,7 @@ import { rm, mkdir } from 'fs/promises';
 import path from 'path';
 
 describe('State Manager', () => {
-  const TEST_STATE_DIR = '.agentos/test-state';
+  const TEST_STATE_DIR = '.airunx-test/test-state';
   let stateManager: StateManager;
   let testWorkflowId: string;
   let testContext: WorkflowContext;

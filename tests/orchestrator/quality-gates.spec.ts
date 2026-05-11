@@ -11,8 +11,8 @@ import { writeFile, rm, mkdir } from 'fs/promises';
 import path from 'path';
 
 describe('Quality Gates', () => {
-  const TEST_CONFIG_PATH = '.agentos/test-config.yml';
-  const TEST_CONFIG_DIR = '.agentos';
+  const TEST_CONFIG_PATH = '.airunx-test/test-config.yml';
+  const TEST_CONFIG_DIR = '.airunx-test';
 
   beforeEach(async () => {
     // Clean up test config
