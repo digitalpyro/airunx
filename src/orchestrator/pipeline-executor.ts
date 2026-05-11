@@ -4,7 +4,7 @@
  */
 
 import crypto from 'crypto';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../utils/async-spawn.js';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type {
@@ -87,14 +87,14 @@ export type WorkflowStartCallback = (
 ) => void;
 
 /**
- * Resolve the retry target stage from the pipeline's judge evaluates_stage config.
+ * Resolve the retry target stage from the pipeline's judge evaluatesStage config.
  * Falls back to 'implement' for backward compatibility.
  */
 function getRetryTargetStage(pipeline: Pipeline): string {
   const judgeStage = pipeline.stages.find(
     (s) => s.decision === 'iterate_or_proceed'
   );
-  return judgeStage?.evaluates_stage || 'implement';
+  return judgeStage?.evaluatesStage || 'implement';
 }
 
 /**
@@ -435,7 +435,7 @@ export class PipelineExecutor {
       // Note: Static analysis is handled by the static-analyzer LLM agent in the
       // pipeline (analyze stage), not as a deterministic gate here.
       if (result.worktreePath && result.status === 'completed') {
-        const testResult = this.runTestsInWorktree(result.worktreePath);
+        const testResult = await this.runTestsInWorktree(result.worktreePath);
         if (!testResult.passed) {
           if (
             isInfrastructureFailure(
@@ -479,7 +479,9 @@ export class PipelineExecutor {
               );
               // Verify tests after retry; downgrade if still failing
               if (result.worktreePath && result.status === 'completed') {
-                const retry = this.runTestsInWorktree(result.worktreePath);
+                const retry = await this.runTestsInWorktree(
+                  result.worktreePath
+                );
                 if (!retry.passed) {
                   logger.warn(
                     'Tests still failing after retry — downgrading to completed_with_errors'
@@ -804,12 +806,12 @@ export class PipelineExecutor {
    * Returns exitCode so callers can distinguish infrastructure failures
    * (exit 127, connection errors) from real test failures.
    */
-  private runTestsInWorktree(worktreePath: string): {
+  private async runTestsInWorktree(worktreePath: string): Promise<{
     passed: boolean;
     skipped: boolean;
     exitCode: number | null;
     output?: string;
-  } {
+  }> {
     const testCmd = this.detectTestCommand(worktreePath);
     if (!testCmd) {
       logger.debug('No test framework detected in worktree, skipping');
@@ -817,16 +819,14 @@ export class PipelineExecutor {
     }
 
     // Auto-install dependencies if binaries are missing (worktrees don't inherit vendor/)
-    this.installDepsIfNeeded(worktreePath);
+    await this.installDepsIfNeeded(worktreePath);
 
     logger.info(
       `Running test verification: ${testCmd.cmd} ${testCmd.args.join(' ')}`
     );
-    const result = spawnSync(testCmd.cmd, testCmd.args, {
+    const result = await spawnAsync(testCmd.cmd, testCmd.args, {
       cwd: worktreePath,
-      encoding: 'utf-8',
       timeout: 120_000,
-      stdio: 'pipe',
     });
 
     if (result.status === 0) {
@@ -882,14 +882,14 @@ export class PipelineExecutor {
    * main workspace, so this is needed on first test run.
    * Only runs when binaries are absent — skips if already installed.
    */
-  private installDepsIfNeeded(worktreePath: string): void {
+  private async installDepsIfNeeded(worktreePath: string): Promise<void> {
     // PHP: composer install if vendor/ is missing
     if (
       existsSync(join(worktreePath, 'composer.json')) &&
       !existsSync(join(worktreePath, 'vendor'))
     ) {
       logger.info('Installing PHP dependencies (vendor/ missing in worktree)');
-      const result = spawnSync(
+      const result = await spawnAsync(
         'composer',
         [
           'install',
@@ -901,9 +901,7 @@ export class PipelineExecutor {
         ],
         {
           cwd: worktreePath,
-          encoding: 'utf-8',
           timeout: 300_000,
-          stdio: 'pipe',
         }
       );
       if (result.status !== 0) {
@@ -921,11 +919,9 @@ export class PipelineExecutor {
       logger.info(
         'Installing Node dependencies (node_modules/ missing in worktree)'
       );
-      const result = spawnSync('npm', ['install', '--ignore-scripts'], {
+      const result = await spawnAsync('npm', ['install', '--ignore-scripts'], {
         cwd: worktreePath,
-        encoding: 'utf-8',
         timeout: 300_000,
-        stdio: 'pipe',
       });
       if (result.status !== 0) {
         logger.warn(

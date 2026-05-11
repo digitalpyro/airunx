@@ -97,9 +97,7 @@ function formatStageOutput(
 
   // Recommendations (full mode only)
   if (format === 'full' && output.outputs.recommendations?.length) {
-    lines.push(
-      `Recommendations: ${output.outputs.recommendations.join('; ')}`
-    );
+    lines.push(`Recommendations: ${output.outputs.recommendations.join('; ')}`);
   }
 
   return lines.join('\n');
@@ -129,8 +127,11 @@ export function formatHandoffContext(
     text: formatStageOutput(name, stageOutputs[name], format),
   }));
 
-  // Check if total fits within budget
-  const totalSize = formattedStages.reduce((sum, s) => sum + s.text.length, 0);
+  // Check if total fits within budget (account for \n\n separators between stages)
+  const totalSize = formattedStages.reduce(
+    (sum, s, i) => sum + Buffer.byteLength(s.text) + (i > 0 ? 2 : 0),
+    0
+  );
 
   if (totalSize <= maxBytes) {
     return formattedStages.map((s) => s.text).join('\n\n');
@@ -144,14 +145,15 @@ export function formatHandoffContext(
   // Reserve space for each stage, prioritizing later stages
   for (let i = formattedStages.length - 1; i >= 0; i--) {
     const stage = formattedStages[i];
-    if (stage.text.length <= remaining) {
+    const stageBytes = Buffer.byteLength(stage.text);
+    const separatorBytes = result.length > 0 ? 2 : 0;
+    if (stageBytes + separatorBytes <= remaining) {
       result.unshift(stage.text);
-      remaining -= stage.text.length;
+      remaining -= stageBytes + separatorBytes;
     } else if (remaining > 100) {
       // Include a truncated version of this stage
-      result.unshift(
-        `### ${stage.name}\n[truncated — ${stage.text.length} chars, budget exceeded]`
-      );
+      const msg = `### ${stage.name}\n[truncated — ${stageBytes} bytes, budget exceeded]`;
+      result.unshift(msg);
       remaining = 0;
     }
     // Skip stages that don't fit at all

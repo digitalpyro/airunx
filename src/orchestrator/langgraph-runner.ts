@@ -4,7 +4,7 @@
  */
 
 import { performance } from 'perf_hooks';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../utils/async-spawn.js';
 import {
   existsSync,
   mkdirSync,
@@ -405,12 +405,12 @@ export class LangGraphRunner {
             // Route to next stage (e.g., document) instead of ending.
             // Post-judge stages like create_pr are handled post-graph
             // by pipeline-executor.ts, not as graph nodes.
-            // Check skip_condition on the next stage — if it should be
+            // Check skipCondition on the next stage — if it should be
             // skipped, bypass to the stage after it (or END).
             const nextStageAfterJudge = stages[i + 1];
             if (!nextStageAfterJudge) return 'END';
             if (
-              (nextStageAfterJudge.skip_condition ||
+              (nextStageAfterJudge.skipCondition ||
                 nextStageAfterJudge.optional) &&
               this.shouldSkipStage(nextStageAfterJudge, state)
             ) {
@@ -430,9 +430,9 @@ export class LangGraphRunner {
           )
         );
       } else if (nextStage) {
-        // Check if the next stage has skip_condition or is optional
+        // Check if the next stage has skipCondition or is optional
         // If so, use conditional edge that can bypass it
-        if (nextStage.skip_condition || nextStage.optional) {
+        if (nextStage.skipCondition || nextStage.optional) {
           // Find the stage after the skippable one (to bypass to)
           const stageAfterSkippable = stages[i + 2];
           const bypassTarget = stageAfterSkippable
@@ -443,10 +443,10 @@ export class LangGraphRunner {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             currentStage.name as any,
             (state: GraphState): string => {
-              // Check if the stage should be skipped based on skip_condition
+              // Check if the stage should be skipped based on skipCondition
               if (this.shouldSkipStage(nextStage, state)) {
                 logger.info(
-                  `Skipping stage: ${nextStage.name} (skip_condition: ${nextStage.skip_condition})`
+                  `Skipping stage: ${nextStage.name} (skipCondition: ${nextStage.skipCondition})`
                 );
                 return bypassTarget;
               }
@@ -472,7 +472,7 @@ export class LangGraphRunner {
   }
 
   /**
-   * Determine if a stage should be skipped based on skip_condition
+   * Determine if a stage should be skipped based on skipCondition
    * Supports iteration context (iteration.first, iteration.last, iteration.interim)
    * and stage success patterns (stage_name.success)
    */
@@ -480,11 +480,11 @@ export class LangGraphRunner {
     stage: Pipeline['stages'][0],
     state: GraphState
   ): boolean {
-    if (!stage.skip_condition) {
+    if (!stage.skipCondition) {
       return false;
     }
 
-    const condition = stage.skip_condition;
+    const condition = stage.skipCondition;
 
     // Build iteration context from workflowContext
     const current = (this.workflowContext.iterationCount ?? 0) + 1; // Convert 0-indexed to 1-indexed
@@ -520,7 +520,7 @@ export class LangGraphRunner {
     }
 
     // Check for checkbox.* pattern — matches "- [ ] <label>" in taskDescription
-    // Example: skip_condition: "!checkbox.generate_documentation" skips unless checkbox present
+    // Example: skipCondition: "!checkbox.generate_documentation" skips unless checkbox present
     const checkboxMatch = condition.match(/^!?checkbox\.([\w_]+)$/);
     if (checkboxMatch) {
       const negate = condition.startsWith('!');
@@ -534,7 +534,7 @@ export class LangGraphRunner {
     }
 
     // Unknown condition pattern - don't skip
-    logger.warn(`Unknown skip_condition pattern: ${condition}`);
+    logger.warn(`Unknown skipCondition pattern: ${condition}`);
     return false;
   }
 
@@ -567,8 +567,8 @@ export class LangGraphRunner {
     }
 
     // Check if this is an optional stage that should be skipped based on configuration
-    if (stage.optional && stage.skip_condition) {
-      // In a full implementation, skip_condition would be evaluated
+    if (stage.optional && stage.skipCondition) {
+      // In a full implementation, skipCondition would be evaluated
       // For now, we check if the stage was explicitly marked to skip
       logger.info(`Checking optional stage: ${stageName}`);
     }
@@ -636,8 +636,8 @@ export class LangGraphRunner {
     }
 
     // Execute agent
-    // Include static context unless stage has ignore_context: true
-    const shouldIncludeContext = this.staticContext && !stage.ignore_context;
+    // Include static context unless stage has ignoreContext: true
+    const shouldIncludeContext = this.staticContext && !stage.ignoreContext;
 
     // Format previous stage outputs as handoff context for the agent prompt
     // StageOutput shape is compatible with formatHandoffContext's expected type
@@ -705,30 +705,34 @@ export class LangGraphRunner {
     // Update and save workflow context atomically using file locking
     // This ensures metrics, current stage, and stage results are all persisted together
     // avoiding race conditions where a stale context could overwrite updated values
-    await this.stateManager.update(state.workflowId, (context) => {
-      // Update metrics
-      context.metrics.tokensUsed =
-        (context.metrics.tokensUsed || 0) + result.metrics.tokensUsed;
-      context.metrics.totalTokens =
-        (context.metrics.totalTokens || 0) + result.metrics.tokensUsed;
-      context.metrics.totalCost =
-        (context.metrics.totalCost || 0) + (result.metrics.cost || 0);
-      context.metrics.stagesCompleted =
-        (context.metrics.stagesCompleted || 0) + 1;
+    // Capture the return value to avoid a redundant load() call for observability below
+    const updatedCtx = await this.stateManager.update(
+      state.workflowId,
+      (context) => {
+        // Update metrics
+        context.metrics.tokensUsed =
+          (context.metrics.tokensUsed || 0) + result.metrics.tokensUsed;
+        context.metrics.totalTokens =
+          (context.metrics.totalTokens || 0) + result.metrics.tokensUsed;
+        context.metrics.totalCost =
+          (context.metrics.totalCost || 0) + (result.metrics.cost || 0);
+        context.metrics.stagesCompleted =
+          (context.metrics.stagesCompleted || 0) + 1;
 
-      // Update stage info and results for resumability
-      context.currentStage = stageName;
-      context.stageResults = newStageOutputs;
+        // Update stage info and results for resumability
+        context.currentStage = stageName;
+        context.stageResults = newStageOutputs;
 
-      // Record stage timing for performance visibility
-      this.recordStageTiming(context, stageName, stageDuration);
+        // Record stage timing for performance visibility
+        this.recordStageTiming(context, stageName, stageDuration);
 
-      // Record rich stage record for run reporting
-      context.stageRecords = context.stageRecords || [];
-      context.stageRecords.push(stageRecord);
+        // Record rich stage record for run reporting
+        context.stageRecords = context.stageRecords || [];
+        context.stageRecords.push(stageRecord);
 
-      return context;
-    });
+        return context;
+      }
+    );
 
     // Emit enriched audit event for stage completion
     this.auditLogger?.logStageComplete(
@@ -744,15 +748,22 @@ export class LangGraphRunner {
     );
 
     // --- Handoff observability ---
-    const latestCtx = await this.stateManager.load(state.workflowId);
-    const cumulativeCost = latestCtx?.metrics.totalCost ?? 0;
-    const cumulativeTokens = latestCtx?.metrics.totalTokens ?? 0;
+    // Use updatedCtx from the atomic update above (avoids redundant stateManager.load I/O)
+    const cumulativeCost = updatedCtx.metrics.totalCost ?? 0;
+    const cumulativeTokens = updatedCtx.metrics.totalTokens ?? 0;
     const maxCostStr = process.env.AIRUNX_MAX_COST_PER_RUN;
-    const maxCost = maxCostStr ? parseFloat(maxCostStr) : 50;
+    const maxCost =
+      maxCostStr && !isNaN(parseFloat(maxCostStr))
+        ? parseFloat(maxCostStr)
+        : 50;
     const budgetPct =
       maxCost > 0 ? ((cumulativeCost / maxCost) * 100).toFixed(1) : '∞';
-    const outputSizeBytes = JSON.stringify(result.outputs).length;
-    const handoffSizeBytes = handoffContext?.length ?? 0;
+    // Serialize once; reuse for size calculation and debug log
+    const outputJson = JSON.stringify(result.outputs);
+    const outputSizeBytes = Buffer.byteLength(outputJson);
+    const handoffSizeBytes = handoffContext
+      ? Buffer.byteLength(handoffContext)
+      : 0;
 
     // INFO: handoff summary with cost tracking
     const tokenStr =
@@ -766,7 +777,7 @@ export class LangGraphRunner {
     );
 
     // Cost projection
-    const completedStages = latestCtx?.metrics.stagesCompleted ?? 1;
+    const completedStages = updatedCtx.metrics.stagesCompleted ?? 1;
     const totalStages = this.pipeline.stages.length;
     const remainingStages = totalStages - completedStages;
     if (remainingStages > 0 && completedStages > 0) {
@@ -779,8 +790,10 @@ export class LangGraphRunner {
       );
     }
 
-    // DEBUG: full handoff payload
-    logger.debug(`Stage '${stageName}' handoff payload: ${JSON.stringify(result.outputs).slice(0, 4000)}`);
+    // DEBUG: full handoff payload (reuse outputJson to avoid redundant stringify)
+    logger.debug(
+      `Stage '${stageName}' handoff payload: ${outputJson.slice(0, 4000)}`
+    );
 
     // Emit stage_handoff audit event
     const stageIndex = this.pipeline.stages.findIndex(
@@ -802,12 +815,10 @@ export class LangGraphRunner {
     });
 
     // Incremental run report — write after each stage for mid-run visibility
-    if (latestCtx) {
-      this.writeRunReport(
-        latestCtx,
-        Math.round(performance.now() - this.workflowStartTime)
-      );
-    }
+    this.writeRunReport(
+      updatedCtx,
+      Math.round(performance.now() - this.workflowStartTime)
+    );
 
     logger.info(`Agent node completed: ${stageName}`);
 
@@ -839,11 +850,11 @@ export class LangGraphRunner {
       throw new Error(`Stage not found: ${stageName}`);
     }
 
-    // Validate evaluates_stage exists (required for all judge stages)
-    const evaluatesStage = stage.evaluates_stage;
+    // Validate evaluatesStage exists (required for all judge stages)
+    const evaluatesStage = stage.evaluatesStage;
     if (!evaluatesStage) {
       throw new Error(
-        `Judge stage '${stageName}' is missing required 'evaluates_stage' property in pipeline config.`
+        `Judge stage '${stageName}' is missing required 'evaluatesStage' property in pipeline config.`
       );
     }
 
@@ -878,7 +889,7 @@ export class LangGraphRunner {
       // If the stage doesn't exist and it's not optional, throw an error
       if (!stageExists && !isOptionalStage) {
         throw new Error(
-          `Judge stage '${stageName}' references an unknown or incomplete stage '${evaluatesStage}' in 'evaluates_stage'. Make sure it's a valid, preceding stage in the pipeline.`
+          `Judge stage '${stageName}' references an unknown or incomplete stage '${evaluatesStage}' in 'evaluatesStage'. Make sure it's a valid, preceding stage in the pipeline.`
         );
       }
 
@@ -971,7 +982,7 @@ export class LangGraphRunner {
     const worktreePath = this.workflowContext.worktreePath;
     let preJudgeTestOutput: string | undefined;
     if (worktreePath && !isLastIteration) {
-      const testResult = this.runTestsInWorktree(worktreePath);
+      const testResult = await this.runTestsInWorktree(worktreePath);
       if (!testResult.passed && !testResult.skipped) {
         // Check if failure is infrastructure (missing MySQL, etc.) vs real test failure
         const infraPatterns = [
@@ -1347,11 +1358,11 @@ export class LangGraphRunner {
    * Lightweight test gate — gives the judge concrete test failure signal
    * so it can ITERATE instead of PROCEEDing with broken tests.
    */
-  private runTestsInWorktree(worktreePath: string): {
+  private async runTestsInWorktree(worktreePath: string): Promise<{
     passed: boolean;
     skipped: boolean;
     output: string;
-  } {
+  }> {
     const timeoutMs =
       parseInt(process.env.AIRUNX_TEST_TIMEOUT_MS || '') || 300_000; // 5 min default
 
@@ -1361,11 +1372,9 @@ export class LangGraphRunner {
       return { passed: true, skipped: true, output: '' };
     }
 
-    const result = spawnSync(cmd.cmd, cmd.args, {
+    const result = await spawnAsync(cmd.cmd, cmd.args, {
       cwd: worktreePath,
-      encoding: 'utf-8',
       timeout: timeoutMs,
-      stdio: 'pipe',
     });
 
     if (result.status === 0) {
