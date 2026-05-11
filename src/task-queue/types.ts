@@ -100,6 +100,7 @@ export type AuditEventType =
   | 'task_created' // V2: Agent-created subtasks
   | 'stage_start'
   | 'stage_complete'
+  | 'stage_handoff'
   | 'stage_error'
   | 'agent_completion_signal'
   | 'circuit_open';

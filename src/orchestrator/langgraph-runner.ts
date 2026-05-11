@@ -5,7 +5,13 @@
 
 import { performance } from 'perf_hooks';
 import { spawnSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 import { StateGraph, END, START } from '@langchain/langgraph';
 import type {
@@ -43,6 +49,7 @@ import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
 import { DEFAULT_MAX_ITERATIONS } from './iteration-manager.js';
+import { formatHandoffContext } from './handoff-context.js';
 
 /**
  * Safety ceiling for LangGraph super-steps. Generous to avoid false trips;
@@ -126,6 +133,8 @@ export class LangGraphRunner {
   /** Resolved tool configs (e.g., docs_location) loaded once for all stages */
   private toolConfigs: Record<string, string>;
   private auditLogger?: AuditLogger;
+  /** Workflow start time for incremental report writing */
+  private workflowStartTime = 0;
 
   constructor(
     adapter: ExecutionAdapter,
@@ -213,7 +222,8 @@ export class LangGraphRunner {
     savedStageOutputs?: Record<string, StageOutput>
   ): Promise<WorkflowContext> {
     // Track workflow start time for total runtime calculation
-    const workflowStartTime = performance.now();
+    this.workflowStartTime = performance.now();
+    const workflowStartTime = this.workflowStartTime;
 
     logger.info(`Creating StateGraph for pipeline: ${this.pipeline.name}`);
 
@@ -628,6 +638,14 @@ export class LangGraphRunner {
     // Execute agent
     // Include static context unless stage has ignore_context: true
     const shouldIncludeContext = this.staticContext && !stage.ignore_context;
+
+    // Format previous stage outputs as handoff context for the agent prompt
+    // StageOutput shape is compatible with formatHandoffContext's expected type
+    const handoffContext = formatHandoffContext(
+      state.stageOutputs as Parameters<typeof formatHandoffContext>[0],
+      { fidelityLevel: fidelityResolution.level }
+    );
+
     const projectContext: ProjectContext = {
       workingDirectory: this.workflowContext.worktreePath || process.cwd(),
       gitBranch: this.workflowContext.branchName,
@@ -637,6 +655,7 @@ export class LangGraphRunner {
         ...(Object.keys(this.toolConfigs).length > 0
           ? { toolConfigs: this.toolConfigs }
           : {}),
+        ...(handoffContext ? { handoffContext } : {}),
       },
     };
     const result = await invoker.execute({
@@ -723,6 +742,72 @@ export class LangGraphRunner {
         spawnCount: stageSpawnCount,
       }
     );
+
+    // --- Handoff observability ---
+    const latestCtx = await this.stateManager.load(state.workflowId);
+    const cumulativeCost = latestCtx?.metrics.totalCost ?? 0;
+    const cumulativeTokens = latestCtx?.metrics.totalTokens ?? 0;
+    const maxCostStr = process.env.AIRUNX_MAX_COST_PER_RUN;
+    const maxCost = maxCostStr ? parseFloat(maxCostStr) : 50;
+    const budgetPct =
+      maxCost > 0 ? ((cumulativeCost / maxCost) * 100).toFixed(1) : '∞';
+    const outputSizeBytes = JSON.stringify(result.outputs).length;
+    const handoffSizeBytes = handoffContext?.length ?? 0;
+
+    // INFO: handoff summary with cost tracking
+    const tokenStr =
+      cumulativeTokens >= 1000
+        ? `${(cumulativeTokens / 1000).toFixed(0)}K`
+        : `${cumulativeTokens}`;
+    logger.info(
+      `Stage '${stageName}' handoff: output=${(outputSizeBytes / 1024).toFixed(1)}KB, ` +
+        `cumulative_cost=$${cumulativeCost.toFixed(2)}/$${maxCost.toFixed(2)} (${budgetPct}%), ` +
+        `tokens=${tokenStr}`
+    );
+
+    // Cost projection
+    const completedStages = latestCtx?.metrics.stagesCompleted ?? 1;
+    const totalStages = this.pipeline.stages.length;
+    const remainingStages = totalStages - completedStages;
+    if (remainingStages > 0 && completedStages > 0) {
+      const avgCostPerStage = cumulativeCost / completedStages;
+      const projectedRemaining = avgCostPerStage * remainingStages;
+      logger.info(
+        `Cost: $${cumulativeCost.toFixed(2)}/$${maxCost.toFixed(2)} (${budgetPct}%), ` +
+          `~$${avgCostPerStage.toFixed(2)}/stage avg, ` +
+          `~$${projectedRemaining.toFixed(2)} projected remaining (${remainingStages} stage${remainingStages === 1 ? '' : 's'} left)`
+      );
+    }
+
+    // DEBUG: full handoff payload
+    logger.debug(`Stage '${stageName}' handoff payload: ${JSON.stringify(result.outputs).slice(0, 4000)}`);
+
+    // Emit stage_handoff audit event
+    const stageIndex = this.pipeline.stages.findIndex(
+      (s) => s.name === stageName
+    );
+    const nextStage =
+      stageIndex >= 0 && stageIndex < this.pipeline.stages.length - 1
+        ? this.pipeline.stages[stageIndex + 1].name
+        : 'end';
+    this.auditLogger?.logStageHandoff(state.workflowId, {
+      fromStage: stageName,
+      toStage: nextStage,
+      outputSizeBytes,
+      handoffContextSizeBytes: handoffSizeBytes,
+      cumulativeCost,
+      cumulativeTokens,
+      budgetRemainingPercent:
+        maxCost > 0 ? Math.max(0, 100 - (cumulativeCost / maxCost) * 100) : 100,
+    });
+
+    // Incremental run report — write after each stage for mid-run visibility
+    if (latestCtx) {
+      this.writeRunReport(
+        latestCtx,
+        Math.round(performance.now() - this.workflowStartTime)
+      );
+    }
 
     logger.info(`Agent node completed: ${stageName}`);
 
@@ -1209,7 +1294,10 @@ export class LangGraphRunner {
         mkdirSync(reportsDir, { recursive: true });
       }
       const reportPath = join(reportsDir, `${context.id}.json`);
-      writeFileSync(reportPath, JSON.stringify(report, null, 2));
+      // Atomic write: write to tmp file then rename to avoid partial reads
+      const tmpPath = reportPath + '.tmp';
+      writeFileSync(tmpPath, JSON.stringify(report, null, 2));
+      renameSync(tmpPath, reportPath);
       logger.info(`Run report written to ${reportPath}`);
     } catch (err) {
       // Non-fatal: don't crash the pipeline if report writing fails

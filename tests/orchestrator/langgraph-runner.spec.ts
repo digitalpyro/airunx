@@ -15,6 +15,7 @@ vi.mock('../../src/audit/audit-logger.js', () => {
     log = vi.fn();
     logStageStart = vi.fn();
     logStageComplete = vi.fn();
+    logStageHandoff = vi.fn();
     logStageError = vi.fn();
     logAgentCompletionSignal = vi.fn();
   }

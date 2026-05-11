@@ -174,6 +174,8 @@ export interface AdditionalContext {
   pipelineMode?: boolean;
   /** Resolved tool configuration paths from settings (e.g., docs_location) */
   toolConfigs?: Record<string, string>;
+  /** Serialized handoff context from previous pipeline stages */
+  handoffContext?: string;
 }
 
 /**
