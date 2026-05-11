@@ -33,9 +33,12 @@ Thumbs.db
 # Runtime state (generated during execution)
 .airunx-state/
 
-# Legacy config directories (for backwards compatibility testing)
+# Legacy config directories (for backwards compatibility)
 .agentos/
 .agents/
+
+# Test temp directories
+.airunx-test/
 
 # User project config (may be generated during testing)
 # Note: .airunx/ is NOT ignored - it's the project config directory

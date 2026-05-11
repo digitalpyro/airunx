@@ -229,12 +229,12 @@ export async function doctorCommand(): Promise<void> {
     spinner.stop();
     if (configError) {
       console.log(chalk.bold('⚙️  System Configuration:'));
-      console.log(chalk.red('  ✗ .agentos/config.yml found but invalid'));
+      console.log(chalk.red('  ✗ .airunx/config.yml found but invalid'));
       console.log(chalk.red(`  Error: ${configError.message}`));
       console.log(chalk.dim('  Fix the configuration or run: airunx init\n'));
     } else if (config) {
       console.log(chalk.bold('⚙️  System Configuration:'));
-      console.log(chalk.green('  ✓ .agentos/config.yml found'));
+      console.log(chalk.green('  ✓ .airunx/config.yml found'));
       console.log(chalk.dim(`  Default backend: ${config.fallback_backend}`));
       console.log(
         chalk.dim(
@@ -244,7 +244,7 @@ export async function doctorCommand(): Promise<void> {
       console.log();
     } else {
       console.log(chalk.yellow('⚙️  System Configuration:'));
-      console.log(chalk.yellow('  ○ No .agentos/config.yml found'));
+      console.log(chalk.yellow('  ○ No .airunx/config.yml found'));
       console.log(chalk.dim('  Run: airunx init\n'));
     }
 

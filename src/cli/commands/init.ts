@@ -389,14 +389,14 @@ export async function initCommand(options: InitOptions): Promise<void> {
 
       console.log(chalk.bold('🗑️  Clearing cache and state files...\n'));
 
-      // Clear workflow state directory
-      const workflowStatePath = join(userProjectDir, '.agentos', 'state');
-      if (existsSync(workflowStatePath)) {
-        rmSync(workflowStatePath, { recursive: true, force: true });
-        console.log(chalk.green('  ✓ Cleared workflow state'));
+      // Clear legacy .agentos/state directory if it exists
+      const legacyStatePath = join(userProjectDir, '.agentos', 'state');
+      if (existsSync(legacyStatePath)) {
+        rmSync(legacyStatePath, { recursive: true, force: true });
+        console.log(chalk.green('  ✓ Cleared legacy .agentos/state directory'));
       }
 
-      // Clear .airunx-state directory (includes circuit breaker state)
+      // Clear .airunx-state directory (workflows, circuit breaker, audit logs)
       const airunxStatePath = join(userProjectDir, '.airunx-state');
       if (existsSync(airunxStatePath)) {
         rmSync(airunxStatePath, { recursive: true, force: true });

@@ -10,7 +10,7 @@ import { rm } from 'fs/promises';
 import { existsSync } from 'fs';
 
 describe('VerboseReporter', () => {
-  const TEST_STATE_DIR = '.agentos/test-verbose-reporter';
+  const TEST_STATE_DIR = '.airunx-test/test-verbose-reporter';
   let stateManager: StateManager;
   let testWorkflowId: string;
   let testContext: WorkflowContext;
