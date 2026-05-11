@@ -278,9 +278,13 @@ export const FidelityConfigSchema = z.object({
     .optional(),
 });
 
-export const PipelineStageSchema = z.object({
+/**
+ * Internal schema for parsing snake_case YAML keys.
+ * PipelineStageSchema transforms these to camelCase for TypeScript usage.
+ */
+const PipelineStageInputSchema = z.object({
   name: z.string().min(1, 'Stage name cannot be empty'),
-  agent: AgentRoleSchema.optional(), // Optional for stage_overrides that only modify existing stages
+  agent: AgentRoleSchema.optional(),
   tools: z.array(z.string()).optional(),
   input: z.string().optional(),
   output: z.string().optional(),
@@ -290,18 +294,33 @@ export const PipelineStageSchema = z.object({
     .union([ExecutionFidelityLevelSchema, z.literal('inherit')])
     .optional(),
   optional: z.boolean().optional().default(false),
-  // Condition to skip this stage (e.g., "judge.verdict == 'ITERATE'")
   skip_condition: z.string().optional(),
-  // Skip on ITERATE verdict shorthand
   skip_on_iterate: z.boolean().optional(),
-  // For judge stages: specifies which stage's output to evaluate
   evaluates_stage: z.string().optional(),
-  // For stage_overrides: insert this stage before/after another stage
   insert_before: z.string().optional(),
   insert_after: z.string().optional(),
-  // Skip injecting static context for this stage
   ignore_context: z.boolean().optional().default(false),
 });
+
+export const PipelineStageSchema = PipelineStageInputSchema.transform(
+  (data) => ({
+    name: data.name,
+    agent: data.agent,
+    tools: data.tools,
+    input: data.input,
+    output: data.output,
+    decision: data.decision,
+    description: data.description,
+    fidelity: data.fidelity,
+    optional: data.optional,
+    skipCondition: data.skip_condition,
+    skipOnIterate: data.skip_on_iterate,
+    evaluatesStage: data.evaluates_stage,
+    insertBefore: data.insert_before,
+    insertAfter: data.insert_after,
+    ignoreContext: data.ignore_context,
+  })
+);
 
 /**
  * Raw pipeline schema - allows stages_inherit for inheritance
@@ -491,6 +510,7 @@ export const WorkflowContextSchema = z.object({
   createdAt: z.union([z.date(), z.string().transform((val) => new Date(val))]),
   status: WorkflowStatusSchema,
   currentStage: z.string().optional(),
+  // Accept both snake_case (from YAML/pipeline parse) and camelCase (from serialized state)
   currentStageObj: PipelineStageSchema.optional(),
 
   // Task metadata

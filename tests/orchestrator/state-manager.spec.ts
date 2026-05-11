@@ -235,7 +235,7 @@ describe('State Manager', () => {
         agent: 'developer' as const,
         input: 'Implement feature',
         optional: false, // Zod schema applies this default
-        ignore_context: false, // Zod schema applies this default
+        ignoreContext: false, // Zod schema applies this default
       };
 
       await stateManager.updateCurrentStage(testWorkflowId, 'developer', stageObj);

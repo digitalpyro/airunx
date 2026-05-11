@@ -15,6 +15,7 @@ vi.mock('../../src/audit/audit-logger.js', () => {
     log = vi.fn();
     logStageStart = vi.fn();
     logStageComplete = vi.fn();
+    logStageHandoff = vi.fn();
     logStageError = vi.fn();
     logAgentCompletionSignal = vi.fn();
   }
@@ -291,7 +292,7 @@ describe('LangGraph Runner', () => {
             name: 'judge',
             agent: 'code-judge',
             input: 'Review',
-            evaluates_stage: 'developer',
+            evaluatesStage: 'developer',
           },
         ],
       };
@@ -332,7 +333,7 @@ describe('LangGraph Runner', () => {
             name: 'judge',
             agent: 'code-judge',
             input: 'Judge',
-            evaluates_stage: 'develop',
+            evaluatesStage: 'develop',
           },
           {
             name: 'document',
@@ -621,7 +622,7 @@ describe('LangGraph Runner', () => {
           name: 'skip-interim',
           agent: 'code-reviewer',
           input: 'Analyze',
-          skip_condition: 'iteration.interim',
+          skipCondition: 'iteration.interim',
         },
         { name: 'final', agent: 'developer', input: 'Implement' },
       ],
@@ -637,7 +638,7 @@ describe('LangGraph Runner', () => {
           name: 'skip-interim',
           agent: 'code-reviewer',
           input: 'Analyze',
-          skip_condition: 'iteration.interim',
+          skipCondition: 'iteration.interim',
         },
       ],
     };
@@ -663,7 +664,7 @@ describe('LangGraph Runner', () => {
       });
     };
 
-    it('should skip stage with skip_condition on interim iterations', async () => {
+    it('should skip stage with skipCondition on interim iterations', async () => {
       const interimContext: WorkflowContext = {
         ...testContext,
         iterationCount: 1, // 0-indexed, so this is iteration 2
@@ -685,7 +686,7 @@ describe('LangGraph Runner', () => {
       expect(stagesExecuted).not.toContain('skip-interim');
     });
 
-    it('should run stage with skip_condition on first iteration', async () => {
+    it('should run stage with skipCondition on first iteration', async () => {
       const firstIterContext: WorkflowContext = {
         ...testContext,
         iterationCount: 0, // 0-indexed, so this is iteration 1
@@ -707,7 +708,7 @@ describe('LangGraph Runner', () => {
       expect(stagesExecuted).toContain('final');
     });
 
-    it('should run stage with skip_condition on last iteration', async () => {
+    it('should run stage with skipCondition on last iteration', async () => {
       const lastIterContext: WorkflowContext = {
         ...testContext,
         iterationCount: 4, // 0-indexed, so this is iteration 5
@@ -780,7 +781,7 @@ describe('LangGraph Runner', () => {
             name: 'only-last',
             agent: 'docs-generator',
             input: 'Generate docs',
-            skip_condition: '!iteration.last',
+            skipCondition: '!iteration.last',
           },
         ],
       };
@@ -816,7 +817,7 @@ describe('LangGraph Runner', () => {
             name: 'docs',
             agent: 'docs-generator',
             input: 'Generate docs',
-            skip_condition: '!checkbox.generate_documentation',
+            skipCondition: '!checkbox.generate_documentation',
             optional: true,
           },
         ],
@@ -931,7 +932,7 @@ describe('LangGraph Runner', () => {
             name: 'deploy',
             agent: 'orchestrator',
             input: 'Deploy',
-            skip_condition: '!build.success',
+            skipCondition: '!build.success',
             optional: true,
           },
         ],
@@ -957,7 +958,7 @@ describe('LangGraph Runner', () => {
       // a more sophisticated mock that properly tracks stage outputs across
       // conditional edge evaluations. The current mock StateGraph doesn't fully
       // replicate LangGraph's state management. The success case above validates
-      // the skip_condition pattern matching works correctly.
+      // the skipCondition pattern matching works correctly.
     });
   });
 });

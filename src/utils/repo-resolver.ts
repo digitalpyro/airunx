@@ -16,7 +16,7 @@ import {
   rmSync,
   utimesSync,
 } from 'fs';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from './async-spawn.js';
 import { join, dirname } from 'path';
 import { createLogger } from './logger.js';
 import { expandPath } from './settings.js';
@@ -51,7 +51,7 @@ export async function resolveRepoLocation(
     if (
       resolved &&
       existsSync(resolved) &&
-      matchesRemote(resolved, targetRemote)
+      (await matchesRemote(resolved, targetRemote))
     ) {
       logger.info(`Found repo in folders[]: ${resolved}`);
       return resolved;
@@ -63,7 +63,7 @@ export async function resolveRepoLocation(
   if (
     defaultProject &&
     existsSync(defaultProject) &&
-    matchesRemote(defaultProject, targetRemote)
+    (await matchesRemote(defaultProject, targetRemote))
   ) {
     logger.info(`Found repo at default_project_location: ${defaultProject}`);
     return defaultProject;
@@ -105,13 +105,19 @@ export async function resolveRepoLocation(
 /**
  * Check if a directory's git remote matches the target owner/repo
  */
-function matchesRemote(repoPath: string, targetRemote: string): boolean {
+async function matchesRemote(
+  repoPath: string,
+  targetRemote: string
+): Promise<boolean> {
   try {
-    const result = spawnSync('git', ['config', '--get', 'remote.origin.url'], {
-      cwd: repoPath,
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
+    const result = await spawnAsync(
+      'git',
+      ['config', '--get', 'remote.origin.url'],
+      {
+        cwd: repoPath,
+        timeout: 5000,
+      }
+    );
 
     if (result.status !== 0 || !result.stdout) {
       return false;
@@ -131,18 +137,14 @@ function matchesRemote(repoPath: string, targetRemote: string): boolean {
  */
 async function fetchLatest(repoPath: string): Promise<void> {
   try {
-    const result = spawnSync('git', ['fetch', '--quiet'], {
+    const result = await spawnAsync('git', ['fetch', '--quiet'], {
       cwd: repoPath,
       timeout: 30000,
     });
     if (result.status === 0) {
       logger.debug(`Fetched latest for ${repoPath}`);
     } else {
-      // Include both stderr and stdout for robust error categorization
-      const errorOutput =
-        result.stderr?.toString() ||
-        result.stdout?.toString() ||
-        'unknown error';
+      const errorOutput = result.stderr || result.stdout || 'unknown error';
       logger.warn(`Failed to fetch latest: ${errorOutput}`);
     }
   } catch (error) {
@@ -170,8 +172,7 @@ async function cloneRepo(
   // but only if gh is actually installed
   const ghAvailable =
     !!token &&
-    spawnSync('which', ['gh'], { encoding: 'utf-8', timeout: 5000 }).status ===
-      0;
+    (await spawnAsync('which', ['gh'], { timeout: 5000 })).status === 0;
 
   let cmd: string;
   let args: string[];
@@ -194,17 +195,14 @@ async function cloneRepo(
   );
 
   try {
-    const result = spawnSync(cmd, args, {
-      encoding: 'utf-8',
+    const result = await spawnAsync(cmd, args, {
       timeout: 300000, // 5 minute timeout for large repos
-      stdio: 'pipe',
       // Prevent git from hanging on credential prompts in headless environments
       // gh CLI reads GH_TOKEN / GITHUB_TOKEN from env automatically
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     });
 
     if (result.error) {
-      // spawnSync error (ENOENT, timeout, etc.)
       throw result.error;
     }
 

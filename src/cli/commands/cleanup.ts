@@ -15,7 +15,7 @@ import {
 import { loadSettings } from '../../utils/settings.js';
 import { createLogger } from '../../utils/logger.js';
 import { findStaleRepos } from '../../utils/repo-resolver.js';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../../utils/async-spawn.js';
 
 const logger = createLogger('cleanup');
 
@@ -366,9 +366,8 @@ export async function workspaceCleanupCommand(
       } else {
         try {
           // Check for uncommitted changes to prevent accidental data loss
-          const status = spawnSync('git', ['status', '--porcelain'], {
+          const status = await spawnAsync('git', ['status', '--porcelain'], {
             cwd: repoPath,
-            encoding: 'utf-8',
           });
 
           // Skip if git command failed or there are uncommitted changes

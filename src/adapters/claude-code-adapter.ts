@@ -7,7 +7,7 @@
  * 2. API key-based - Uses ANTHROPIC_API_KEY environment variable
  */
 
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../utils/async-spawn.js';
 import { BaseCliAdapter, type CliAdapterConfig } from './base-cli-adapter.js';
 import type { ExecutionRequest } from '../core/adapter-types.js';
 import { ANTHROPIC_PRICING } from './pricing.js';
@@ -46,8 +46,7 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
     // without a real subscription. Stripping it gives us the true OAuth state.
     try {
       const cliCmd = this.getCliConfig().cliCommand;
-      const result = spawnSync(cliCmd, ['auth', 'status'], {
-        encoding: 'utf-8',
+      const result = await spawnAsync(cliCmd, ['auth', 'status'], {
         timeout: 5000,
         env: { ...process.env, ANTHROPIC_API_KEY: undefined },
       });

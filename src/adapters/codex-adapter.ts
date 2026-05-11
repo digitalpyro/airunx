@@ -11,7 +11,7 @@
 
 import * as path from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../utils/async-spawn.js';
 import { homedir, platform } from 'os';
 import { BaseCliAdapter, type CliAdapterConfig } from './base-cli-adapter.js';
 import type {
@@ -177,8 +177,7 @@ export class CodexAdapter extends BaseCliAdapter {
     // 1. Prefer subscription authentication (codex login)
     try {
       const cliCmd = this.getCliConfig().cliCommand;
-      const result = spawnSync(cliCmd, ['login', 'status'], {
-        encoding: 'utf-8',
+      const result = await spawnAsync(cliCmd, ['login', 'status'], {
         timeout: 5000,
       });
       const output = (result.stdout || '') + (result.stderr || '');

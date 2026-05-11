@@ -171,6 +171,28 @@ export class AuditLogger {
   }
 
   /**
+   * Log a stage handoff event with observability metrics
+   */
+  logStageHandoff(
+    workflowId: string,
+    details: {
+      fromStage: string;
+      toStage: string;
+      outputSizeBytes: number;
+      handoffContextSizeBytes: number;
+      cumulativeCost: number;
+      cumulativeTokens: number;
+      budgetRemainingPercent: number;
+    }
+  ): void {
+    this.log({
+      event: 'stage_handoff',
+      workflowId,
+      details,
+    });
+  }
+
+  /**
    * Log a pipeline stage error
    */
   logStageError(workflowId: string, stageName: string, error: string): void {

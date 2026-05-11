@@ -10,7 +10,7 @@ import type { Todo } from '../../src/core/types.js';
 import { existsSync } from 'fs';
 import { rm, writeFile, mkdir, readdir, readFile } from 'fs/promises';
 import path from 'path';
-import { spawnSync } from 'child_process';
+import { spawnAsync } from '../../src/utils/async-spawn.js';
 
 // Track todos created during tests
 const createdTodos: Todo[] = [];
@@ -78,15 +78,12 @@ vi.mock('../../src/orchestrator/langgraph-runner.js', () => {
   return { LangGraphRunner };
 });
 
-// Mock child_process.spawnSync for test verification gate
-// Preserves real exports (execFile, spawn) for AutoCommit/PRGenerator
-vi.mock('child_process', async (importOriginal) => {
-  const original = await importOriginal<typeof import('child_process')>();
-  return {
-    ...original,
-    spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: '', stderr: '' }),
-  };
-});
+// Mock spawnAsync for test verification gate
+vi.mock('../../src/utils/async-spawn.js', () => ({
+  spawnAsync: vi
+    .fn()
+    .mockResolvedValue({ status: 0, stdout: '', stderr: '', error: undefined }),
+}));
 
 // Valid standard pipeline YAML for tests (uses valid pipeline type key)
 const VALID_STANDARD_PIPELINE_YAML = `
@@ -600,12 +597,12 @@ pipelines:
     }
 
     beforeEach(() => {
-      vi.mocked(spawnSync).mockReset();
-      vi.mocked(spawnSync).mockReturnValue({
+      vi.mocked(spawnAsync).mockReset();
+      vi.mocked(spawnAsync).mockResolvedValue({
         status: 0,
         stdout: '',
         stderr: '',
-      } as ReturnType<typeof spawnSync>);
+      });
     });
 
     it('should skip test gate when no test framework is detected', async () => {
@@ -634,7 +631,7 @@ pipelines:
       });
 
       expect(result.status).toBe('completed');
-      expect(spawnSync).not.toHaveBeenCalled();
+      expect(spawnAsync).not.toHaveBeenCalled();
     });
 
     it('should pass when tests succeed (package.json)', async () => {
@@ -654,11 +651,11 @@ pipelines:
         } as unknown as typeof LangGraphRunner
       );
 
-      vi.mocked(spawnSync).mockReturnValue({
+      vi.mocked(spawnAsync).mockResolvedValue({
         status: 0,
         stdout: 'Tests passed',
         stderr: '',
-      } as ReturnType<typeof spawnSync>);
+      });
 
       const result = await pipelineExecutor.execute({
         input: 'Test task',
@@ -667,7 +664,7 @@ pipelines:
       });
 
       expect(result.status).toBe('completed');
-      expect(spawnSync).toHaveBeenCalledWith(
+      expect(spawnAsync).toHaveBeenCalledWith(
         'npm',
         ['test'],
         expect.objectContaining({ cwd: TEST_WORKTREE })
@@ -698,7 +695,7 @@ pipelines:
       });
 
       expect(result.status).toBe('completed');
-      expect(spawnSync).toHaveBeenCalledWith(
+      expect(spawnAsync).toHaveBeenCalledWith(
         'composer',
         ['test'],
         expect.objectContaining({ cwd: TEST_WORKTREE })
@@ -730,7 +727,7 @@ pipelines:
         skipCommit: true,
       });
 
-      expect(spawnSync).toHaveBeenCalledWith(
+      expect(spawnAsync).toHaveBeenCalledWith(
         path.join(TEST_WORKTREE, 'vendor/bin/phpunit'),
         [],
         expect.objectContaining({ cwd: TEST_WORKTREE })
@@ -754,11 +751,11 @@ pipelines:
         } as unknown as typeof LangGraphRunner
       );
 
-      vi.mocked(spawnSync).mockReturnValue({
+      vi.mocked(spawnAsync).mockResolvedValue({
         status: 1,
         stdout: '',
         stderr: 'Test failed',
-      } as ReturnType<typeof spawnSync>);
+      });
 
       const result = await pipelineExecutor.execute({
         input: 'Test task',
@@ -796,17 +793,17 @@ pipelines:
       );
 
       // First test run fails, retry test run passes
-      vi.mocked(spawnSync)
-        .mockReturnValueOnce({
+      vi.mocked(spawnAsync)
+        .mockResolvedValueOnce({
           status: 1,
           stdout: '',
           stderr: 'FAIL',
-        } as ReturnType<typeof spawnSync>)
-        .mockReturnValueOnce({
+        })
+        .mockResolvedValueOnce({
           status: 0,
           stdout: 'PASS',
           stderr: '',
-        } as ReturnType<typeof spawnSync>);
+        });
 
       const result = await pipelineExecutor.execute({
         input: 'Test task',
@@ -845,11 +842,11 @@ pipelines:
       );
 
       // Both test runs fail
-      vi.mocked(spawnSync).mockReturnValue({
+      vi.mocked(spawnAsync).mockResolvedValue({
         status: 1,
         stdout: '',
         stderr: 'Tests always fail',
-      } as ReturnType<typeof spawnSync>);
+      });
 
       const result = await pipelineExecutor.execute({
         input: 'Test task',
@@ -887,7 +884,7 @@ pipelines:
       });
 
       expect(result.status).toBe('completed');
-      expect(spawnSync).not.toHaveBeenCalled();
+      expect(spawnAsync).not.toHaveBeenCalled();
     });
   });
 

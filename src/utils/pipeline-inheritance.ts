@@ -156,7 +156,7 @@ function resolveSinglePipeline(
  * Apply stage overrides to inherited stages.
  * Supports:
  * - Modifying existing stages (matched by name)
- * - Inserting new stages (via insert_before/insert_after)
+ * - Inserting new stages (via insertBefore/insertAfter)
  */
 function applyStageOverrides(
   stages: PipelineStage[],
@@ -166,55 +166,55 @@ function applyStageOverrides(
   const result = [...stages];
 
   for (const override of overrides) {
-    if (override.insert_before) {
+    if (override.insertBefore) {
       // Insert new stage before specified stage
       const targetIdx = result.findIndex(
-        (s) => s.name === override.insert_before
+        (s) => s.name === override.insertBefore
       );
       if (targetIdx === -1) {
         throw new Error(
-          `Cannot insert stage '${override.name}' before '${override.insert_before}' in pipeline '${pipelineName}': target stage not found`
+          `Cannot insert stage '${override.name}' before '${override.insertBefore}' in pipeline '${pipelineName}': target stage not found`
         );
       }
 
       // Validate new stage has agent
       if (!override.agent) {
         throw new Error(
-          `New stage '${override.name}' (insert_before: ${override.insert_before}) must have an agent`
+          `New stage '${override.name}' (insertBefore: ${override.insertBefore}) must have an agent`
         );
       }
 
-      // Remove insert_before from the stage object
+      // Remove insertBefore from the stage object
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { insert_before: _insertBefore, ...cleanStage } = override;
+      const { insertBefore: _insertBefore, ...cleanStage } = override;
       result.splice(targetIdx, 0, cleanStage as PipelineStage);
       logger.debug(
-        `Inserted stage '${override.name}' before '${override.insert_before}'`
+        `Inserted stage '${override.name}' before '${override.insertBefore}'`
       );
-    } else if (override.insert_after) {
+    } else if (override.insertAfter) {
       // Insert new stage after specified stage
       const targetIdx = result.findIndex(
-        (s) => s.name === override.insert_after
+        (s) => s.name === override.insertAfter
       );
       if (targetIdx === -1) {
         throw new Error(
-          `Cannot insert stage '${override.name}' after '${override.insert_after}' in pipeline '${pipelineName}': target stage not found`
+          `Cannot insert stage '${override.name}' after '${override.insertAfter}' in pipeline '${pipelineName}': target stage not found`
         );
       }
 
       // Validate new stage has agent
       if (!override.agent) {
         throw new Error(
-          `New stage '${override.name}' (insert_after: ${override.insert_after}) must have an agent`
+          `New stage '${override.name}' (insertAfter: ${override.insertAfter}) must have an agent`
         );
       }
 
-      // Remove insert_after from the stage object
+      // Remove insertAfter from the stage object
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { insert_after: _insertAfter, ...cleanStage } = override;
+      const { insertAfter: _insertAfter, ...cleanStage } = override;
       result.splice(targetIdx + 1, 0, cleanStage as PipelineStage);
       logger.debug(
-        `Inserted stage '${override.name}' after '${override.insert_after}'`
+        `Inserted stage '${override.name}' after '${override.insertAfter}'`
       );
     } else {
       // Modify existing stage
@@ -226,11 +226,11 @@ function applyStageOverrides(
       }
 
       // Merge override with existing stage (override takes precedence)
-      // Strip insert_before/insert_after to prevent them being added to modified stages
+      // Strip insertBefore/insertAfter to prevent them being added to modified stages
       /* eslint-disable @typescript-eslint/no-unused-vars */
       const {
-        insert_before: _ib,
-        insert_after: _ia,
+        insertBefore: _ib,
+        insertAfter: _ia,
         ...cleanOverride
       } = override;
       /* eslint-enable @typescript-eslint/no-unused-vars */

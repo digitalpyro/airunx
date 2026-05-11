@@ -138,7 +138,7 @@ describe('resolvePipelineInheritance', () => {
               {
                 name: 'analyze',
                 agent: 'code-reviewer',
-                insert_before: 'review',
+                insertBefore: 'review',
               },
             ],
           },
@@ -170,7 +170,7 @@ describe('resolvePipelineInheritance', () => {
               {
                 name: 'test',
                 agent: 'test-creator',
-                insert_after: 'implement',
+                insertAfter: 'implement',
               },
             ],
           },
@@ -236,7 +236,7 @@ describe('resolvePipelineInheritance', () => {
       );
     });
 
-    it('should throw on insert_before with nonexistent target', () => {
+    it('should throw on insertBefore with nonexistent target', () => {
       const rawConfig: RawPipelineConfig = {
         pipelines: {
           standard: {
@@ -250,7 +250,7 @@ describe('resolvePipelineInheritance', () => {
               {
                 name: 'test',
                 agent: 'test-creator',
-                insert_before: 'nonexistent',
+                insertBefore: 'nonexistent',
               },
             ],
           },
@@ -296,7 +296,7 @@ describe('resolvePipelineInheritance', () => {
               {
                 name: 'test',
                 // No agent specified for new stage
-                insert_after: 'implement',
+                insertAfter: 'implement',
               },
             ],
           },
@@ -324,14 +324,14 @@ describe('resolvePipelineInheritance', () => {
             name: 'Feature Pipeline',
             stages_inherit: 'standard',
             stage_overrides: [
-              { name: 'review', agent: 'code-reviewer', insert_after: 'implement' },
+              { name: 'review', agent: 'code-reviewer', insertAfter: 'implement' },
             ],
           },
           'mission-critical': {
             name: 'Mission Critical Pipeline',
             stages_inherit: 'feature',
             stage_overrides: [
-              { name: 'judge', agent: 'code-judge', insert_after: 'review' },
+              { name: 'judge', agent: 'code-judge', insertAfter: 'review' },
             ],
           },
         },
