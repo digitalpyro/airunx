@@ -12,29 +12,35 @@ import type { ModelPricing } from '../../src/adapters/pricing.js';
 describe('Pricing', () => {
   describe('resolveModelAlias', () => {
     it('should resolve known Anthropic aliases', () => {
-      expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-4-5-20250514');
-      expect(resolveModelAlias('opus')).toBe('claude-opus-4-5-20251101');
-      expect(resolveModelAlias('haiku')).toBe('claude-3-haiku-20240307');
+      expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
+      expect(resolveModelAlias('opus')).toBe('claude-opus-4-8');
+      expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5');
     });
 
     it('should resolve versioned aliases', () => {
+      expect(resolveModelAlias('sonnet-5')).toBe('claude-sonnet-5');
+      expect(resolveModelAlias('sonnet-4.6')).toBe('claude-sonnet-4-6');
+      expect(resolveModelAlias('opus-4.8')).toBe('claude-opus-4-8');
+      expect(resolveModelAlias('opus-4.7')).toBe('claude-opus-4-7');
       expect(resolveModelAlias('opus-4.5')).toBe('claude-opus-4-5-20251101');
-      expect(resolveModelAlias('opus-4.1')).toBe('claude-4-1-opus-20250324');
+      expect(resolveModelAlias('opus-4.1')).toBe('claude-opus-4-1-20250805');
       expect(resolveModelAlias('sonnet-4.5')).toBe(
-        'claude-sonnet-4-5-20250514'
+        'claude-sonnet-4-5-20250929'
       );
+      // No real Sonnet 4.1 exists upstream; historical target preserved
       expect(resolveModelAlias('sonnet-4.1')).toBe(
         'claude-4-1-sonnet-20250514'
       );
     });
 
     it('should resolve OpenAI aliases', () => {
+      expect(resolveModelAlias('gpt-5.6')).toBe('gpt-5.6-terra');
       expect(resolveModelAlias('gpt-4-mini')).toBe('gpt-4o-mini');
     });
 
     it('should be case-insensitive', () => {
-      expect(resolveModelAlias('SONNET')).toBe('claude-sonnet-4-5-20250514');
-      expect(resolveModelAlias('Opus')).toBe('claude-opus-4-5-20251101');
+      expect(resolveModelAlias('SONNET')).toBe('claude-sonnet-5');
+      expect(resolveModelAlias('Opus')).toBe('claude-opus-4-8');
     });
 
     it('should return lowercased input for unknown models', () => {
@@ -130,6 +136,43 @@ describe('Pricing', () => {
         'claude-sonnet-4-5-20250514'
       );
       expect(pricing.input).toBe(3);
+    });
+
+    it('should price 2026 models correctly', () => {
+      expect(
+        getModelPricing('claude-sonnet-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 3, output: 15 });
+      expect(
+        getModelPricing('claude-opus-4-8', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 5, output: 25 });
+      expect(
+        getModelPricing('claude-haiku-4-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 1, output: 5 });
+      expect(
+        getModelPricing('gpt-5.6-sol', OPENAI_PRICING, 'gpt-5.6-terra')
+      ).toEqual({ input: 5, output: 30 });
+      expect(
+        getModelPricing('gpt-5.6-terra', OPENAI_PRICING, 'gpt-5.6-terra')
+      ).toEqual({ input: 2.5, output: 15 });
+      expect(
+        getModelPricing('gpt-5.6-luna', OPENAI_PRICING, 'gpt-5.6-terra')
+      ).toEqual({ input: 1, output: 6 });
+      expect(
+        getModelPricing('gpt-5.4-nano', OPENAI_PRICING, 'gpt-5.6-terra')
+      ).toEqual({ input: 0.2, output: 1.25 });
+    });
+
+    it('should keep legacy IDs priced for backward compatibility', () => {
+      expect(
+        getModelPricing(
+          'claude-sonnet-4-5-20250514',
+          ANTHROPIC_PRICING,
+          'sonnet'
+        )
+      ).toEqual({ input: 3, output: 15 });
+      expect(
+        getModelPricing('claude-4-1-opus-20250324', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 15, output: 75 });
     });
   });
 

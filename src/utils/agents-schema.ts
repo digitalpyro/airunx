@@ -63,18 +63,33 @@ const PRIMARY_ANTHROPIC_ALIASES = ['opus', 'sonnet', 'haiku'] as const;
  * These are kept in OPENAI_PRICING for backward compatibility but
  * shouldn't be suggested as primary options to users
  */
-const LEGACY_OPENAI_MODELS = ['gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'] as const;
+const LEGACY_OPENAI_MODELS = [
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-4o',
+  'gpt-4o-mini',
+  'o1',
+  'o1-mini',
+  'gpt-4-turbo',
+  'gpt-4',
+  'gpt-3.5-turbo',
+] as const;
 
 /**
  * Legacy Anthropic models to exclude from suggestions
  * Kept in ANTHROPIC_PRICING for backward compatibility
  */
 const LEGACY_ANTHROPIC_MODELS = [
+  'claude-opus-4-5-20251101',
+  'claude-sonnet-4-5-20250929',
+  'claude-opus-4-1-20250805',
+  'claude-sonnet-4-5-20250514',
   'claude-4-1-opus-20250324',
   'claude-4-1-sonnet-20250514',
   'claude-3.5-sonnet-20240620',
   'claude-3-opus-20240229',
   'claude-3-sonnet-20240229',
+  'claude-3-haiku-20240307',
 ] as const;
 
 /**
@@ -131,6 +146,23 @@ export function isValidModel(value: string): boolean {
 }
 
 /**
+ * Legacy model IDs from both providers, as a lookup set
+ */
+const LEGACY_MODEL_IDS = new Set<string>([
+  ...LEGACY_OPENAI_MODELS,
+  ...LEGACY_ANTHROPIC_MODELS,
+]);
+
+/**
+ * Models eligible for "did you mean" suggestions
+ * Excludes legacy IDs so validation never recommends a deprecated or
+ * never-existed historical ID; they stay in VALID_MODELS for backward compat.
+ */
+const SUGGESTABLE_MODELS: readonly string[] = VALID_MODELS.filter(
+  (model) => !LEGACY_MODEL_IDS.has(model)
+);
+
+/**
  * Helper to create a validation issue for an invalid model field
  */
 function createModelValidationIssue(
@@ -143,7 +175,7 @@ function createModelValidationIssue(
   const valueWithoutComment = value.split('#')[0].trim();
   const closest = getClosestMatch(
     valueWithoutComment.toLowerCase(),
-    VALID_MODELS
+    SUGGESTABLE_MODELS
   );
   return {
     severity: mode === 'lenient' ? 'warning' : 'error',
@@ -171,8 +203,14 @@ const PROVIDER_MODEL_FAMILIES: Record<
   }
 > = {
   'claude-code': { family: 'anthropic', examples: "'opus', 'sonnet', 'haiku'" },
-  cursor: { family: 'openai', examples: "'gpt-5.5', 'gpt-5.4-mini', 'o1'" },
-  codex: { family: 'openai', examples: "'gpt-5.5', 'gpt-5.4-mini', 'o1'" },
+  cursor: {
+    family: 'openai',
+    examples: "'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4-mini'",
+  },
+  codex: {
+    family: 'openai',
+    examples: "'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4-mini'",
+  },
 };
 
 /**
@@ -1086,7 +1124,7 @@ export function generateAgentsMdTemplate(): string {
 - **Responsibilities**: Line-by-line review, touch point analysis, multi-pass review
 - **Tools**: Codebase read, static analysis
 - **Provider**: codex
-- **Model**: gpt-5.5
+- **Model**: gpt-5.6-terra
 - **Model-Rationale**: ChatGPT subscription compatible; strong reasoning for reviews
 - **Provider-Rationale**: Independent perspective prevents self-deception
 - **Fallback-Provider**: claude-code

@@ -1275,6 +1275,16 @@ orchestrator → developer → reviewer
         expect(isValidModel('sonett')).toBe(false);
         expect(isValidModel('gpt-40')).toBe(false);
       });
+
+      it('should accept 2026 model IDs', () => {
+        expect(isValidModel('claude-sonnet-5')).toBe(true);
+        expect(isValidModel('claude-opus-4-8')).toBe(true);
+        expect(isValidModel('claude-haiku-4-5')).toBe(true);
+        expect(isValidModel('gpt-5.6-sol')).toBe(true);
+        expect(isValidModel('gpt-5.6-terra')).toBe(true);
+        expect(isValidModel('gpt-5.6-luna')).toBe(true);
+        expect(isValidModel('gpt-5.4-nano')).toBe(true);
+      });
     });
 
     describe('getValidModels', () => {
@@ -1298,8 +1308,8 @@ orchestrator → developer → reviewer
         expect(aliases).toContain('opus');
         expect(aliases).toContain('sonnet');
         expect(aliases).toContain('haiku');
-        expect(aliases).toContain('gpt-4o');
-        expect(aliases).toContain('gpt-4o-mini');
+        expect(aliases).toContain('gpt-5.6-terra');
+        expect(aliases).toContain('gpt-5.6-luna');
       });
 
       it('should not include legacy models', () => {
@@ -1307,6 +1317,8 @@ orchestrator → developer → reviewer
         expect(aliases).not.toContain('gpt-4-turbo');
         expect(aliases).not.toContain('gpt-4');
         expect(aliases).not.toContain('gpt-3.5-turbo');
+        expect(aliases).not.toContain('gpt-4o');
+        expect(aliases).not.toContain('o1');
       });
     });
 
@@ -1441,8 +1453,49 @@ orchestrator → developer → reviewer
         );
         expect(costWarning).toBeDefined();
         expect(costWarning?.message).toContain('o1');
-        // Should suggest OpenAI alternatives, not Anthropic
-        expect(costWarning?.suggestion).toContain('gpt-4o');
+        // Should suggest current OpenAI alternatives, not Anthropic or legacy
+        expect(costWarning?.suggestion).toContain('gpt-5.4-nano');
+        expect(costWarning?.suggestion).not.toContain('gpt-4o');
+      });
+
+      it('should suggest current Anthropic alternatives for opus', () => {
+        const content = `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: opus
+`;
+
+        const parsed = parseAgentsMd(content);
+        const issues = validateParsedAgents(parsed);
+
+        const costWarning = issues.find(
+          (i) => i.severity === 'info' && i.path.endsWith('.model')
+        );
+        expect(costWarning).toBeDefined();
+        // Haiku 4.5 (via 'haiku' display alias), not the retired Claude 3 Haiku
+        expect(costWarning?.suggestion).toContain('haiku');
+        expect(costWarning?.suggestion).not.toContain('claude-3-haiku-20240307');
+      });
+
+      it('should not suggest legacy or fabricated IDs for typos', () => {
+        const content = `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: claude-sonnet-4-5-2025051
+`;
+
+        const parsed = parseAgentsMd(content);
+        const issues = validateParsedAgents(parsed);
+
+        const modelIssue = issues.find(
+          (i) => i.path.endsWith('.model') && i.severity !== 'info'
+        );
+        expect(modelIssue).toBeDefined();
+        expect(modelIssue?.suggestion ?? '').not.toContain('20250514');
+        expect(modelIssue?.suggestion ?? '').not.toContain('20250929');
+        expect(modelIssue?.suggestedValue ?? '').not.toContain('20250514');
       });
 
       it('should not generate cost warning for cheaper models', () => {
