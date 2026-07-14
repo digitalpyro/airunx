@@ -20,14 +20,19 @@ export interface ModelPricing {
 
 /**
  * OpenAI model pricing (used by Cursor CLI, Codex)
- * Updated as of April 2026
+ * Updated as of July 2026 (verified against OpenAI pricing docs 2026-07-14)
  */
 export const OPENAI_PRICING: Record<string, ModelPricing> = {
-  // 2026 models
-  'gpt-5.5': { input: 2.5, output: 15 },
+  // GPT-5.6 family (released 2026-07-09)
+  'gpt-5.6-sol': { input: 5, output: 30 },
+  'gpt-5.6-terra': { input: 2.5, output: 15 },
+  'gpt-5.6-luna': { input: 1, output: 6 },
+  // Earlier 2026 models
+  'gpt-5.5': { input: 5, output: 30 },
   'gpt-5.4': { input: 2.5, output: 15 },
-  'gpt-5.4-mini': { input: 0.25, output: 2 },
-  'gpt-5.3-codex': { input: 2.5, output: 15 },
+  'gpt-5.4-mini': { input: 0.75, output: 4.5 },
+  'gpt-5.4-nano': { input: 0.2, output: 1.25 },
+  'gpt-5.3-codex': { input: 1.75, output: 14 },
   // 2025 models
   'gpt-4o': { input: 5, output: 15 },
   'gpt-4o-mini': { input: 0.15, output: 0.6 },
@@ -41,15 +46,29 @@ export const OPENAI_PRICING: Record<string, ModelPricing> = {
 
 /**
  * Anthropic model pricing (used by Claude Code CLI)
- * Updated as of April 2026
+ * Updated as of July 2026 (verified against Anthropic model docs 2026-07-14)
+ * IDs from the 4.6 generation onward are dateless pinned snapshots.
  */
 export const ANTHROPIC_PRICING: Record<string, ModelPricing> = {
+  // 2026 models
+  // Sonnet 5 standard pricing; introductory pricing of $2/$10 applies
+  // through 2026-08-31 — we record the durable standard rate.
+  'claude-sonnet-5': { input: 3, output: 15 },
+  'claude-opus-4-8': { input: 5, output: 25 },
+  'claude-opus-4-7': { input: 5, output: 25 },
+  'claude-opus-4-6': { input: 5, output: 25 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-haiku-4-5': { input: 1, output: 5 },
   // 2025 models
   'claude-opus-4-5-20251101': { input: 5, output: 25 },
+  'claude-sonnet-4-5-20250929': { input: 3, output: 15 },
+  'claude-opus-4-1-20250805': { input: 15, output: 75 },
+  // Legacy entries (kept for backward compatibility so existing configs
+  // keep validating; the 20250514/20250324 IDs never existed upstream but
+  // were previously valid airunx values)
   'claude-sonnet-4-5-20250514': { input: 3, output: 15 },
   'claude-4-1-opus-20250324': { input: 15, output: 75 },
   'claude-4-1-sonnet-20250514': { input: 3, output: 15 },
-  // Legacy 2024 models (kept for backward compatibility)
   'claude-3.5-sonnet-20240620': { input: 3, output: 15 },
   'claude-3-opus-20240229': { input: 15, output: 75 },
   'claude-3-sonnet-20240229': { input: 3, output: 15 },
@@ -62,14 +81,23 @@ export const ANTHROPIC_PRICING: Record<string, ModelPricing> = {
  */
 export const MODEL_ALIASES: Record<string, string> = {
   // Anthropic aliases
-  opus: 'claude-opus-4-5-20251101',
+  opus: 'claude-opus-4-8',
+  'opus-4.8': 'claude-opus-4-8',
+  'opus-4.7': 'claude-opus-4-7',
+  'opus-4.6': 'claude-opus-4-6',
   'opus-4.5': 'claude-opus-4-5-20251101',
-  'opus-4.1': 'claude-4-1-opus-20250324',
-  sonnet: 'claude-sonnet-4-5-20250514',
-  'sonnet-4.5': 'claude-sonnet-4-5-20250514',
+  'opus-4.1': 'claude-opus-4-1-20250805',
+  sonnet: 'claude-sonnet-5',
+  'sonnet-5': 'claude-sonnet-5',
+  'sonnet-4.6': 'claude-sonnet-4-6',
+  'sonnet-4.5': 'claude-sonnet-4-5-20250929',
+  // No real Sonnet 4.1 exists upstream; keep the historical target so
+  // existing configs pinning this alias continue to resolve.
   'sonnet-4.1': 'claude-4-1-sonnet-20250514',
-  haiku: 'claude-3-haiku-20240307',
+  haiku: 'claude-haiku-4-5',
+  'haiku-4.5': 'claude-haiku-4-5',
   // OpenAI aliases
+  'gpt-5.6': 'gpt-5.6-terra',
   // Note: 'gpt-4' alias intentionally omitted to preserve backward compatibility
   // with legacy 'gpt-4' pricing. Users wanting gpt-4o should use 'gpt-4o' explicitly.
   // Note: 'o1' and 'o1-mini' don't need aliases since getModelPricing normalizes
@@ -101,7 +129,7 @@ export function calculateCost(
 
 /**
  * Get pricing for a model, with fallback to default
- * Supports model aliases (e.g., "sonnet" -> "claude-sonnet-4-5-20250514")
+ * Supports model aliases (e.g., "sonnet" -> "claude-sonnet-5")
  * Case-insensitive: resolveModelAlias handles lowercase normalization
  *
  * If pricing is not found for either model or default, logs a warning and
