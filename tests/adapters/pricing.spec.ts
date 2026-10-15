@@ -12,12 +12,21 @@ import type { ModelPricing } from '../../src/adapters/pricing.js';
 describe('Pricing', () => {
   describe('resolveModelAlias', () => {
     it('should resolve known Anthropic aliases', () => {
-      expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
-      expect(resolveModelAlias('opus')).toBe('claude-opus-4-8');
-      expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5');
+      expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5-5');
+      expect(resolveModelAlias('opus')).toBe('claude-opus-5-5');
+      expect(resolveModelAlias('haiku')).toBe('claude-haiku-5-5');
+      expect(resolveModelAlias('fable')).toBe('claude-fable-5-1');
     });
 
     it('should resolve versioned aliases', () => {
+      expect(resolveModelAlias('fable-5.1')).toBe('claude-fable-5-1');
+      expect(resolveModelAlias('fable-5')).toBe('claude-fable-5');
+      expect(resolveModelAlias('opus-5.5')).toBe('claude-opus-5-5');
+      expect(resolveModelAlias('opus-5')).toBe('claude-opus-5');
+      expect(resolveModelAlias('sonnet-5.5')).toBe('claude-sonnet-5-5');
+      expect(resolveModelAlias('haiku-5.5')).toBe('claude-haiku-5-5');
+      // Previously-current pinned aliases keep their targets
+      expect(resolveModelAlias('haiku-4.5')).toBe('claude-haiku-4-5');
       expect(resolveModelAlias('sonnet-5')).toBe('claude-sonnet-5');
       expect(resolveModelAlias('sonnet-4.6')).toBe('claude-sonnet-4-6');
       expect(resolveModelAlias('opus-4.8')).toBe('claude-opus-4-8');
@@ -38,9 +47,16 @@ describe('Pricing', () => {
       expect(resolveModelAlias('gpt-4-mini')).toBe('gpt-4o-mini');
     });
 
+    it('should not add OpenAI shorthand aliases that CLIs cannot accept', () => {
+      // Aliases only drive pricing; the raw string reaches the CLI
+      expect(MODEL_ALIASES['gpt-6']).toBeUndefined();
+      expect(MODEL_ALIASES['gpt-6.1']).toBeUndefined();
+    });
+
     it('should be case-insensitive', () => {
-      expect(resolveModelAlias('SONNET')).toBe('claude-sonnet-5');
-      expect(resolveModelAlias('Opus')).toBe('claude-opus-4-8');
+      expect(resolveModelAlias('SONNET')).toBe('claude-sonnet-5-5');
+      expect(resolveModelAlias('Opus')).toBe('claude-opus-5-5');
+      expect(resolveModelAlias('FABLE')).toBe('claude-fable-5-1');
     });
 
     it('should return lowercased input for unknown models', () => {
@@ -105,8 +121,8 @@ describe('Pricing', () => {
         ANTHROPIC_PRICING,
         'claude-sonnet-4-5-20250514'
       );
-      expect(pricing.input).toBe(3);
-      expect(pricing.output).toBe(15);
+      expect(pricing.input).toBe(2);
+      expect(pricing.output).toBe(10);
     });
 
     it('should fall back to default model when specified model not found', () => {
@@ -115,8 +131,8 @@ describe('Pricing', () => {
         ANTHROPIC_PRICING,
         'sonnet'
       );
-      expect(pricing.input).toBe(3);
-      expect(pricing.output).toBe(15);
+      expect(pricing.input).toBe(2);
+      expect(pricing.output).toBe(10);
     });
 
     it('should return zero-cost when neither model nor default found', () => {
@@ -135,13 +151,13 @@ describe('Pricing', () => {
         ANTHROPIC_PRICING,
         'claude-sonnet-4-5-20250514'
       );
-      expect(pricing.input).toBe(3);
+      expect(pricing.input).toBe(2);
     });
 
     it('should price 2026 models correctly', () => {
       expect(
         getModelPricing('claude-sonnet-5', ANTHROPIC_PRICING, 'sonnet')
-      ).toEqual({ input: 3, output: 15 });
+      ).toEqual({ input: 2, output: 10 });
       expect(
         getModelPricing('claude-opus-4-8', ANTHROPIC_PRICING, 'sonnet')
       ).toEqual({ input: 5, output: 25 });
@@ -150,16 +166,64 @@ describe('Pricing', () => {
       ).toEqual({ input: 1, output: 5 });
       expect(
         getModelPricing('gpt-5.6-sol', OPENAI_PRICING, 'gpt-5.6-terra')
-      ).toEqual({ input: 5, output: 30 });
+      ).toEqual({ input: 4, output: 20 });
       expect(
         getModelPricing('gpt-5.6-terra', OPENAI_PRICING, 'gpt-5.6-terra')
-      ).toEqual({ input: 2.5, output: 15 });
+      ).toEqual({ input: 2, output: 12 });
       expect(
         getModelPricing('gpt-5.6-luna', OPENAI_PRICING, 'gpt-5.6-terra')
-      ).toEqual({ input: 1, output: 6 });
+      ).toEqual({ input: 0.2, output: 1.2 });
       expect(
         getModelPricing('gpt-5.4-nano', OPENAI_PRICING, 'gpt-5.6-terra')
       ).toEqual({ input: 0.2, output: 1.25 });
+    });
+
+    it('should price October 2026 models correctly', () => {
+      expect(
+        getModelPricing('claude-fable-5-1', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 10, output: 50 });
+      expect(
+        getModelPricing('claude-fable-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 10, output: 50 });
+      expect(
+        getModelPricing('claude-opus-5-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 4, output: 20 });
+      expect(
+        getModelPricing('claude-opus-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 5, output: 25 });
+      expect(
+        getModelPricing('claude-sonnet-5-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 2, output: 10 });
+      expect(
+        getModelPricing('claude-haiku-5-5', ANTHROPIC_PRICING, 'sonnet')
+      ).toEqual({ input: 0.1, output: 0.5 });
+      expect(
+        getModelPricing('gpt-6-astra', OPENAI_PRICING, 'gpt-6.1-sol')
+      ).toEqual({ input: 10, output: 50 });
+      expect(
+        getModelPricing('gpt-6.1-sol', OPENAI_PRICING, 'gpt-6.1-sol')
+      ).toEqual({ input: 2, output: 10 });
+      expect(
+        getModelPricing('gpt-6-sol', OPENAI_PRICING, 'gpt-6.1-sol')
+      ).toEqual({ input: 2, output: 10 });
+      expect(
+        getModelPricing('gpt-6-luna', OPENAI_PRICING, 'gpt-6.1-sol')
+      ).toEqual({ input: 0.1, output: 0.5 });
+    });
+
+    it('should price short aliases at their current-generation targets', () => {
+      expect(getModelPricing('opus', ANTHROPIC_PRICING, 'sonnet')).toEqual({
+        input: 4,
+        output: 20,
+      });
+      expect(getModelPricing('fable', ANTHROPIC_PRICING, 'sonnet')).toEqual({
+        input: 10,
+        output: 50,
+      });
+      expect(getModelPricing('haiku', ANTHROPIC_PRICING, 'sonnet')).toEqual({
+        input: 0.1,
+        output: 0.5,
+      });
     });
 
     it('should keep legacy IDs priced for backward compatibility', () => {

@@ -10,11 +10,12 @@ import type { BackendType } from '../core/adapter-types.js';
  * Default models for each backend
  */
 export const DEFAULT_MODELS = {
-  // Drives the cursor adapter's --model flag and cost-estimation fallbacks.
-  // The claude CLI runs its own default (no --model is passed) and codex
-  // passes --model only when explicitly configured.
-  OPENAI: 'gpt-5.6-terra',
-  ANTHROPIC: 'claude-sonnet-5',
+  // Drives cost-estimation fallbacks, and the cursor adapter passes OPENAI as
+  // --model on every run without a configured model (no retry fallback), so
+  // cursor-agent must accept it. The claude CLI runs its own default (no
+  // --model is passed) and codex passes --model only when explicitly configured.
+  OPENAI: 'gpt-6.1-sol',
+  ANTHROPIC: 'claude-sonnet-5-5',
 } as const;
 
 /**

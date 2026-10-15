@@ -59,7 +59,7 @@ describe('CursorAdapter', () => {
 
       expect(args).toContain('--model');
       expect(args[args.indexOf('--model') + 1]).toBe(DEFAULT_MODELS.OPENAI);
-      expect(args[args.indexOf('--model') + 1]).toBe('gpt-5.6-terra');
+      expect(args[args.indexOf('--model') + 1]).toBe('gpt-6.1-sol');
     });
 
     it('should use the agent preferred model when set', () => {
