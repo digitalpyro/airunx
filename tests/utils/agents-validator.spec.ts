@@ -38,7 +38,7 @@ const VALID_AGENTS_MD = `# Agents
 - **Responsibilities**: Write code
 
 ### Reviewer
-- **Model**: opus
+- **Model**: fable
 - **Responsibilities**: Review code
 `;
 
@@ -170,8 +170,9 @@ describe('validateAgentsMdWithConfirmation', () => {
         }
       );
 
-      // Without cost warnings should have equal or fewer issues
-      expect(resultWithoutWarnings.issues.length).toBeLessThanOrEqual(
+      // fable ($10/$50) is the fixture's expensive model, so the filter
+      // must actually remove a warning
+      expect(resultWithoutWarnings.issues.length).toBeLessThan(
         resultWithWarnings.issues.length
       );
     });

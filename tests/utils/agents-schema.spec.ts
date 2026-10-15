@@ -4,6 +4,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   parseAgentsMd,
   validateParsedAgents,
@@ -18,6 +20,9 @@ import {
   type ParsedAgentDefinition,
   type ParsedAgentsConfig,
 } from '../../src/utils/agents-schema.js';
+
+const isCostWarning = (issue: { severity: string; message: string }) =>
+  issue.severity === 'info' && issue.message.includes('per 1M tokens');
 
 describe('Agents Schema', () => {
   describe('parseAgentsMd', () => {
@@ -500,6 +505,45 @@ orchestrator → developer → reviewer
       expect(template).toContain('**Fallback-Provider**');
       expect(template).toContain('claude-code');
       expect(template).toContain('codex');
+    });
+
+    it('should use current models with no cost or retirement warnings', () => {
+      const template = generateAgentsMdTemplate();
+      expect(template).toContain('gpt-6.1-sol');
+      expect(template).not.toContain('gpt-5.6');
+
+      const issues = validateParsedAgents(parseAgentsMd(template));
+      expect(issues.filter((i) => i.severity === 'info')).toHaveLength(0);
+    });
+  });
+
+  describe('shipped config/default/AGENTS.md', () => {
+    const shipped = readFileSync(
+      resolve(process.cwd(), 'config/default/AGENTS.md'),
+      'utf-8'
+    );
+
+    it('should validate with no errors, cost warnings, or retirement warnings', () => {
+      const issues = validateParsedAgents(parseAgentsMd(shipped));
+      expect(issues.filter((i) => i.severity === 'error')).toHaveLength(0);
+      expect(issues.filter((i) => i.severity === 'info')).toHaveLength(0);
+    });
+
+    it('should reference only the current model generation', () => {
+      for (const stale of [
+        'gpt-5.6',
+        'Opus 4.8',
+        'Haiku 4.5',
+        'Sonnet 5;',
+        '$3/$15',
+        '$5/$25',
+      ]) {
+        expect(shipped, stale).not.toContain(stale);
+      }
+      expect(shipped).toContain('gpt-6.1-sol');
+      expect(shipped).toContain('Sonnet 5.5');
+      expect(shipped).toContain('Opus 5.5');
+      expect(shipped).toContain('Haiku 5.5');
     });
   });
 
@@ -1285,6 +1329,25 @@ orchestrator → developer → reviewer
         expect(isValidModel('gpt-5.6-luna')).toBe(true);
         expect(isValidModel('gpt-5.4-nano')).toBe(true);
       });
+
+      it('should accept October 2026 model IDs and aliases', () => {
+        for (const model of [
+          'fable',
+          'fable-5.1',
+          'claude-fable-5-1',
+          'claude-fable-5',
+          'claude-opus-5-5',
+          'claude-opus-5',
+          'claude-sonnet-5-5',
+          'claude-haiku-5-5',
+          'gpt-6-astra',
+          'gpt-6.1-sol',
+          'gpt-6-sol',
+          'gpt-6-luna',
+        ]) {
+          expect(isValidModel(model), model).toBe(true);
+        }
+      });
     });
 
     describe('getValidModels', () => {
@@ -1308,8 +1371,11 @@ orchestrator → developer → reviewer
         expect(aliases).toContain('opus');
         expect(aliases).toContain('sonnet');
         expect(aliases).toContain('haiku');
+        expect(aliases).toContain('fable');
+        expect(aliases).toContain('gpt-6.1-sol');
+        expect(aliases).toContain('gpt-6-luna');
+        expect(aliases).toContain('gpt-6-astra');
         expect(aliases).toContain('gpt-5.6-terra');
-        expect(aliases).toContain('gpt-5.6-luna');
       });
 
       it('should not include legacy models', () => {
@@ -1319,6 +1385,8 @@ orchestrator → developer → reviewer
         expect(aliases).not.toContain('gpt-3.5-turbo');
         expect(aliases).not.toContain('gpt-4o');
         expect(aliases).not.toContain('o1');
+        expect(aliases).not.toContain('gpt-5.3-codex');
+        expect(aliases).not.toContain('gpt-5.4-nano');
       });
     });
 
@@ -1423,7 +1491,7 @@ orchestrator → developer → reviewer
 
 ### orchestrator
 - **Purpose**: Coordinate
-- **Model**: opus
+- **Model**: fable
 `;
 
         const parsed = parseAgentsMd(content);
@@ -1433,8 +1501,45 @@ orchestrator → developer → reviewer
           (i) => i.severity === 'info' && i.path.endsWith('.model')
         );
         expect(costWarning).toBeDefined();
-        expect(costWarning?.message).toContain('opus');
+        expect(costWarning?.message).toContain('fable');
         expect(costWarning?.suggestion).toContain('cost savings');
+      });
+
+      it('should not warn for opus now that Opus 5.5 is under the thresholds', () => {
+        const content = `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: opus
+`;
+
+        const issues = validateParsedAgents(parseAgentsMd(content));
+        expect(issues.filter(isCostWarning)).toHaveLength(0);
+      });
+
+      it('should warn for claude-opus-5 at exactly the output threshold', () => {
+        const content = `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: claude-opus-5
+`;
+
+        const issues = validateParsedAgents(parseAgentsMd(content));
+        expect(issues.some(isCostWarning)).toBe(true);
+      });
+
+      it('should warn for gpt-6-astra but not gpt-6.1-sol', () => {
+        const make = (model: string) => `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: ${model}
+`;
+        const astra = validateParsedAgents(parseAgentsMd(make('gpt-6-astra')));
+        expect(astra.some(isCostWarning)).toBe(true);
+        const sol = validateParsedAgents(parseAgentsMd(make('gpt-6.1-sol')));
+        expect(sol.filter(isCostWarning)).toHaveLength(0);
       });
 
       it('should generate cost warning for expensive OpenAI models', () => {
@@ -1454,16 +1559,17 @@ orchestrator → developer → reviewer
         expect(costWarning).toBeDefined();
         expect(costWarning?.message).toContain('o1');
         // Should suggest current OpenAI alternatives, not Anthropic or legacy
-        expect(costWarning?.suggestion).toContain('gpt-5.4-nano');
+        expect(costWarning?.suggestion).toContain('gpt-6-luna');
+        expect(costWarning?.suggestion).not.toContain('gpt-5.4-nano');
         expect(costWarning?.suggestion).not.toContain('gpt-4o');
       });
 
-      it('should suggest current Anthropic alternatives for opus', () => {
+      it('should suggest current Anthropic alternatives for fable', () => {
         const content = `# Agents
 
 ### orchestrator
 - **Purpose**: Coordinate
-- **Model**: opus
+- **Model**: fable
 `;
 
         const parsed = parseAgentsMd(content);
@@ -1473,9 +1579,98 @@ orchestrator → developer → reviewer
           (i) => i.severity === 'info' && i.path.endsWith('.model')
         );
         expect(costWarning).toBeDefined();
-        // Haiku 4.5 (via 'haiku' display alias), not the retired Claude 3 Haiku
+        // Haiku 5.5 (via 'haiku' display alias), not the retired Claude 3 Haiku
         expect(costWarning?.suggestion).toContain('haiku');
         expect(costWarning?.suggestion).not.toContain('claude-3-haiku-20240307');
+      });
+
+      describe('retiring models', () => {
+        const make = (model: string) => `# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: ${model}
+`;
+
+        it('should keep validating a retiring model but warn with date and replacement', () => {
+          const issues = validateParsedAgents(parseAgentsMd(make('gpt-4o')));
+          expect(issues.some((i) => i.severity !== 'info')).toBe(false);
+          const retirement = issues.find((i) =>
+            i.message.includes('retiring')
+          );
+          expect(retirement).toBeDefined();
+          expect(retirement?.severity).toBe('info');
+          expect(retirement?.message).toContain('2027-01-14');
+          expect(retirement?.suggestedValue).toBe('gpt-6-luna');
+        });
+
+        it('should warn when an alias resolves to a retiring model', () => {
+          const issues = validateParsedAgents(
+            parseAgentsMd(make('gpt-4-mini'))
+          );
+          expect(issues.some((i) => i.message.includes('retiring'))).toBe(
+            true
+          );
+        });
+
+        it('should map gpt-5.3-codex to gpt-6-sol', () => {
+          const issues = validateParsedAgents(
+            parseAgentsMd(make('gpt-5.3-codex'))
+          );
+          const retirement = issues.find((i) =>
+            i.message.includes('retiring')
+          );
+          expect(retirement?.message).toContain('2027-04-01');
+          expect(retirement?.suggestedValue).toBe('gpt-6-sol');
+        });
+
+        it('should not warn for current models', () => {
+          for (const model of ['gpt-5.6-terra', 'gpt-6.1-sol', 'sonnet']) {
+            const issues = validateParsedAgents(parseAgentsMd(make(model)));
+            expect(
+              issues.some((i) => i.message.includes('retiring')),
+              model
+            ).toBe(false);
+          }
+        });
+      });
+
+      it('should suggest the intended model for near-miss typos', () => {
+        const suggestFor = (model: string) =>
+          validateParsedAgents(
+            parseAgentsMd(`# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: ${model}
+`)
+          ).find((i) => i.path.endsWith('.model') && i.severity !== 'info')
+            ?.suggestedValue;
+
+        expect(suggestFor('sonet')).toBe('sonnet');
+        expect(suggestFor('gpt-5.6-tera')).toBe('gpt-5.6-terra');
+        expect(suggestFor('gpt-6-lunna')).toBe('gpt-6-luna');
+      });
+
+      it('should not suggest retiring IDs or aliases that resolve to them', () => {
+        const suggestFor = (model: string) =>
+          validateParsedAgents(
+            parseAgentsMd(`# Agents
+
+### orchestrator
+- **Purpose**: Coordinate
+- **Model**: ${model}
+`)
+          ).find((i) => i.path.endsWith('.model') && i.severity !== 'info')
+            ?.suggestedValue;
+
+        for (const typo of ['gpt-4o-mni', 'gpt-4-min', 'gpt-5.3-codx']) {
+          const suggestion = suggestFor(typo) ?? '';
+          expect(
+            ['gpt-4o', 'gpt-4o-mini', 'gpt-4-mini', 'gpt-5.3-codex'],
+            typo
+          ).not.toContain(suggestion);
+        }
       });
 
       it('should not suggest legacy or fabricated IDs for typos', () => {
