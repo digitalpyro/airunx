@@ -4,9 +4,12 @@
  */
 
 import * as path from 'path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex-adapter.js';
-import type { ExecutionRequest } from '../../src/core/adapter-types.js';
+import type {
+  ExecutionRequest,
+  ExecutionResult,
+} from '../../src/core/adapter-types.js';
 
 // Create a test subclass to access protected methods
 class TestableCodexAdapter extends CodexAdapter {
@@ -148,6 +151,55 @@ describe('CodexAdapter', () => {
       const pathArg = args[args.indexOf('-C') + 1];
 
       expect(pathArg).toBe('/path/with spaces/test');
+    });
+  });
+
+  describe('execute model fallback', () => {
+    const baseExecute = Object.getPrototypeOf(CodexAdapter.prototype) as {
+      execute: (request: ExecutionRequest) => Promise<ExecutionResult>;
+    };
+
+    const result = (success: boolean, stderr = ''): ExecutionResult => ({
+      success,
+      outputs: { stdout: success ? 'OK' : '', stderr },
+      metrics: { tokensUsed: 0, duration: 0 },
+      errors: [],
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('retries without --model when an older Codex CLI rejects a GPT-6 model', async () => {
+      // Exact error text from Codex CLI 0.144.5 on a ChatGPT login
+      const rejection =
+        'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-6.1-sol\' model is not supported when using Codex with a ChatGPT account."}}';
+      const spy = vi
+        .spyOn(baseExecute, 'execute')
+        .mockResolvedValueOnce(result(false, rejection))
+        .mockResolvedValueOnce(result(true));
+
+      const outcome = await adapter.execute(
+        createMockRequest({ agent: { preferredModel: 'gpt-6.1-sol' } })
+      );
+
+      expect(outcome.success).toBe(true);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy.mock.calls[0][0].agent.preferredModel).toBe('gpt-6.1-sol');
+      expect(spy.mock.calls[1][0].agent.preferredModel).toBeUndefined();
+    });
+
+    it('does not retry on unrelated failures', async () => {
+      const spy = vi
+        .spyOn(baseExecute, 'execute')
+        .mockResolvedValueOnce(result(false, 'network timeout'));
+
+      const outcome = await adapter.execute(
+        createMockRequest({ agent: { preferredModel: 'gpt-6.1-sol' } })
+      );
+
+      expect(outcome.success).toBe(false);
+      expect(spy).toHaveBeenCalledTimes(1);
     });
   });
 

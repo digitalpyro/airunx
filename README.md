@@ -90,6 +90,8 @@ Authentication options:
 - **Subscription**: `codex login` (uses your ChatGPT Plus/Team quota)
 - **API Key**: `export OPENAI_API_KEY=sk-...` (pay-per-token)
 
+Use Codex CLI 0.163.0 or newer for the GPT-6 models (`gpt-6.1-sol` is the default codex model). Older CLIs reject GPT-6 on a ChatGPT login, and airunx then retries with the CLI's own default model.
+
 **Option C: Cursor CLI (experimental — least tested backend)**
 
 ```bash
