@@ -586,14 +586,15 @@ airunx agents-validate --non-interactive --json
 
 - Agent role names (with typo suggestions)
 - Provider field values (`claude-code`, `cursor`, `codex`)
-- **Model field values** (`opus`, `sonnet`, `haiku`, `gpt-4o`, `o1`, etc.)
+- **Model field values** (`opus`, `sonnet`, `haiku`, `fable`, `gpt-6.1-sol`, etc.)
 - Required fields (Purpose)
 
 **Model validation features:**
 
 - Detects typos using Levenshtein distance (e.g., `sonnett` → `sonnet`)
 - Interactive prompts to fix invalid values
-- Cost warnings for expensive models (`opus`, `o1`)
+- Cost warnings for expensive models (`fable`, `gpt-6-astra`)
+- Retirement warnings for models with an announced shutdown date (e.g., `gpt-4o`), with a suggested replacement
 - Auto-fix mode for CI/CD pipelines
 
 #### `airunx heartbeat`
@@ -1350,12 +1351,12 @@ backends:
   cursor:
     type: cli
     executable: cursor-agent
-    model: gpt-4o # Default model for this backend
+    model: gpt-6.1-sol # Default model for this backend
     timeout: 300
   codex:
     type: cli
     executable: codex
-    model: gpt-4o # Default model for this backend
+    model: gpt-6.1-sol # Default model for this backend
     timeout: 300
 ```
 
@@ -1678,7 +1679,7 @@ Define agent roles and responsibilities using a structured markdown format. Each
 | **Provider**           |          | Backend to use: `claude-code`, `cursor`, or `codex`                 | Routes agent execution to specified backend       |
 | **Provider-Rationale** |          | Explanation for why this provider was chosen                        | Documentation only (not used at runtime)          |
 | **Fallback-Provider**  |          | Backup backend if primary is unavailable                            | Automatic failover when primary fails             |
-| **Model**              |          | Model alias to use: `opus`, `sonnet`, `haiku`, `gpt-4o`, `o1`, etc. | Overrides backend default model for this agent    |
+| **Model**              |          | Model alias to use: `opus`, `sonnet`, `haiku`, `fable`, `gpt-6.1-sol`, etc. | Overrides backend default model for this agent    |
 | **Model-Rationale**    |          | Explanation for why this model was chosen                           | Documentation only (not used at runtime)          |
 | **System-Prompt**      |          | Custom natural language instructions for the agent                  | **Overrides auto-generated prompt when provided** |
 | **Used in**            |          | Pipeline stages where this agent is assigned                        | Documentation only (not used at runtime)          |
