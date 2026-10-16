@@ -3,7 +3,7 @@
  * Validates parsing and validation of agent role definitions
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
@@ -1579,12 +1579,25 @@ orchestrator → developer → reviewer
           (i) => i.severity === 'info' && i.path.endsWith('.model')
         );
         expect(costWarning).toBeDefined();
+        // Current-generation primary aliases only, not superseded raw IDs
+        expect(costWarning?.suggestion).toContain('sonnet');
+        expect(costWarning?.suggestion).not.toContain('claude-haiku-4-5');
+        expect(costWarning?.suggestion).not.toContain('claude-sonnet-5');
         // Haiku 5.5 (via 'haiku' display alias), not the retired Claude 3 Haiku
         expect(costWarning?.suggestion).toContain('haiku');
         expect(costWarning?.suggestion).not.toContain('claude-3-haiku-20240307');
       });
 
       describe('retiring models', () => {
+        // Pin "today" so tests stay deterministic as shutdown dates pass
+        beforeEach(() => {
+          vi.useFakeTimers();
+          vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
+        });
+        afterEach(() => {
+          vi.useRealTimers();
+        });
+
         const make = (model: string) => `# Agents
 
 ### orchestrator
@@ -1622,6 +1635,16 @@ orchestrator → developer → reviewer
           );
           expect(retirement?.message).toContain('2027-04-01');
           expect(retirement?.suggestedValue).toBe('gpt-6-sol');
+        });
+
+        it('should escalate to a warning once the shutdown date has passed', () => {
+          vi.setSystemTime(new Date('2026-10-24T00:00:00Z'));
+          const issues = validateParsedAgents(parseAgentsMd(make('gpt-4')));
+          const retirement = issues.find((i) => i.message.includes('retired'));
+          expect(retirement?.severity).toBe('warning');
+          expect(retirement?.suggestion).toContain('will fail');
+          // Still valid for backward compatibility: no errors
+          expect(issues.some((i) => i.severity === 'error')).toBe(false);
         });
 
         it('should not warn for current models', () => {

@@ -176,6 +176,30 @@ describe('validateAgentsMdWithConfirmation', () => {
         resultWithWarnings.issues.length
       );
     });
+
+    it('keeps retirement warnings when cost warnings are disabled', async () => {
+      const filePath = join(tmpDir, 'AGENTS.md');
+      writeFileSync(
+        filePath,
+        `# Agents
+
+## Configuration
+
+### Developer
+- **Model**: gpt-4o
+- **Responsibilities**: Write code
+`
+      );
+
+      const result = await validateAgentsMdWithConfirmation(filePath, {
+        interactive: false,
+        costWarnings: false,
+      });
+
+      expect(
+        result.issues.some((issue) => issue.message.includes('OpenAI'))
+      ).toBe(true);
+    });
   });
 });
 

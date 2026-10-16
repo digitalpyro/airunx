@@ -48,6 +48,12 @@ name = "openai"
 env_key = "${DEFAULT_API_KEY_ENV.codex}"
 `;
 
+/**
+ * Retry requests that must run on the Codex CLI's own default model,
+ * ignoring both the agent's preferredModel and the backend config model
+ */
+const modelOverrideDisabled = new WeakSet<ExecutionRequest>();
+
 export class CodexAdapter extends BaseCliAdapter {
   name = 'codex' as const;
   private useSubscriptionAuth = false;
@@ -86,8 +92,9 @@ export class CodexAdapter extends BaseCliAdapter {
     // Only pass --model when explicitly configured (via settings or AGENTS.md).
     // When no override is set, let the Codex CLI use its own default model,
     // which is version-appropriate and subscription-compatible.
-    const model =
-      this.config?.model || request.agent.preferredModel || undefined;
+    const model = modelOverrideDisabled.has(request)
+      ? undefined
+      : this.config?.model || request.agent.preferredModel || undefined;
     const modelFlags = model ? ['--model', model] : [];
 
     const args = [
@@ -299,11 +306,13 @@ export class CodexAdapter extends BaseCliAdapter {
         `Model '${currentModel}' rejected — retrying without --model (CLI default)`
       );
 
-      // Clear preferredModel so buildCommand omits --model flag
+      // Clear preferredModel and bypass any backend-configured model so
+      // buildCommand omits the --model flag entirely
       const retryRequest = {
         ...request,
         agent: { ...request.agent, preferredModel: undefined },
       };
+      modelOverrideDisabled.add(retryRequest);
       return super.execute(retryRequest);
     }
 

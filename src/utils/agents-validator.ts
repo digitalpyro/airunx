@@ -15,6 +15,7 @@ import {
   parseAgentsMd,
   validateParsedAgents,
   getCommonModelAliases,
+  isCostWarningIssue,
   type ParsedAgentsConfig,
 } from './agents-schema.js';
 import type { ValidationIssue, ValidationMode } from './file-validator.js';
@@ -216,9 +217,7 @@ export async function validateAgentsMdWithConfirmation(
 
   // Filter cost warnings if disabled
   if (!costWarnings) {
-    issues = issues.filter(
-      (issue) => !(issue.severity === 'info' && issue.path.endsWith('.model'))
-    );
+    issues = issues.filter((issue) => !isCostWarningIssue(issue));
   }
 
   // Separate model issues for interactive handling
@@ -325,9 +324,7 @@ export async function validateAgentsMdWithConfirmation(
     result.parsedConfig = parsed;
     issues = validateParsedAgents(parsed, mode);
     result.issues = issues.filter(
-      (issue) =>
-        costWarnings ||
-        !(issue.severity === 'info' && issue.path.endsWith('.model'))
+      (issue) => costWarnings || !isCostWarningIssue(issue)
     );
   }
 

@@ -16,6 +16,10 @@ class TestableCodexAdapter extends CodexAdapter {
   public testBuildCliArgs(request: ExecutionRequest, prompt: string): string[] {
     return this.buildCliArgs(request, prompt);
   }
+
+  public setBackendModel(model: string): void {
+    this.config = { ...this.config, model } as typeof this.config;
+  }
 }
 
 /**
@@ -187,6 +191,23 @@ describe('CodexAdapter', () => {
       expect(spy).toHaveBeenCalledTimes(2);
       expect(spy.mock.calls[0][0].agent.preferredModel).toBe('gpt-6.1-sol');
       expect(spy.mock.calls[1][0].agent.preferredModel).toBeUndefined();
+    });
+
+    it('omits --model on retry even when the backend config sets a model', async () => {
+      adapter.setBackendModel('gpt-6.1-sol');
+      const spy = vi
+        .spyOn(baseExecute, 'execute')
+        .mockResolvedValueOnce(
+          result(false, "The 'gpt-6.1-sol' model is not supported")
+        )
+        .mockResolvedValueOnce(result(true));
+
+      await adapter.execute(createMockRequest());
+
+      const firstArgs = adapter.testBuildCliArgs(spy.mock.calls[0][0], 'p');
+      const retryArgs = adapter.testBuildCliArgs(spy.mock.calls[1][0], 'p');
+      expect(firstArgs).toContain('--model');
+      expect(retryArgs).not.toContain('--model');
     });
 
     it('does not retry on unrelated failures', async () => {

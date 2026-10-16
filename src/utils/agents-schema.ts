@@ -23,6 +23,7 @@ import {
   MODEL_ALIASES,
   ANTHROPIC_PRICING,
   OPENAI_PRICING,
+  resolveModelAlias,
 } from '../adapters/pricing.js';
 
 /**
@@ -193,22 +194,41 @@ const SUGGESTABLE_MODELS: readonly string[] = VALID_MODELS.filter(
 function createRetirementWarningIssue(
   agentRole: string,
   model: string,
-  lineNumber: number
+  lineNumber: number,
+  today: Date = new Date()
 ): ValidationIssue | null {
-  const normalized = model.toLowerCase();
-  const resolvedModel = MODEL_ALIASES[normalized] || normalized;
-  const retirement = RETIRING_OPENAI_MODELS[resolvedModel];
+  const retirement = RETIRING_OPENAI_MODELS[resolveModelAlias(model)];
   if (!retirement) return null;
 
+  // Shutdown dates are UTC calendar days; compare as YYYY-MM-DD strings
+  const isShutDown =
+    today.toISOString().slice(0, 10) >= retirement.shutdownDate;
   return {
-    severity: 'info',
+    // After shutdown, runs with this model fail at the API, so escalate
+    severity: isShutDown ? 'warning' : 'info',
     path: `agents.${agentRole}.model`,
-    message: `Agent '${agentRole}' uses model '${model}', which OpenAI is retiring (API shutdown ${retirement.shutdownDate})`,
+    message: isShutDown
+      ? `Agent '${agentRole}' uses model '${model}', which OpenAI retired (API shutdown ${retirement.shutdownDate})`
+      : `Agent '${agentRole}' uses model '${model}', which OpenAI is retiring (API shutdown ${retirement.shutdownDate})`,
     value: model,
     suggestedValue: retirement.replacement,
-    suggestion: `Switch to '${retirement.replacement}' before ${retirement.shutdownDate}`,
+    suggestion: isShutDown
+      ? `Switch to '${retirement.replacement}'; runs with '${model}' will fail`
+      : `Switch to '${retirement.replacement}' before ${retirement.shutdownDate}`,
     lineNumber,
   };
+}
+
+/**
+ * Whether a validation issue is an expensive-model cost warning
+ * (used by the cost-warnings toggle so it doesn't hide other model notices)
+ */
+export function isCostWarningIssue(issue: ValidationIssue): boolean {
+  return (
+    issue.severity === 'info' &&
+    issue.path.endsWith('.model') &&
+    issue.message.includes('per 1M tokens')
+  );
 }
 
 /**
@@ -390,7 +410,11 @@ function findCheaperAlternatives(
         pricing.input < currentCost.input &&
         pricing.output < currentCost.output &&
         // Cast needed: legacyModels has literal tuple type from 'as const'
-        !(legacyModels as readonly string[]).includes(modelId)
+        !(legacyModels as readonly string[]).includes(modelId) &&
+        // Anthropic: suggest only current-generation primary alias targets,
+        // not superseded IDs (e.g. claude-haiku-4-5 at 10x haiku's price)
+        (currentCost.provider === 'openai' ||
+          getModelDisplayName(modelId) !== modelId)
     )
     .map(([modelId, pricing]) => ({
       name: getModelDisplayName(modelId),
