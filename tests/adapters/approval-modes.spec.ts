@@ -11,7 +11,10 @@ describe('APPROVAL_MODES', () => {
 describe('APPROVAL_MODE_FLAGS', () => {
   it('maps Codex modes correctly', () => {
     expect(APPROVAL_MODE_FLAGS.codex.manual).toEqual([]);
-    expect(APPROVAL_MODE_FLAGS.codex.auto).toEqual(['--full-auto']);
+    expect(APPROVAL_MODE_FLAGS.codex.auto).toEqual([
+      '--sandbox',
+      'workspace-write',
+    ]);
     expect(APPROVAL_MODE_FLAGS.codex.yolo).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
     ]);

@@ -87,7 +87,11 @@ export class CodexAdapter extends BaseCliAdapter {
     // The pre-push git hook provides the actual git push block.
     const isPipelineMode =
       request.context.additionalContext?.pipelineMode === true;
-    const sandboxFlags = isPipelineMode ? ['--sandbox', 'workspace-write'] : [];
+    // Codex rejects a repeated --sandbox, so skip it when the approval mode already sets one.
+    const sandboxFlags =
+      isPipelineMode && !approvalFlags.includes('--sandbox')
+        ? ['--sandbox', 'workspace-write']
+        : [];
 
     // Only pass --model when explicitly configured (via settings or AGENTS.md).
     // When no override is set, let the Codex CLI use its own default model,

@@ -1053,7 +1053,7 @@ AIRunX supports 3 approval modes to control CLI adapter permission handling:
 | Mode       | Description                         | Adapter Flags                                                                                                        |
 | ---------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | **manual** | Interactive prompts for all actions | No auto-approval flags                                                                                               |
-| **auto**   | Auto-approve all actions (default)  | Codex: `--full-auto`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
+| **auto**   | Auto-approve all actions (default)  | Codex: `--sandbox workspace-write`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
 | **yolo**   | Skip all approvals and sandboxing   | Codex: `--dangerously-bypass-approvals-and-sandbox`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags |
 
 ### Configuration
