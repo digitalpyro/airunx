@@ -13,7 +13,10 @@ import type {
   BackendType,
   AdapterType,
   BackendAvailability,
+  BuiltPrompt,
 } from '../core/adapter-types.js';
+import { PROMPT_SECTION_NAMES } from '../core/types.js';
+import type { PromptSectionBytes, PromptSectionName } from '../core/types.js';
 import { DEFAULT_TEMPERATURE } from './constants.js';
 
 /**
@@ -22,6 +25,32 @@ import { DEFAULT_TEMPERATURE } from './constants.js';
 interface CacheEntry {
   result: ExecutionResult;
   timestamp: number;
+}
+
+/**
+ * UTF-8 byte length of an optional string (0 when absent)
+ */
+function byteLength(text: string | undefined): number {
+  return text ? Buffer.byteLength(text, 'utf8') : 0;
+}
+
+/**
+ * Name of the largest prompt section (ties resolve to the earlier section)
+ */
+export function dominantPromptSection(
+  sections: PromptSectionBytes
+): PromptSectionName {
+  return PROMPT_SECTION_NAMES.reduce((best, name) =>
+    sections[name] > sections[best] ? name : best
+  );
+}
+
+/**
+ * Render a section breakdown for logs, e.g. "total=1200 task=300 other=900"
+ */
+export function formatPromptSections(sections: PromptSectionBytes): string {
+  const parts = PROMPT_SECTION_NAMES.map((name) => `${name}=${sections[name]}`);
+  return [`total=${sections.total}`, ...parts].join(' ');
 }
 
 export abstract class BaseAdapter implements ExecutionAdapter {
@@ -64,6 +93,19 @@ export abstract class BaseAdapter implements ExecutionAdapter {
     task: string,
     context: ProjectContext
   ): string {
+    return this.buildPromptWithSections(agent, task, context).prompt;
+  }
+
+  /**
+   * Build a standardized prompt and report the UTF-8 byte size of each section.
+   * Section content is counted raw; headings, separators, and fixed scaffolding
+   * land in `other` so the sections sum exactly to `total`.
+   */
+  protected buildPromptWithSections(
+    agent: AgentDef,
+    task: string,
+    context: ProjectContext
+  ): BuiltPrompt {
     // Build context lines array for proper formatting
     const contextLines = [`- Working Directory: ${context.workingDirectory}`];
     if (context.gitBranch) {
@@ -122,7 +164,7 @@ export abstract class BaseAdapter implements ExecutionAdapter {
     const additionalContextSection =
       contextParts.length > 0 ? `\n${contextParts.join('\n\n')}\n` : '';
 
-    return `You are the ${agent.role} agent.
+    const prompt = `You are the ${agent.role} agent.
 
 Role: ${agent.role}
 Capabilities: ${agent.capabilities.join(', ')}
@@ -137,6 +179,23 @@ ${agent.systemPrompt ? `\n${agent.systemPrompt}\n` : ''}
 
 Please complete the task according to your role and capabilities.
 Output your results in a structured format.`;
+
+    const total = Buffer.byteLength(prompt, 'utf8');
+    const named = {
+      staticContext: byteLength(additionalCtx?.staticContext),
+      dynamicContext: byteLength(additionalCtx?.dynamicContext),
+      handoffContext: byteLength(additionalCtx?.handoffContext),
+      systemPrompt: byteLength(agent.systemPrompt),
+      task: byteLength(task),
+    };
+    const namedSum = Object.values(named).reduce((sum, n) => sum + n, 0);
+    const sections: PromptSectionBytes = {
+      ...named,
+      other: total - namedSum,
+      total,
+    };
+
+    return { prompt, sections };
   }
 
   /**

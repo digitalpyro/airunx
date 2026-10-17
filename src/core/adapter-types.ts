@@ -4,7 +4,7 @@
  */
 
 import { z } from 'zod';
-import type { AgentRole } from './types.js';
+import type { AgentRole, PromptSectionBytes } from './types.js';
 import { AgentRoleSchema, FidelityConfigSchema } from './types.js';
 
 /**
@@ -234,8 +234,20 @@ export interface ExecutionResult {
     provider?: string;
     /** Number of CLI spawns for this execution (1 for simple, >1 for compound) */
     spawnCount?: number;
+    /** UTF-8 byte size of the prompt sent to the backend */
+    promptBytes?: number;
+    /** Per-section byte breakdown of the prompt (explains large prompts) */
+    promptSections?: PromptSectionBytes;
   };
   errors: Error[];
+}
+
+/**
+ * Prompt text plus its per-section byte breakdown
+ */
+export interface BuiltPrompt {
+  prompt: string;
+  sections: PromptSectionBytes;
 }
 
 /**

@@ -7,7 +7,11 @@
 import { exec, execFile, spawn, type ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { stat } from 'fs/promises';
-import { BaseAdapter } from './base-adapter.js';
+import {
+  BaseAdapter,
+  dominantPromptSection,
+  formatPromptSections,
+} from './base-adapter.js';
 import type {
   ExecutionRequest,
   ExecutionResult,
@@ -358,16 +362,30 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     const startTime = Date.now();
     const { agent, task, context } = request;
     const cliConfig = this.getCliConfig();
+    // Prompt size metrics, attached to every result (success or failure)
+    let promptMetrics: Pick<
+      ExecutionResult['metrics'],
+      'promptBytes' | 'promptSections'
+    > = {};
 
     try {
-      // Build the prompt
-      const prompt = this.buildPrompt(agent, task, context);
+      // Build the prompt and record its per-section byte breakdown
+      const { prompt, sections } = this.buildPromptWithSections(
+        agent,
+        task,
+        context
+      );
+      promptMetrics = { promptBytes: sections.total, promptSections: sections };
+      this.logger.debug(
+        `Prompt sections (bytes): ${formatPromptSections(sections)}`
+      );
 
       // Warn on large prompts — each spawn with a 100KB+ prompt is expensive
       const PROMPT_SIZE_WARNING_THRESHOLD = 100_000; // ~25K tokens
-      if (prompt.length > PROMPT_SIZE_WARNING_THRESHOLD) {
+      if (sections.total > PROMPT_SIZE_WARNING_THRESHOLD) {
+        const dominant = dominantPromptSection(sections);
         this.logger.warn(
-          `Large prompt: ${(prompt.length / 1024).toFixed(0)}KB (~${Math.ceil(prompt.length / 4).toLocaleString()} tokens est., actual may vary)`
+          `Large prompt: ${(sections.total / 1024).toFixed(0)}KB (~${Math.ceil(sections.total / 4).toLocaleString()} tokens est., actual may vary); largest section: ${dominant} ${(sections[dominant] / 1024).toFixed(0)}KB`
         );
       }
 
@@ -438,6 +456,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         duration,
         cost,
         spawnCount: 1, // Single CLI spawn for base adapter
+        ...promptMetrics,
       });
     } catch (error) {
       const duration = Date.now() - startTime;
@@ -456,9 +475,10 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         // total_cost_usd and token counts) only on clean exit. On SIGTERM kill, stdout
         // is typically empty — salvage will not recover cost data in that case.
         // The primary defense against wasted spend is the per-run cost cap, not timeouts.
-        let metrics: { tokensUsed: number; duration: number; cost?: number } = {
+        let metrics: ExecutionResult['metrics'] = {
           tokensUsed: 0,
           duration,
+          ...promptMetrics,
         };
         if (processError.stdout?.trim()) {
           try {
@@ -491,6 +511,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
                 tokensUsed: partial.tokensUsed,
                 duration,
                 cost: salvagedCost,
+                ...promptMetrics,
               };
               this.logger.warn(
                 `Salvaged partial metrics from failed execution: ${partial.tokensUsed} tokens, $${salvagedCost?.toFixed(4) ?? '?'}`
@@ -553,6 +574,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           tokensUsed: 0,
           duration,
           cost: 0,
+          ...promptMetrics,
         },
         errors: [categorizedError],
       };

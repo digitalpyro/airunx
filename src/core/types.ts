@@ -439,6 +439,35 @@ export const TodoSchema = z.object({
 });
 
 /**
+ * Prompt sections whose byte size is tracked per spawn.
+ * `other` covers fixed scaffolding (role header, restrictions, project context,
+ * tool configuration, section headings, separators) so sections sum to `total`.
+ */
+export const PROMPT_SECTION_NAMES = [
+  'staticContext',
+  'dynamicContext',
+  'handoffContext',
+  'systemPrompt',
+  'task',
+  'other',
+] as const;
+export type PromptSectionName = (typeof PROMPT_SECTION_NAMES)[number];
+
+/**
+ * Per-section UTF-8 byte counts for a built prompt (sections sum to `total`)
+ */
+export const PromptSectionBytesSchema = z.object({
+  staticContext: z.number().int().nonnegative(),
+  dynamicContext: z.number().int().nonnegative(),
+  handoffContext: z.number().int().nonnegative(),
+  systemPrompt: z.number().int().nonnegative(),
+  task: z.number().int().nonnegative(),
+  other: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+});
+export type PromptSectionBytes = z.infer<typeof PromptSectionBytesSchema>;
+
+/**
  * Quality metrics schema
  */
 export const QualityMetricsSchema = z.object({
