@@ -14,7 +14,9 @@ import {
   type ProjectContext,
   type BackendType,
   type SpawnContext,
+  type AttemptRecord,
 } from '../core/adapter-types.js';
+import { mergeCostSummaries } from '../core/cost-accounting.js';
 import type {
   AgentRole,
   ExecutionFidelityLevel,
@@ -43,6 +45,14 @@ import {
 import type { ProviderRouter } from './provider-router.js';
 
 const logger = createLogger('agent-invoker');
+
+/**
+ * Enum-like error category: the error class name, never the message
+ */
+function errorCategoryOf(error: Error): string {
+  const ctorName = error.constructor?.name;
+  return ctorName && ctorName !== 'Error' ? ctorName : error.name || 'Error';
+}
 
 /**
  * Agent execution context
@@ -308,6 +318,12 @@ export class AgentInvoker {
     // Execute with retry logic
     let lastError: Error | null = null;
     let result: ExecutionResult | null = null;
+    /** Global attempt number (never reset by fallback) */
+    let globalAttempt = 0;
+    /** Failed results whose (salvaged) spend must reach the returned totals */
+    const failedResults: ExecutionResult[] = [];
+    /** Backend a fallback switched to during the current attempt */
+    let switchedTo: BackendType | undefined;
 
     // Helper to attempt fallback on configuration/auth errors
     // Returns true if fallback was successful and caller should continue loop
@@ -334,6 +350,7 @@ export class AgentInvoker {
           adapter = fallbackAdapter;
           backend = adapter.name;
           triedFallback = true;
+          switchedTo = backend;
           return true;
         }
       } catch (fallbackError) {
@@ -350,9 +367,16 @@ export class AgentInvoker {
       attempt <= this.fidelityParams.retryCount;
       attempt++
     ) {
+      globalAttempt++;
+      const attemptAdapter = adapter;
+      const attemptBackend = backend;
+      const backendAttempt = attempt;
+      let attemptResult: ExecutionResult | undefined;
+      switchedTo = undefined;
       try {
         logger.info(`Attempt ${attempt}/${this.fidelityParams.retryCount}`);
         result = await adapter.execute(request);
+        attemptResult = result;
 
         if (result.success) {
           logger.info(`Agent execution successful on attempt ${attempt}`);
@@ -360,9 +384,23 @@ export class AgentInvoker {
           if (this.circuitBreaker) {
             await this.circuitBreaker.recordSuccess(backend);
           }
-          // Add provider info to metrics before returning
-          return this.addProviderToResult(result, backend);
+          if (globalAttempt > 1) {
+            this.emitAttempt(attemptAdapter, request, {
+              attempt: globalAttempt,
+              backendAttempt,
+              backend: attemptBackend,
+              outcome: 'success',
+              fallback: false,
+              result,
+            });
+          }
+          // Add provider info (and earlier attempts' spend) before returning
+          return this.addProviderToResult(
+            this.withSalvagedSpend(result, failedResults),
+            backend
+          );
         }
+        failedResults.push(result);
 
         // Log each error explicitly so users can see what went wrong
         // Pass error object to logger.warn for stack traces in DEBUG mode
@@ -378,10 +416,25 @@ export class AgentInvoker {
             (err) => err instanceof ConfigurationError
           );
           if (hasConfigError && (await tryFallbackOnConfigError(lastError))) {
+            this.emitFailedAttempt(attemptAdapter, request, {
+              attempt: globalAttempt,
+              backendAttempt,
+              backend: attemptBackend,
+              error: lastError,
+              switchedTo,
+              result: attemptResult,
+            });
             attempt = 0; // Reset attempt counter for new provider
             continue;
           }
         }
+        this.emitFailedAttempt(attemptAdapter, request, {
+          attempt: globalAttempt,
+          backendAttempt,
+          backend: attemptBackend,
+          error: result.errors?.[0],
+          result: attemptResult,
+        });
       } catch (error) {
         lastError = toError(error);
         logger.warn(`Attempt ${attempt} failed:`, error);
@@ -391,9 +444,22 @@ export class AgentInvoker {
           lastError instanceof ConfigurationError &&
           (await tryFallbackOnConfigError(lastError))
         ) {
+          this.emitFailedAttempt(attemptAdapter, request, {
+            attempt: globalAttempt,
+            backendAttempt,
+            backend: attemptBackend,
+            error: lastError,
+            switchedTo,
+          });
           attempt = 0;
           continue;
         }
+        this.emitFailedAttempt(attemptAdapter, request, {
+          attempt: globalAttempt,
+          backendAttempt,
+          backend: attemptBackend,
+          error: lastError,
+        });
 
         // Don't retry timeout errors — they'll just timeout again at the same limit
         if (lastError instanceof TimeoutError) {
@@ -427,22 +493,138 @@ export class AgentInvoker {
     // Return last result if available, or create failure result
     // Add provider info to track which backend was attempted
     if (result) {
-      return this.addProviderToResult(result, backend);
+      return this.addProviderToResult(
+        this.withSalvagedSpend(result, failedResults),
+        backend
+      );
     }
 
+    return this.withSalvagedSpend(
+      {
+        success: false,
+        outputs: {
+          analysis: `Agent execution failed after ${this.fidelityParams.retryCount} attempts`,
+        },
+        metrics: {
+          tokensUsed: 0,
+          duration: 0,
+          cost: 0,
+          provider: backend,
+        },
+        errors: lastError ? [lastError] : [new Error('Unknown error')],
+      },
+      failedResults
+    );
+  }
+
+  /**
+   * Fold the spend of earlier failed attempts into the returned result so
+   * stage totals include retries (the returned result itself is skipped
+   * when it is one of the failed attempts).
+   */
+  private withSalvagedSpend(
+    result: ExecutionResult,
+    failedResults: ExecutionResult[]
+  ): ExecutionResult {
+    const earlier = failedResults.filter((r) => r !== result);
+    if (earlier.length === 0) return result;
+
+    const sum = (pick: (m: ExecutionResult['metrics']) => number): number =>
+      earlier.reduce((acc, r) => acc + pick(r.metrics), 0);
+    const salvagedCost = sum((m) => m.cost ?? 0);
+    const salvagedTokens = sum((m) => m.tokensUsed ?? 0);
+    const salvagedSpawns = sum((m) => m.spawnCount ?? 1);
+    if (salvagedCost > 0) {
+      logger.info(
+        `Including $${salvagedCost.toFixed(4)} spent by ${earlier.length} failed attempt(s) in totals`
+      );
+    }
+
+    const costSummary = mergeCostSummaries(
+      result.metrics.costSummary,
+      ...earlier.map((r) => r.metrics.costSummary)
+    );
     return {
-      success: false,
-      outputs: {
-        analysis: `Agent execution failed after ${this.fidelityParams.retryCount} attempts`,
-      },
+      ...result,
       metrics: {
-        tokensUsed: 0,
-        duration: 0,
-        cost: 0,
-        provider: backend,
+        ...result.metrics,
+        tokensUsed: (result.metrics.tokensUsed ?? 0) + salvagedTokens,
+        cost: (result.metrics.cost ?? 0) + salvagedCost,
+        spawnCount: (result.metrics.spawnCount ?? 1) + salvagedSpawns,
+        ...(costSummary ? { costSummary } : {}),
       },
-      errors: lastError ? [lastError] : [new Error('Unknown error')],
     };
+  }
+
+  /**
+   * Emit an `attempt` event for a failed attempt
+   */
+  private emitFailedAttempt(
+    adapter: ExecutionAdapter,
+    request: ExecutionRequest,
+    facts: {
+      attempt: number;
+      backendAttempt: number;
+      backend: BackendType;
+      error?: Error;
+      switchedTo?: BackendType;
+      result?: ExecutionResult;
+    }
+  ): void {
+    this.emitAttempt(adapter, request, {
+      attempt: facts.attempt,
+      backendAttempt: facts.backendAttempt,
+      backend: facts.backend,
+      outcome: 'failure',
+      errorCategory: facts.error ? errorCategoryOf(facts.error) : 'unknown',
+      fallback: facts.switchedTo !== undefined,
+      fallbackTo: facts.switchedTo,
+      result: facts.result,
+    });
+  }
+
+  /**
+   * Hand an attempt record to the adapter's ledger observer. Never throws.
+   */
+  private emitAttempt(
+    adapter: ExecutionAdapter,
+    request: ExecutionRequest,
+    facts: Pick<
+      AttemptRecord,
+      | 'attempt'
+      | 'backendAttempt'
+      | 'backend'
+      | 'outcome'
+      | 'errorCategory'
+      | 'fallback'
+      | 'fallbackTo'
+    > & { result?: ExecutionResult }
+  ): void {
+    const observer = adapter.getSpawnObserver?.();
+    if (!observer?.onAttempt) return;
+    const { result, ...rest } = facts;
+    const ctx = request.spawnContext;
+    try {
+      observer.onAttempt(
+        {
+          ...rest,
+          workflowId: ctx?.workflowId,
+          stage: ctx?.stage,
+          iteration: ctx?.iteration,
+          spawnId: result?.spawnId,
+          parentSpawnId: ctx?.parentSpawnId,
+          maxAttempts: this.fidelityParams.retryCount,
+          agentRole: request.agent.role,
+          costUsd: result?.metrics.cost,
+          costSummary: result?.metrics.costSummary,
+        },
+        request
+      );
+    } catch (error) {
+      logger.warn(
+        `Attempt observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   /**

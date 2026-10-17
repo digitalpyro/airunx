@@ -27,6 +27,7 @@ import {
 } from '../../src/audit/audit-logger.js';
 import type { AuditEvent } from '../../src/audit/audit-logger.js';
 import { provenanceMix } from '../../src/core/cost-accounting.js';
+import { RetryableError } from '../../src/utils/errors.js';
 
 /** Fixture CLI: each spawn reports a distinct cost; the judge proceeds */
 class FixtureCliAdapter extends BaseCliAdapter {
@@ -35,6 +36,9 @@ class FixtureCliAdapter extends BaseCliAdapter {
   private lastRole = '';
   /** Role whose spawn prints plain text (forces the estimated fallback) */
   public plainTextRole?: string;
+  /** Role whose first spawn fails after partial (salvageable) work */
+  public failFirstRole?: string;
+  private failedOnce = false;
 
   protected getCliConfig(): CliAdapterConfig {
     return {
@@ -61,6 +65,18 @@ class FixtureCliAdapter extends BaseCliAdapter {
         : `Work for spawn ${this.spawnIndex}`;
     if (this.lastRole === this.plainTextRole) {
       return { stdout: 'x'.repeat(4000), stderr: '' };
+    }
+    if (this.lastRole === this.failFirstRole && !this.failedOnce) {
+      this.failedOnce = true;
+      throw Object.assign(new RetryableError('fixture crash', undefined), {
+        stdout: JSON.stringify({
+          result: 'partial',
+          input_tokens: 500,
+          output_tokens: 50,
+          total_cost_usd: 0.0077,
+        }),
+        stderr: '',
+      });
     }
     return {
       stdout: JSON.stringify({
@@ -283,5 +299,109 @@ describe('llm_spawn ledger (fixture-driven run)', () => {
     // The aggregate survives a reload from disk
     const reloaded = await stateManager.load('wf-mix-fixture');
     expect(reloaded?.metrics.costSummary).toEqual(summary);
+  });
+  it('records the retry and judge trail; spawn sum equals stage aggregates', async () => {
+    const auditDir = join(testDir, 'audit');
+    const auditLogger = new AuditLogger(auditDir);
+    const stateManager = new StateManager(join(testDir, 'state'));
+
+    const adapter = new FixtureCliAdapter();
+    adapter.failFirstRole = 'developer';
+    await adapter.init({ type: 'cli' });
+    adapter.setSpawnObserver(createAuditSpawnObserver(auditLogger));
+
+    const pipeline = {
+      name: 'trail-pipeline',
+      description: 'Retry + judge trail',
+      default_fidelity: 'standard',
+      stages: [
+        { name: 'implement', agent: 'developer', input: 'Implement it' },
+        { name: 'judge', agent: 'code-judge', evaluatesStage: 'implement' },
+      ],
+    } as Pipeline;
+    const workflowContext: WorkflowContext = {
+      id: 'wf-trail-fixture',
+      input: 'Add a feature',
+      inputType: 'prompt',
+      mode: 'pipeline',
+      fidelityLevel: 'standard',
+      createdAt: new Date(),
+      status: 'initializing',
+      iterationCount: 0,
+      maxIterations: 3,
+      todos: [],
+      metrics: {
+        tokensUsed: 0,
+        totalTokens: 0,
+        runtime: 0,
+        totalRuntimeMs: 0,
+        stagesCompleted: 0,
+        totalStages: 2,
+        errors: 0,
+        totalCost: 0,
+      },
+    };
+    await stateManager.save(workflowContext);
+
+    const runner = new LangGraphRunner({
+      adapter,
+      stateManager,
+      pipeline,
+      workflowContext,
+      auditLogger,
+    });
+    const finalContext = await runner.execute();
+
+    const events: AuditEvent[] = readdirSync(auditDir)
+      .filter((f) => f.endsWith('.jsonl'))
+      .flatMap((f) =>
+        readFileSync(join(auditDir, f), 'utf-8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as AuditEvent)
+      );
+    const spawns = events.filter((e) => e.event === 'llm_spawn');
+    const attempts = events.filter((e) => e.event === 'attempt');
+    const decisions = events.filter((e) => e.event === 'iteration_decision');
+
+    // Failed attempt + successful retry, both attributed and costed
+    expect(attempts.map((a) => a.details?.outcome)).toEqual([
+      'failure',
+      'success',
+    ]);
+    expect(attempts[0].details).toMatchObject({
+      attempt: 1,
+      stage: 'implement',
+      iteration: 1,
+      error_category: 'RetryableError',
+      salvaged: true,
+      cost_micro_usd: 7700,
+    });
+    expect(attempts[0].spawn_id).toBe(
+      spawns.find((s) => s.details?.success === false)?.spawn_id
+    );
+
+    // Judge verdict recorded
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].details).toMatchObject({
+      verdict: 'PROCEED',
+      iteration: 1,
+      max_iterations: 3,
+      gap_count: 0,
+      will_iterate: false,
+    });
+
+    // Spawn sum equals each stage aggregate (salvaged spend included)
+    for (const record of finalContext.stageRecords ?? []) {
+      const stageMicro = spawns
+        .filter((s) => s.details?.stage === record.stage)
+        .reduce((sum, s) => sum + Number(s.details?.cost_micro_usd ?? 0), 0);
+      expect(Math.round(record.costUsd * 1e6)).toBe(stageMicro);
+    }
+    const implement = finalContext.stageRecords?.find(
+      (r) => r.stage === 'implement'
+    );
+    expect(implement?.spawnCount).toBe(2);
+    expect(implement?.costSummary?.spawnCount).toBe(2);
   });
 });

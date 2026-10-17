@@ -5,9 +5,16 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { LangGraphRunner } from '../../src/orchestrator/langgraph-runner.js';
-import type { ExecutionAdapter, ExecutionResult } from '../../src/core/adapter-types.js';
+import type {
+  ExecutionAdapter,
+  ExecutionResult,
+} from '../../src/core/adapter-types.js';
 import type { Pipeline, WorkflowContext } from '../../src/core/types.js';
 import { StateManager } from '../../src/orchestrator/state-manager.js';
+import {
+  JudgeAgent,
+  type ExtendedJudgeResult,
+} from '../../src/orchestrator/judge-agent.js';
 
 // Mock AuditLogger to prevent tests from writing to .airunx-state/audit/
 vi.mock('../../src/audit/audit-logger.js', () => {
@@ -18,6 +25,7 @@ vi.mock('../../src/audit/audit-logger.js', () => {
     logStageHandoff = vi.fn();
     logStageError = vi.fn();
     logAgentCompletionSignal = vi.fn();
+    logIterationDecision = vi.fn();
   }
   return {
     AuditLogger: MockAuditLogger,
@@ -33,7 +41,14 @@ vi.mock('@langchain/langgraph', () => {
       private nodes = new Map<string, (state: T) => Promise<Partial<T>>>();
       private edges = new Map<
         string,
-        Array<string | { conditional: true; condition: (state: T) => string; targets: Record<string, string> }>
+        Array<
+          | string
+          | {
+              conditional: true;
+              condition: (state: T) => string;
+              targets: Record<string, string>;
+            }
+        >
       >();
       private entryPoint: string | null = null;
 
@@ -56,7 +71,11 @@ vi.mock('@langchain/langgraph', () => {
       });
 
       addConditionalEdges = vi.fn(
-        (from: string, condition: (state: T) => string, targets: Record<string, string>) => {
+        (
+          from: string,
+          condition: (state: T) => string,
+          targets: Record<string, string>
+        ) => {
           if (!this.edges.has(from)) this.edges.set(from, []);
           this.edges.get(from)!.push({ conditional: true, condition, targets });
         }
@@ -76,7 +95,11 @@ vi.mock('@langchain/langgraph', () => {
             const maxIterations = 20; // Safety limit
             let iterationCount = 0;
 
-            while (currentNode && currentNode !== 'END' && iterationCount < maxIterations) {
+            while (
+              currentNode &&
+              currentNode !== 'END' &&
+              iterationCount < maxIterations
+            ) {
               iterationCount++;
 
               // Prevent infinite loops on same node (except judge which may legitimately loop)
@@ -232,16 +255,21 @@ describe('LangGraph Runner', () => {
       const result = await runner.execute();
 
       expect(result).toBeDefined();
-      expect(stateManager.updateStatus).toHaveBeenCalledWith('test-workflow-123', 'running');
+      expect(stateManager.updateStatus).toHaveBeenCalledWith(
+        'test-workflow-123',
+        'running'
+      );
     });
 
     it('should handle execution errors gracefully', async () => {
       // Mock state manager to throw error during execution
-      vi.spyOn(stateManager, 'updateStatus').mockImplementation(async (id, status) => {
-        if (status === 'running') {
-          throw new Error('State update failed');
+      vi.spyOn(stateManager, 'updateStatus').mockImplementation(
+        async (id, status) => {
+          if (status === 'running') {
+            throw new Error('State update failed');
+          }
         }
-      });
+      );
 
       const runner = new LangGraphRunner(
         mockAdapter,
@@ -271,7 +299,10 @@ describe('LangGraph Runner', () => {
       await runner.execute();
 
       // Verify status was updated to running
-      expect(stateManager.updateStatus).toHaveBeenCalledWith('test-workflow-123', 'running');
+      expect(stateManager.updateStatus).toHaveBeenCalledWith(
+        'test-workflow-123',
+        'running'
+      );
       expect(stateManager.updateCurrentStage).toHaveBeenCalled();
     });
   });
@@ -366,7 +397,9 @@ describe('LangGraph Runner', () => {
       // are from implement and document stages only (2 calls, not 3).
       const executeCalls = vi.mocked(mockAdapter.execute).mock.calls;
       const executedTasks = executeCalls.map((call) => call[0].task as string);
-      expect(executedTasks.some((task) => task.includes('Generate docs'))).toBe(true);
+      expect(executedTasks.some((task) => task.includes('Generate docs'))).toBe(
+        true
+      );
     });
   });
 
@@ -480,7 +513,9 @@ describe('LangGraph Runner', () => {
           totalCost: 0.005,
         },
       };
-      const updateSpy = vi.spyOn(stateManager, 'update').mockResolvedValue(contextWithMetrics);
+      const updateSpy = vi
+        .spyOn(stateManager, 'update')
+        .mockResolvedValue(contextWithMetrics);
       vi.spyOn(stateManager, 'updateStatus').mockResolvedValue();
       vi.spyOn(stateManager, 'updateCurrentStage').mockResolvedValue();
       vi.spyOn(stateManager, 'updateMetrics').mockResolvedValue();
@@ -974,9 +1009,11 @@ describe('LangGraph Runner', () => {
 
     const recordAuditCalls = (runner: LangGraphRunner): string[] => {
       const calls: string[] = [];
-      const audit = (runner as unknown as {
-        auditLogger: Record<string, ReturnType<typeof vi.fn>>;
-      }).auditLogger;
+      const audit = (
+        runner as unknown as {
+          auditLogger: Record<string, ReturnType<typeof vi.fn>>;
+        }
+      ).auditLogger;
       audit.logStageStart.mockImplementation((_id: string, stage: string) =>
         calls.push(`start:${stage}`)
       );
@@ -1020,11 +1057,15 @@ describe('LangGraph Runner', () => {
 
       await runner.execute();
 
-      const requests = vi.mocked(mockAdapter.execute).mock.calls.map(
-        (call) => call[0]
-      );
+      const requests = vi
+        .mocked(mockAdapter.execute)
+        .mock.calls.map((call) => call[0]);
       expect(requests.map((r) => r.spawnContext)).toEqual([
-        { workflowId: 'test-workflow-123', stage: 'orchestrator', iteration: 1 },
+        {
+          workflowId: 'test-workflow-123',
+          stage: 'orchestrator',
+          iteration: 1,
+        },
         { workflowId: 'test-workflow-123', stage: 'developer', iteration: 1 },
       ]);
     });
@@ -1070,6 +1111,127 @@ describe('LangGraph Runner', () => {
       await expect(runner.execute()).rejects.toThrow('state store unavailable');
 
       expect(calls).toEqual(['error:orchestrator']);
+    });
+  });
+  describe('iteration_decision events (U4)', () => {
+    const judgePipeline: Pipeline = {
+      name: 'judge-events',
+      description: 'developer + judge',
+      default_fidelity: 'standard',
+      stages: [
+        { name: 'developer', agent: 'developer', input: 'Implement' },
+        {
+          name: 'judge',
+          agent: 'code-judge',
+          input: 'Review',
+          evaluatesStage: 'developer',
+        },
+      ],
+    };
+
+    const judgeResult = (
+      decision: 'ITERATE' | 'PROCEED',
+      gaps: string[]
+    ): ExtendedJudgeResult => ({
+      decision,
+      reason: 'test',
+      gaps,
+      shouldIterate: decision === 'ITERATE',
+      metrics: { tokensUsed: 50, duration: 10, cost: 0.02 },
+    });
+
+    /** State store backed by an in-memory context so callbacks run */
+    const useMemoryState = (): void => {
+      let ctx: WorkflowContext = structuredClone(testContext);
+      vi.spyOn(stateManager, 'update').mockImplementation(
+        async (_id, updater) => {
+          ctx = await updater(ctx);
+          return ctx;
+        }
+      );
+      vi.spyOn(stateManager, 'load').mockImplementation(async () => ctx);
+      vi.spyOn(stateManager, 'updateStatus').mockResolvedValue();
+      vi.spyOn(stateManager, 'updateCurrentStage').mockResolvedValue();
+      vi.spyOn(stateManager, 'updateMetrics').mockResolvedValue();
+      vi.spyOn(stateManager, 'save').mockResolvedValue();
+      vi.spyOn(stateManager, 'incrementIteration').mockImplementation(
+        async () => {
+          ctx.iterationCount = (ctx.iterationCount ?? 0) + 1;
+          return ctx.iterationCount;
+        }
+      );
+    };
+
+    const decisionCalls = (
+      runner: LangGraphRunner
+    ): Array<[string, Record<string, unknown>]> =>
+      (
+        runner as unknown as {
+          auditLogger: { logIterationDecision: ReturnType<typeof vi.fn> };
+        }
+      ).auditLogger.logIterationDecision.mock.calls as Array<
+        [string, Record<string, unknown>]
+      >;
+
+    it('ITERATE emits n of max, gap count, and projected re-run cost', async () => {
+      useMemoryState();
+      vi.spyOn(JudgeAgent.prototype, 'judgeExtended').mockResolvedValueOnce(
+        judgeResult('ITERATE', ['missing tests', 'lint errors'])
+      );
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        judgePipeline,
+        testContext
+      );
+
+      await runner.execute();
+
+      const calls = decisionCalls(runner);
+      expect(calls).toHaveLength(1);
+      const [workflowId, decision] = calls[0];
+      expect(workflowId).toBe('test-workflow-123');
+      expect(decision).toMatchObject({
+        stage: 'judge',
+        evaluatesStage: 'developer',
+        verdict: 'ITERATE',
+        iteration: 1,
+        maxIterations: 3,
+        gapCount: 2,
+        willIterate: true,
+        remainingIterations: 2,
+      });
+      // Completed iteration = developer ($0.01) + judge ($0.02)
+      expect(decision.iterationCostUsd).toBeCloseTo(0.03);
+      // Existing projection: first iteration falls back to run cost so far
+      expect(decision.projectedRerunCostUsd).toBeCloseTo(0.01);
+    });
+
+    it('PROCEED emits an event without a re-run projection', async () => {
+      useMemoryState();
+      vi.spyOn(JudgeAgent.prototype, 'judgeExtended').mockResolvedValueOnce(
+        judgeResult('PROCEED', [])
+      );
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        judgePipeline,
+        testContext
+      );
+
+      await runner.execute();
+
+      const calls = decisionCalls(runner);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][1]).toMatchObject({
+        verdict: 'PROCEED',
+        iteration: 1,
+        maxIterations: 3,
+        gapCount: 0,
+        willIterate: false,
+      });
+      expect(calls[0][1].projectedRerunCostUsd).toBeUndefined();
+      expect(calls[0][1].iterationCostUsd).toBeCloseTo(0.03);
     });
   });
 });

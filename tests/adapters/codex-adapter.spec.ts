@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex-adapter.js';
 import type {
   AdapterConfig,
+  AttemptRecord,
   ExecutionRequest,
   ExecutionResult,
   SpawnRecord,
@@ -17,6 +18,7 @@ import {
   OPENAI_PRICING,
   calculateCost,
 } from '../../src/adapters/pricing.js';
+import { RetryableError } from '../../src/utils/errors.js';
 
 // Create a test subclass to access protected methods
 class TestableCodexAdapter extends CodexAdapter {
@@ -402,5 +404,105 @@ describe('CodexAdapter normalized tokens and cache-aware cost', () => {
       'api_equivalent',
       'billed',
     ]);
+  });
+});
+
+describe('CodexAdapter model-rejection retry ledger (U4)', () => {
+  /** Stub whose spawns are scripted: each entry returns or throws */
+  class ScriptedCodexAdapter extends CodexAdapter {
+    public records: SpawnRecord[] = [];
+    public attempts: AttemptRecord[] = [];
+    public script: Array<() => { stdout: string; stderr: string }> = [];
+
+    async init(config: AdapterConfig): Promise<void> {
+      this.config = config;
+      this.initialized = true;
+      this.setSpawnObserver({
+        onSpawnComplete: (record) => this.records.push(record),
+        onAttempt: (record) => this.attempts.push(record),
+      });
+    }
+
+    protected async executeWithSpawn(): Promise<{
+      stdout: string;
+      stderr: string;
+    }> {
+      const next = this.script.shift();
+      if (!next) throw new Error('no scripted spawn left');
+      return next();
+    }
+  }
+
+  const usage = (input: number, output: number): string =>
+    jsonl(
+      {
+        type: 'turn.completed',
+        usage: { input_tokens: input, output_tokens: output },
+      },
+      { type: 'item.completed', item: { text: 'done' } }
+    );
+
+  it('emits two llm_spawn events, one attempt event, and sums both spawns', async () => {
+    const adapter = new ScriptedCodexAdapter();
+    await adapter.init({ type: 'cli', model: 'gpt-5.6-terra' });
+    adapter.script = [
+      () => {
+        // Rejected after doing some billable work (partial usage salvaged)
+        throw Object.assign(new RetryableError('codex exited 1', undefined), {
+          stdout: usage(10_000, 500),
+          stderr: "The 'gpt-5.6-terra' model is not supported",
+        });
+      },
+      () => ({ stdout: usage(20_000, 1_000), stderr: '' }),
+    ];
+
+    const result = await adapter.execute(
+      createMockRequest({
+        spawnContext: {
+          workflowId: 'wf-codex',
+          stage: 'developer',
+          iteration: 1,
+        },
+      })
+    );
+
+    expect(result.success).toBe(true);
+    expect(adapter.records).toHaveLength(2);
+    const [rejected, retry] = adapter.records;
+    expect(rejected.success).toBe(false);
+    expect(rejected.costUsd).toBeGreaterThan(0);
+
+    expect(adapter.attempts).toHaveLength(1);
+    expect(adapter.attempts[0]).toMatchObject({
+      attempt: 1,
+      outcome: 'failure',
+      errorCategory: 'model_rejected',
+      backend: 'codex',
+      spawnId: rejected.spawnId,
+      workflowId: 'wf-codex',
+      stage: 'developer',
+      costUsd: rejected.costUsd,
+    });
+
+    // Stage aggregate equals the spawn sum
+    expect(result.metrics.cost).toBeCloseTo(
+      (rejected.costUsd ?? 0) + (retry.costUsd ?? 0),
+      10
+    );
+    expect(result.metrics.spawnCount).toBe(2);
+    expect(result.metrics.tokensUsed).toBe(
+      rejected.tokensUsed + retry.tokensUsed
+    );
+    const summary = result.metrics.costSummary;
+    expect(summary?.spawnCount).toBe(2);
+    expect(
+      (summary?.billedMicroUsd ?? 0) +
+        (summary?.apiEquivalentMicroUsd ?? 0) +
+        (summary?.unknownBasisMicroUsd ?? 0)
+    ).toBe(
+      Math.round((rejected.costUsd ?? 0) * 1e6) +
+        Math.round((retry.costUsd ?? 0) * 1e6)
+    );
+    expect(result.spawnId).toBe(retry.spawnId);
   });
 });

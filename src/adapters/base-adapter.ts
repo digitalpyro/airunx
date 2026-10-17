@@ -88,6 +88,13 @@ export abstract class BaseAdapter implements ExecutionAdapter {
     this.spawnObserver = observer;
   }
 
+  /**
+   * The attached spawn ledger observer, if any
+   */
+  getSpawnObserver(): SpawnObserver | undefined {
+    return this.spawnObserver;
+  }
+
   abstract execute(_request: ExecutionRequest): Promise<ExecutionResult>;
   abstract isAvailable(): Promise<BackendAvailability>;
 

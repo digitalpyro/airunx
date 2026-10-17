@@ -217,6 +217,90 @@ describe('AuditLogger', () => {
       ).not.toThrow();
       expect(onError).toHaveBeenCalledOnce();
     });
+
+    it('routes attempt and delegation records into the ledger', () => {
+      const observer = createAuditSpawnObserver(logger);
+      observer.onAttempt?.(
+        {
+          workflowId: 'wf-ledger',
+          stage: 'implement',
+          iteration: 1,
+          spawnId: 'spawn-a',
+          attempt: 2,
+          backendAttempt: 1,
+          backend: 'codex',
+          agentRole: 'developer',
+          outcome: 'failure',
+          errorCategory: 'model_rejected',
+          fallback: false,
+          costUsd: 0.0123,
+        },
+        {} as ExecutionRequest
+      );
+      observer.onDelegation?.(
+        {
+          phase: 'completion',
+          workflowId: 'wf-ledger',
+          spawnId: 'spawn-main',
+          triggerReason: 'keyword',
+          keyword: 'system design',
+          keywordSource: 'task',
+          taskLength: 40,
+          lengthThreshold: 500,
+          subAgentCount: 3,
+          subAgents: ['a', 'b', 'c'],
+          succeededCount: 3,
+          marginalCostUsd: 0.03,
+          marginalCostMicroUsd: 30_000,
+        },
+        {} as ExecutionRequest
+      );
+      logger.logIterationDecision('wf-ledger', {
+        stage: 'judge',
+        verdict: 'ITERATE',
+        iteration: 1,
+        maxIterations: 3,
+        gapCount: 2,
+        willIterate: true,
+        iterationCostUsd: 1.5,
+        projectedRerunCostUsd: 1.25,
+      });
+
+      const [attempt, delegation, decision] = readLines(logger.getLogPath());
+      expect(attempt).toMatchObject({
+        event: 'attempt',
+        run_id: 'wf-ledger',
+        spawn_id: 'spawn-a',
+        details: {
+          attempt: 2,
+          error_category: 'model_rejected',
+          salvaged: true,
+          cost_micro_usd: 12_300,
+        },
+      });
+      expect(delegation).toMatchObject({
+        event: 'delegation',
+        spawn_id: 'spawn-main',
+        details: {
+          phase: 'completion',
+          trigger_reason: 'keyword',
+          keyword: 'system design',
+          sub_agent_count: 3,
+          marginal_cost_micro_usd: 30_000,
+        },
+      });
+      expect(decision).toMatchObject({
+        event: 'iteration_decision',
+        details: {
+          verdict: 'ITERATE',
+          iteration: 1,
+          max_iterations: 3,
+          gap_count: 2,
+          iteration_cost_micro_usd: 1_500_000,
+          projected_rerun_cost_micro_usd: 1_250_000,
+        },
+      });
+    });
   });
 
   describe('dated files', () => {

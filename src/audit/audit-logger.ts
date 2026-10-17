@@ -22,10 +22,13 @@ import {
 import { join } from 'path';
 import { AUDIT_SCHEMA_VERSION, type AuditEvent } from '../task-queue/types.js';
 import type {
+  AttemptRecord,
+  DelegationRecord,
   ExecutionRequest,
   SpawnObserver,
   SpawnRecord,
 } from '../core/adapter-types.js';
+import type { CostSummary } from '../core/types.js';
 import { isSensitiveKey, redactSecrets } from '../utils/redaction.js';
 import { ulid } from '../utils/ulid.js';
 
@@ -165,6 +168,47 @@ export function toMicroUsd(usd: number | undefined): number | undefined {
     : Math.round(usd * 1_000_000);
 }
 
+/**
+ * Compact, numbers-only view of a CostSummary for decision events
+ */
+export function compactCostSummary(
+  summary: CostSummary | undefined
+): Record<string, unknown> | undefined {
+  if (!summary) return undefined;
+  return {
+    provenance: summary.provenance ?? 'missing',
+    billed_micro_usd: summary.billedMicroUsd,
+    api_equivalent_micro_usd: summary.apiEquivalentMicroUsd,
+    unknown_basis_micro_usd: summary.unknownBasisMicroUsd,
+    spawn_count: summary.spawnCount,
+    missing_cost_spawns: summary.missingCostSpawns,
+  };
+}
+
+/**
+ * Judge verdict facts for an `iteration_decision` event (R2)
+ */
+export interface IterationDecisionDetails {
+  stage: string;
+  /** Stage the judge evaluated (the re-run target on ITERATE) */
+  evaluatesStage?: string;
+  verdict: string;
+  /** 1-indexed iteration that just completed */
+  iteration: number;
+  maxIterations: number;
+  gapCount: number;
+  /** The judge decided to run another iteration */
+  willIterate: boolean;
+  /** Cost of the completed iteration (all its stage records, judge included) */
+  iterationCostUsd?: number;
+  /** Projected cost of the re-run (ITERATE only) */
+  projectedRerunCostUsd?: number;
+  remainingIterations?: number;
+  /** Run total so far */
+  runCostUsd?: number;
+  spawnId?: string;
+}
+
 export class AuditLogger {
   private logDir: string;
   /** Paths whose permissions were already tightened in this process */
@@ -290,6 +334,98 @@ export class AuditLogger {
           : {}),
         provider_usage: record.providerUsage,
         cost_basis: record.costBasis,
+      },
+    });
+  }
+
+  /**
+   * Log one execution attempt (retry / fallback / model-rejection retry)
+   */
+  logAttempt(record: AttemptRecord): void {
+    this.log({
+      event: 'attempt',
+      workflowId: record.workflowId,
+      ...(record.spawnId ? { spawn_id: record.spawnId } : {}),
+      ...(record.parentSpawnId
+        ? { parent_spawn_id: record.parentSpawnId }
+        : {}),
+      details: {
+        stage: record.stage,
+        iteration: record.iteration,
+        attempt: record.attempt,
+        backend_attempt: record.backendAttempt,
+        max_attempts: record.maxAttempts,
+        backend: record.backend,
+        agent_role: record.agentRole,
+        outcome: record.outcome,
+        error_category: record.errorCategory,
+        fallback: record.fallback,
+        fallback_to: record.fallbackTo,
+        salvaged: record.outcome === 'failure',
+        cost_usd: record.costUsd,
+        cost_micro_usd: toMicroUsd(record.costUsd),
+        cost_summary: compactCostSummary(record.costSummary),
+      },
+    });
+  }
+
+  /**
+   * Log a judge verdict and its spend projection (iteration_decision)
+   */
+  logIterationDecision(
+    workflowId: string,
+    decision: IterationDecisionDetails
+  ): void {
+    this.log({
+      event: 'iteration_decision',
+      workflowId,
+      ...(decision.spawnId ? { spawn_id: decision.spawnId } : {}),
+      details: {
+        stage: decision.stage,
+        evaluates_stage: decision.evaluatesStage,
+        verdict: decision.verdict,
+        iteration: decision.iteration,
+        max_iterations: decision.maxIterations,
+        gap_count: decision.gapCount,
+        will_iterate: decision.willIterate,
+        iteration_cost_usd: decision.iterationCostUsd,
+        iteration_cost_micro_usd: toMicroUsd(decision.iterationCostUsd),
+        projected_rerun_cost_usd: decision.projectedRerunCostUsd,
+        projected_rerun_cost_micro_usd: toMicroUsd(
+          decision.projectedRerunCostUsd
+        ),
+        remaining_iterations: decision.remainingIterations,
+        run_cost_micro_usd: toMicroUsd(decision.runCostUsd),
+      },
+    });
+  }
+
+  /**
+   * Log a CE delegation decision or completion (delegation)
+   */
+  logDelegation(record: DelegationRecord): void {
+    this.log({
+      event: 'delegation',
+      workflowId: record.workflowId,
+      ...(record.spawnId ? { spawn_id: record.spawnId } : {}),
+      ...(record.parentSpawnId
+        ? { parent_spawn_id: record.parentSpawnId }
+        : {}),
+      details: {
+        phase: record.phase,
+        stage: record.stage,
+        iteration: record.iteration,
+        trigger_reason: record.triggerReason,
+        keyword: record.keyword,
+        keyword_source: record.keywordSource,
+        task_length: record.taskLength,
+        length_threshold: record.lengthThreshold,
+        sub_agent_count: record.subAgentCount,
+        sub_agents: record.subAgents,
+        succeeded_count: record.succeededCount,
+        marginal_cost_usd: record.marginalCostUsd,
+        marginal_cost_micro_usd: record.marginalCostMicroUsd,
+        marginal_cost_summary: compactCostSummary(record.marginalCostSummary),
       },
     });
   }
@@ -610,7 +746,8 @@ function parseAuditLine(line: string): AuditEvent | null {
 }
 
 /**
- * SpawnObserver that writes each spawn to the audit ledger as `llm_spawn`.
+ * SpawnObserver that writes each spawn to the audit ledger as `llm_spawn`,
+ * and attempt/delegation decision events as `attempt` / `delegation`.
  * Routing is purely on the request's spawnContext (carried in the record),
  * so one observer serves every runner sharing an adapter factory.
  * Write failures are swallowed — the ledger must never break a run.
@@ -623,6 +760,20 @@ export function createAuditSpawnObserver(
     onSpawnComplete(record: SpawnRecord, _request: ExecutionRequest): void {
       try {
         auditLogger.logLlmSpawn(record);
+      } catch (error) {
+        onError?.(error);
+      }
+    },
+    onAttempt(record: AttemptRecord, _request: ExecutionRequest): void {
+      try {
+        auditLogger.logAttempt(record);
+      } catch (error) {
+        onError?.(error);
+      }
+    },
+    onDelegation(record: DelegationRecord, _request: ExecutionRequest): void {
+      try {
+        auditLogger.logDelegation(record);
       } catch (error) {
         onError?.(error);
       }

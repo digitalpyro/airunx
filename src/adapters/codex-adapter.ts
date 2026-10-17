@@ -30,6 +30,7 @@ import {
   DEFAULT_MODELS,
 } from './constants.js';
 import { ConfigurationError } from '../utils/errors.js';
+import { mergeCostSummaries } from '../core/cost-accounting.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('codex-adapter');
@@ -387,10 +388,75 @@ export class CodexAdapter extends BaseCliAdapter {
         agent: { ...request.agent, preferredModel: undefined },
       };
       modelOverrideDisabled.add(retryRequest);
-      return super.execute(retryRequest);
+      this.emitModelRejectedAttempt(request, result);
+      const retryResult = await super.execute(retryRequest);
+      return this.withRejectedSpawnSpend(retryResult, result);
     }
 
     return result;
+  }
+
+  /**
+   * Record the rejected first spawn as an `attempt` event (model_rejected)
+   */
+  private emitModelRejectedAttempt(
+    request: ExecutionRequest,
+    rejected: ExecutionResult
+  ): void {
+    const observer = this.spawnObserver;
+    if (!observer?.onAttempt) return;
+    const ctx = request.spawnContext;
+    try {
+      observer.onAttempt(
+        {
+          workflowId: ctx?.workflowId,
+          stage: ctx?.stage,
+          iteration: ctx?.iteration,
+          spawnId: rejected.spawnId,
+          parentSpawnId: ctx?.parentSpawnId,
+          attempt: 1,
+          backendAttempt: 1,
+          backend: this.name,
+          agentRole: request.agent.role,
+          outcome: 'failure',
+          errorCategory: 'model_rejected',
+          fallback: false,
+          costUsd: rejected.metrics.cost,
+          costSummary: rejected.metrics.costSummary,
+        },
+        request
+      );
+    } catch (error) {
+      logger.warn(
+        `Attempt observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Add the rejected spawn's spend to the retry's result so the stage
+   * aggregate equals the sum of both llm_spawn events
+   */
+  private withRejectedSpawnSpend(
+    retry: ExecutionResult,
+    rejected: ExecutionResult
+  ): ExecutionResult {
+    const costSummary = mergeCostSummaries(
+      retry.metrics.costSummary,
+      rejected.metrics.costSummary
+    );
+    return {
+      ...retry,
+      metrics: {
+        ...retry.metrics,
+        tokensUsed:
+          (retry.metrics.tokensUsed ?? 0) + (rejected.metrics.tokensUsed ?? 0),
+        cost: (retry.metrics.cost ?? 0) + (rejected.metrics.cost ?? 0),
+        spawnCount:
+          (retry.metrics.spawnCount ?? 1) + (rejected.metrics.spawnCount ?? 1),
+        ...(costSummary ? { costSummary } : {}),
+      },
+    };
   }
 
   protected buildEnv(): Record<string, string | undefined> {

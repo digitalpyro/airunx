@@ -11,6 +11,8 @@
 
 import { ClaudeCodeAdapter } from './claude-code-adapter.js';
 import type {
+  DelegationRecord,
+  DelegationTriggerReason,
   ExecutionRequest,
   ExecutionResult,
   ProjectContext,
@@ -18,7 +20,7 @@ import type {
 import { SUB_AGENT_TYPES, type SubAgentType } from '../core/adapter-types.js';
 import { createLogger } from '../utils/logger.js';
 import type { CostSummary } from '../core/types.js';
-import { mergeCostSummaries } from '../core/cost-accounting.js';
+import { mergeCostSummaries, usdToMicroUsd } from '../core/cost-accounting.js';
 
 const logger = createLogger('compound-engineering-adapter');
 
@@ -30,6 +32,27 @@ const COMPLEX_TASK_LENGTH_THRESHOLD = 500;
 
 // Re-export for backward compatibility
 export { SUB_AGENT_TYPES, type SubAgentType } from '../core/adapter-types.js';
+
+/**
+ * Why delegation fired. Length takes precedence when both length and a
+ * keyword match; the keyword is still reported.
+ */
+export interface DelegationTrigger {
+  reason: DelegationTriggerReason;
+  keyword?: string;
+  keywordSource?: 'task' | 'analysis';
+}
+
+/** Analysis phrases that signal a complex task */
+const ANALYSIS_COMPLEXITY_INDICATORS = [
+  'complex architecture',
+  'multiple components',
+  'system design',
+  'architectural decision',
+  'refactoring needed',
+  'dependency analysis',
+  'cross-cutting concern',
+];
 
 /**
  * Sub-agent delegation request
@@ -186,16 +209,49 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
     }
 
     // Check if we should delegate to sub-agents
-    if (
-      effectiveDelegationEnabled &&
-      this.shouldDelegate(request, mainResult)
-    ) {
+    const trigger = effectiveDelegationEnabled
+      ? this.shouldDelegate(request, mainResult)
+      : null;
+    if (trigger) {
       logger.info('Delegating to sub-agents for comprehensive research');
+
+      const agentsToRun = this.resolveSubAgents(request);
+      const delegationBase = this.delegationBase(
+        request,
+        mainResult,
+        trigger,
+        agentsToRun
+      );
+      this.emitDelegation({ ...delegationBase, phase: 'decision' }, request);
 
       const subAgentResults = await this.executeSubAgents(
         request,
         mainResult.outputs.analysis || '',
-        mainResult.spawnId
+        mainResult.spawnId,
+        agentsToRun
+      );
+
+      // Marginal cost of delegation: exactly the sub-agent spawns' costs,
+      // summed per spawn as the ledger records them
+      const marginalCostMicroUsd = subAgentResults.reduce(
+        (sum, r) => sum + usdToMicroUsd(r.metrics?.cost ?? 0),
+        0
+      );
+      this.emitDelegation(
+        {
+          ...delegationBase,
+          phase: 'completion',
+          succeededCount: subAgentResults.filter((r) => r.success).length,
+          marginalCostUsd: subAgentResults.reduce(
+            (sum, r) => sum + (r.metrics?.cost ?? 0),
+            0
+          ),
+          marginalCostMicroUsd,
+          marginalCostSummary: mergeCostSummaries(
+            ...subAgentResults.map((r) => r.metrics?.costSummary)
+          ),
+        },
+        request
       );
 
       // Synthesize results
@@ -214,62 +270,152 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
   }
 
   /**
-   * Determine if sub-agent delegation is needed based on complexity signals
+   * Determine if sub-agent delegation is needed based on complexity signals.
+   * Returns the trigger (reason + matched keyword), or null to skip.
    */
   private shouldDelegate(
     request: ExecutionRequest,
     mainResult: ExecutionResult
-  ): boolean {
-    const analysis = mainResult.outputs.analysis || '';
+  ): DelegationTrigger | null {
+    const analysis = (mainResult.outputs.analysis || '').toLowerCase();
 
-    // Check for complexity indicators in the main result
-    // These must be specific enough to avoid triggering on simple tasks
-    const complexityIndicators = [
-      'complex architecture',
-      'multiple components',
-      'system design',
-      'architectural decision',
-      'refactoring needed',
-      'dependency analysis',
-      'cross-cutting concern',
-    ];
-
-    const hasComplexityIndicator = complexityIndicators.some((indicator) =>
-      analysis.toLowerCase().includes(indicator)
+    // Complexity indicators in the main result must be specific enough to
+    // avoid triggering on simple tasks
+    const analysisKeyword = ANALYSIS_COMPLEXITY_INDICATORS.find((indicator) =>
+      analysis.includes(indicator)
     );
 
-    // Check if the task itself suggests complexity (must have explicit keywords)
+    // Task keywords that suggest complexity (must be explicit)
     const taskLower = request.task.toLowerCase();
-    const taskComplexity =
-      request.task.length > COMPLEX_TASK_LENGTH_THRESHOLD ||
-      (taskLower.includes('architecture') && taskLower.includes('design')) ||
-      taskLower.includes('system design') ||
-      taskLower.includes('research and analyze');
+    let taskKeyword: string | undefined;
+    if (taskLower.includes('architecture') && taskLower.includes('design')) {
+      taskKeyword = 'architecture+design';
+    } else if (taskLower.includes('system design')) {
+      taskKeyword = 'system design';
+    } else if (taskLower.includes('research and analyze')) {
+      taskKeyword = 'research and analyze';
+    }
+    const overLength = request.task.length > COMPLEX_TASK_LENGTH_THRESHOLD;
 
-    const shouldDelegate = hasComplexityIndicator || taskComplexity;
-
-    if (shouldDelegate) {
-      // Build human-readable reasons for why delegation was triggered
-      const reasons: string[] = [];
-      if (hasComplexityIndicator)
-        reasons.push('complexity indicators in analysis');
-      if (request.task.length > COMPLEX_TASK_LENGTH_THRESHOLD)
-        reasons.push(
-          `task length ${request.task.length} chars > ${COMPLEX_TASK_LENGTH_THRESHOLD}`
-        );
-      if (taskComplexity && !reasons.some((r) => r.includes('task length')))
-        reasons.push('task keywords match (architecture/design/research)');
-
-      logger.info(
-        `Delegation triggered: spawning ${this.subAgents.length} sub-agents (${reasons.join(', ')})`
-      );
-    } else {
+    const keyword = analysisKeyword ?? taskKeyword;
+    if (!overLength && keyword === undefined) {
       logger.debug(
-        `Delegation decision: skipped (complexity: ${hasComplexityIndicator}, task: ${taskComplexity})`
+        `Delegation decision: skipped (complexity: false, task: false)`
+      );
+      return null;
+    }
+
+    // Build human-readable reasons for why delegation was triggered
+    const reasons: string[] = [];
+    if (analysisKeyword) reasons.push('complexity indicators in analysis');
+    if (overLength)
+      reasons.push(
+        `task length ${request.task.length} chars > ${COMPLEX_TASK_LENGTH_THRESHOLD}`
+      );
+    if (taskKeyword && !overLength)
+      reasons.push('task keywords match (architecture/design/research)');
+    logger.info(
+      `Delegation triggered: spawning ${this.subAgents.length} sub-agents (${reasons.join(', ')})`
+    );
+
+    return {
+      reason: overLength ? 'length' : 'keyword',
+      ...(keyword !== undefined
+        ? {
+            keyword,
+            keywordSource: analysisKeyword !== undefined ? 'analysis' : 'task',
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * Fields shared by a delegation's decision and completion events
+   */
+  private delegationBase(
+    request: ExecutionRequest,
+    mainResult: ExecutionResult,
+    trigger: DelegationTrigger,
+    agentsToRun: SubAgentType[]
+  ): Omit<DelegationRecord, 'phase'> {
+    const ctx = request.spawnContext;
+    return {
+      workflowId: ctx?.workflowId,
+      stage: ctx?.stage,
+      iteration: ctx?.iteration,
+      spawnId: mainResult.spawnId,
+      parentSpawnId: ctx?.parentSpawnId,
+      triggerReason: trigger.reason,
+      keyword: trigger.keyword,
+      keywordSource: trigger.keywordSource,
+      taskLength: request.task.length,
+      lengthThreshold: COMPLEX_TASK_LENGTH_THRESHOLD,
+      subAgentCount: agentsToRun.length,
+      subAgents: [...agentsToRun],
+    };
+  }
+
+  /**
+   * Hand a delegation record to the ledger observer. Never throws.
+   */
+  private emitDelegation(
+    record: DelegationRecord,
+    request: ExecutionRequest
+  ): void {
+    const observer = this.spawnObserver;
+    if (!observer?.onDelegation) return;
+    try {
+      observer.onDelegation(record, request);
+    } catch (error) {
+      logger.warn(
+        `Delegation observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Sub-agents to run for a request: the agent's configured list (invalid
+   * types dropped) or all available
+   */
+  private resolveSubAgents(parentRequest: ExecutionRequest): SubAgentType[] {
+    // Get configured sub-agents from request, or use all available
+    const configuredSubAgentStrings =
+      parentRequest.agent.providerConfig?.subAgents;
+
+    if (configuredSubAgentStrings === undefined) {
+      // No configuration - use all available (current default behavior)
+      logger.debug(
+        `Using default sub-agents for ${parentRequest.agent.role}: [${this.subAgents.join(', ')}]`
+      );
+      return this.subAgents;
+    }
+
+    // Explicit configuration - partition into valid/invalid in single pass
+    // Validation should have caught invalid types, but this makes the adapter robust
+    const [validAgents, invalidAgents] = configuredSubAgentStrings.reduce<
+      [SubAgentType[], string[]]
+    >(
+      ([valid, invalid], sa) => {
+        if ((SUB_AGENT_TYPES as readonly string[]).includes(sa)) {
+          valid.push(sa as SubAgentType);
+        } else {
+          invalid.push(sa);
+        }
+        return [valid, invalid];
+      },
+      [[], []]
+    );
+
+    if (invalidAgents.length > 0) {
+      logger.warn(
+        `Ignoring invalid sub-agent types for agent '${parentRequest.agent.role}': ${invalidAgents.join(', ')}`
       );
     }
 
-    return shouldDelegate;
+    logger.debug(
+      `Using configured sub-agents for ${parentRequest.agent.role}: [${validAgents.join(', ')}]`
+    );
+    return validAgents;
   }
 
   /**
@@ -278,50 +424,10 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
   private async executeSubAgents(
     parentRequest: ExecutionRequest,
     parentAnalysis: string,
-    parentSpawnId?: string
+    parentSpawnId?: string,
+    agentsToRun: SubAgentType[] = this.resolveSubAgents(parentRequest)
   ): Promise<SubAgentResult[]> {
     const results: SubAgentResult[] = [];
-
-    // Get configured sub-agents from request, or use all available
-    const configuredSubAgentStrings =
-      parentRequest.agent.providerConfig?.subAgents;
-
-    // Determine which sub-agents to run
-    let agentsToRun: SubAgentType[];
-    if (configuredSubAgentStrings !== undefined) {
-      // Explicit configuration - partition into valid/invalid in single pass
-      // Validation should have caught invalid types, but this makes the adapter robust
-      const [validAgents, invalidAgents] = configuredSubAgentStrings.reduce<
-        [SubAgentType[], string[]]
-      >(
-        ([valid, invalid], sa) => {
-          if ((SUB_AGENT_TYPES as readonly string[]).includes(sa)) {
-            valid.push(sa as SubAgentType);
-          } else {
-            invalid.push(sa);
-          }
-          return [valid, invalid];
-        },
-        [[], []]
-      );
-      agentsToRun = validAgents;
-
-      if (invalidAgents.length > 0) {
-        logger.warn(
-          `Ignoring invalid sub-agent types for agent '${parentRequest.agent.role}': ${invalidAgents.join(', ')}`
-        );
-      }
-
-      logger.debug(
-        `Using configured sub-agents for ${parentRequest.agent.role}: [${agentsToRun.join(', ')}]`
-      );
-    } else {
-      // No configuration - use all available (current default behavior)
-      agentsToRun = this.subAgents;
-      logger.debug(
-        `Using default sub-agents for ${parentRequest.agent.role}: [${agentsToRun.join(', ')}]`
-      );
-    }
 
     // Early return if no sub-agents configured
     if (agentsToRun.length === 0) {

@@ -1115,6 +1115,9 @@ export class LangGraphRunner {
 
     let shouldIterate = false;
     let iterationTarget: string | undefined;
+    /** Projected re-run cost on ITERATE (for the iteration_decision event) */
+    let projectedRerunCostUsd: number | undefined;
+    let remainingIterationsAfter: number | undefined;
 
     // Prepare updated stage outputs (may be modified for iteration)
     let updatedStageOutputs = { ...state.stageOutputs };
@@ -1132,6 +1135,8 @@ export class LangGraphRunner {
       const projectedCost = lastEntry?.costUsd ?? currentTotalCost;
       const remainingIterations =
         (this.workflowContext.maxIterations ?? 1) - currentIteration - 1;
+      projectedRerunCostUsd = projectedCost;
+      remainingIterationsAfter = remainingIterations;
       logger.info(
         `Iterating: cost so far $${currentTotalCost.toFixed(2)}, ` +
           `projected next iteration ~$${projectedCost.toFixed(2)}, ` +
@@ -1289,6 +1294,29 @@ export class LangGraphRunner {
       this.recordStageTiming(context, stageName, stageDuration);
 
       return context;
+    });
+
+    // Every verdict is a spend decision: record it with the completed
+    // iteration's cost and (on ITERATE) the projected re-run cost
+    let runCostUsd: number | undefined;
+    try {
+      runCostUsd = (await this.stateManager.load(state.workflowId))?.metrics
+        .totalCost;
+    } catch {
+      // Best-effort figure only
+    }
+    this.auditLogger?.logIterationDecision(state.workflowId, {
+      stage: stageName,
+      evaluatesStage,
+      verdict: judgeResult.decision,
+      iteration: currentIteration + 1,
+      maxIterations,
+      gapCount: judgeResult.gaps.length,
+      willIterate: shouldIterate,
+      iterationCostUsd: iterationEntry.costUsd,
+      projectedRerunCostUsd,
+      remainingIterations: remainingIterationsAfter,
+      runCostUsd,
     });
 
     this.auditLogger?.logStageComplete(

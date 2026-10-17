@@ -313,6 +313,75 @@ export interface SpawnRecord {
  */
 export interface SpawnObserver {
   onSpawnComplete(record: SpawnRecord, request: ExecutionRequest): void;
+  /** One execution attempt (retry, fallback switch, model-rejection retry) */
+  onAttempt?(record: AttemptRecord, request: ExecutionRequest): void;
+  /** CE sub-agent delegation decision and completion */
+  onDelegation?(record: DelegationRecord, request: ExecutionRequest): void;
+}
+
+/**
+ * Correlation shared by decision events (copied from the request's
+ * spawnContext; absent fields → unattributed)
+ */
+export interface DecisionEventContext {
+  workflowId?: string;
+  stage?: string;
+  iteration?: number;
+  /** Spawn the event is about (the attempt's spawn / the delegating spawn) */
+  spawnId?: string;
+  parentSpawnId?: string;
+}
+
+/**
+ * One execution attempt that was retried, triggered a fallback, or
+ * succeeded after earlier failures. Clean first-attempt successes are not
+ * recorded (they are not a spend multiplier).
+ */
+export interface AttemptRecord extends DecisionEventContext {
+  /** 1-indexed, counted across fallback switches (never resets) */
+  attempt: number;
+  /** 1-indexed per-backend counter (resets after a fallback switch) */
+  backendAttempt: number;
+  /** Configured attempts per backend */
+  maxAttempts?: number;
+  backend: BackendType;
+  agentRole: AgentRole;
+  outcome: 'success' | 'failure';
+  /** Error class name / enum (never the provider message) */
+  errorCategory?: string;
+  /** This attempt's failure switched to another backend */
+  fallback: boolean;
+  fallbackTo?: BackendType;
+  /** Cost spent by this attempt (salvaged when it failed); undefined = unknown */
+  costUsd?: number;
+  costSummary?: CostSummary;
+}
+
+/** Why CE delegated to sub-agents */
+export type DelegationTriggerReason = 'length' | 'keyword';
+
+/**
+ * CE delegation: `decision` is emitted before sub-agents spawn, `completion`
+ * after they finish with the marginal sub-agent cost.
+ */
+export interface DelegationRecord extends DecisionEventContext {
+  phase: 'decision' | 'completion';
+  triggerReason: DelegationTriggerReason;
+  /** Matched keyword when triggerReason is `keyword` (or also matched) */
+  keyword?: string;
+  /** Where the keyword matched: the task text or the main spawn's analysis */
+  keywordSource?: 'task' | 'analysis';
+  taskLength: number;
+  lengthThreshold: number;
+  subAgentCount: number;
+  subAgents: string[];
+  /** completion only */
+  succeededCount?: number;
+  /** completion only: sum of the sub-agent spawns' costs */
+  marginalCostUsd?: number;
+  /** completion only: integer micro-USD sum of per-spawn ledger costs */
+  marginalCostMicroUsd?: number;
+  marginalCostSummary?: CostSummary;
 }
 
 /**
@@ -405,6 +474,12 @@ export interface ExecutionAdapter {
    * that never spawn may omit it)
    */
   setSpawnObserver?(observer: SpawnObserver | undefined): void;
+
+  /**
+   * The attached ledger observer, so callers that drive this adapter (e.g.
+   * the AgentInvoker retry loop) can emit decision events on the same route
+   */
+  getSpawnObserver?(): SpawnObserver | undefined;
 }
 
 /**
