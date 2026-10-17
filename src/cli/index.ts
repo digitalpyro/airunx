@@ -305,6 +305,10 @@ cleanupCmd
     '--debug-files [days]',
     'Clean up debug files older than N days (default: 7)'
   )
+  .option(
+    '--audit-logs [days]',
+    'Clean up audit logs older than N days (default: 30; current UTC day always kept)'
+  )
   .option('--workflow-state', 'Clean up workflow state files')
   .option('--todos', 'Clean up todo files')
   .option('--all', 'Clean up all resource types')
