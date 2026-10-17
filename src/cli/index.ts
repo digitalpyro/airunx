@@ -35,6 +35,7 @@ import {
   circuitResetCommand,
 } from './commands/circuit.js';
 import { registerHeartbeatCommands } from './commands/heartbeat.js';
+import { registerCostsCommands } from './commands/costs.js';
 import { CONFIG_FILE_TYPES } from '../utils/file-validator.js';
 
 /**
@@ -370,5 +371,8 @@ program
 
 // Heartbeat execution mode commands
 registerHeartbeatCommands(program);
+
+// Cost ledger reading surface
+registerCostsCommands(program);
 
 program.parse();
