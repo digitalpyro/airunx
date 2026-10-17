@@ -293,6 +293,26 @@ describe('BaseCliAdapter', () => {
       }
     });
 
+    it('never passes provider admin keys to CLI children', () => {
+      const keys = ['ANTHROPIC_ADMIN_KEY', 'OPENAI_ADMIN_KEY'] as const;
+      const saved = Object.fromEntries(
+        [...keys, 'AIRUNX_EXTRA_ENV_VARS'].map((k) => [k, process.env[k]])
+      );
+      process.env.ANTHROPIC_ADMIN_KEY = 'sk-ant-admin01-secret';
+      process.env.OPENAI_ADMIN_KEY = 'sk-admin-secret';
+      // Even the escape hatch cannot opt them in
+      process.env.AIRUNX_EXTRA_ENV_VARS = keys.join(',');
+      try {
+        const env = (adapter as any).getFilteredEnv();
+        for (const key of keys) expect(key in env).toBe(false);
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+
     it('includes CI vars when CI=true', () => {
       const origCI = process.env.CI;
       const origActions = process.env.GITHUB_ACTIONS;

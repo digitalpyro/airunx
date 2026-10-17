@@ -25,6 +25,12 @@ import {
   isValidWorkflowId,
 } from '../../utils/workflow-id.js';
 import { formatRunCosts } from '../formatters/costs-formatter.js';
+import {
+  formatReconcileReport,
+  reconcileUsage,
+  type ReconcileOptions,
+  type ReconcileReport,
+} from '../../integrations/usage-reconciler.js';
 
 export interface CostsOptions {
   workflowId?: string;
@@ -146,6 +152,51 @@ export async function costsCommand(options: CostsOptions): Promise<void> {
   process.exit(0);
 }
 
+export interface ReconcileCommandOptions extends ReconcileOptions {
+  json?: boolean;
+}
+
+/**
+ * `airunx costs reconcile` action. Exits 0 whenever reconciliation ran —
+ * missing admin keys, provider failures and drift are reported, not fatal.
+ * Exits 1 only on invalid options.
+ */
+export async function reconcileCommand(
+  options: ReconcileCommandOptions
+): Promise<void> {
+  const { json, ...reconcileOptions } = options;
+  let report: ReconcileReport;
+  try {
+    report = await reconcileUsage(reconcileOptions);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (json) {
+      console.log(JSON.stringify({ error: message }, null, 2));
+    } else {
+      console.error(chalk.red(`Error: ${message}`));
+    }
+    process.exit(1);
+    return;
+  }
+
+  // Warnings are already redacted and never carry provider response bodies
+  for (const warning of report.warnings) {
+    console.error(chalk.yellow(`Warning: ${warning}`));
+  }
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(formatReconcileReport(report));
+  }
+  process.exit(0);
+}
+
+function parseDays(value: string): number {
+  const n = Number(value);
+  // Range is validated by the reconciler; NaN passes through to fail there
+  return Number.isInteger(n) ? n : Number.NaN;
+}
+
 /**
  * Register `costs` and its subcommands. `costs show` is the default, so
  * `airunx costs --workflow-id <id>` works; further subcommands (e.g.
@@ -168,6 +219,35 @@ export function registerCostsCommands(program: Command): Command {
     .option('-j, --json', 'Output machine-readable JSON')
     .action((opts: { workflowId?: string; json?: boolean }) =>
       costsCommand({ workflowId: opts.workflowId, json: opts.json })
+    );
+
+  costs
+    .command('reconcile')
+    .description(
+      'Compare billed (API-key) ledger spend per closed UTC day against provider cost reports (needs ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY)'
+    )
+    .option(
+      '--date <YYYY-MM-DD>',
+      'Last UTC day to reconcile (default: yesterday)'
+    )
+    .option('--days <n>', 'Number of days ending at --date (1-31)', parseDays)
+    .option(
+      '--anthropic-workspace <id>',
+      'Restrict Anthropic totals to this workspace (env AIRUNX_ANTHROPIC_WORKSPACE_ID)'
+    )
+    .option(
+      '--openai-project <id>',
+      'Restrict OpenAI totals to this project (env AIRUNX_OPENAI_PROJECT_ID)'
+    )
+    .option('-j, --json', 'Output machine-readable JSON')
+    .action(
+      (opts: {
+        date?: string;
+        days?: number;
+        anthropicWorkspace?: string;
+        openaiProject?: string;
+        json?: boolean;
+      }) => reconcileCommand(opts)
     );
 
   return costs;

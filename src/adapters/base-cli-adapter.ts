@@ -1342,6 +1342,12 @@ export abstract class BaseCliAdapter extends BaseAdapter {
   ];
 
   /** CI-standard vars auto-included when CI=true is detected */
+  /** Never passed to CLI children, whatever the allowlists say */
+  private static readonly ENV_DENYLIST = [
+    'ANTHROPIC_ADMIN_KEY',
+    'OPENAI_ADMIN_KEY',
+  ];
+
   private static readonly CI_VARS = [
     'CI',
     'GITHUB_TOKEN',
@@ -1384,7 +1390,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
     // Merge backend-specific vars (API keys, etc.)
     const backendEnv = this.buildEnv();
-    return { ...filtered, ...backendEnv };
+    const env = { ...filtered, ...backendEnv };
+
+    // Provider admin keys are for `costs reconcile` only — never visible to
+    // agent CLIs, even via AIRUNX_EXTRA_ENV_VARS
+    for (const key of BaseCliAdapter.ENV_DENYLIST) {
+      delete env[key];
+    }
+    return env;
   }
 
   /**
