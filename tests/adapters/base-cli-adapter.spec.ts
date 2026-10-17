@@ -3,9 +3,21 @@
  * Validates CLI execution helpers: output parsing, timeout, buildEnv, error categorization
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { dirname, join } from 'path';
+import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
 import { BaseCliAdapter } from '../../src/adapters/base-cli-adapter.js';
-import type { CliAdapterConfig } from '../../src/adapters/base-cli-adapter.js';
+import type {
+  CliAdapterConfig,
+  SignalLadder,
+} from '../../src/adapters/base-cli-adapter.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+  type InterruptedSpawnSummary,
+} from '../../src/utils/shutdown-coordinator.js';
 import type {
   ExecutionRequest,
   ExecutionResult,
@@ -728,3 +740,245 @@ describe('CompoundEngineeringAdapter spawn attribution', () => {
     expect(sum).toBeCloseTo(result.metrics.cost ?? 0, 10);
   });
 });
+
+// ─── Signal ladder (U9) — real child processes ───────────────────────────────
+
+const FAKE_CLI = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'fixtures',
+  'kill-path',
+  'fake-cli.mjs'
+);
+
+/** Runs tests/fixtures/kill-path/fake-cli.mjs as the CLI, short ladder */
+class ProcessCliAdapter extends BaseCliAdapter {
+  name = 'claude-code' as const;
+  public mode: 'honor' | 'ignore' | 'late' | 'finish' = 'honor';
+  public logPath = '';
+  public ladder: SignalLadder = {
+    interruptGraceMs: 300,
+    terminateGraceMs: 300,
+    postKillSettleMs: 300,
+  };
+
+  protected getCliConfig(): CliAdapterConfig {
+    return {
+      cliCommand: process.execPath,
+      installInstructions: 'n/a',
+      pricingMap: { 'stub-model': { input: 3, output: 15 } },
+      defaultModel: 'stub-model',
+    };
+  }
+
+  protected buildCliArgs(): string[] {
+    return [FAKE_CLI, this.mode, this.logPath];
+  }
+
+  protected getSignalLadder(): SignalLadder {
+    return this.ladder;
+  }
+
+  public defaultLadder(): SignalLadder {
+    return super.getSignalLadder();
+  }
+
+  async init(config: AdapterConfig): Promise<void> {
+    this.config = config;
+    this.initialized = true;
+  }
+
+  async isAvailable(): Promise<BackendAvailability> {
+    return { available: true };
+  }
+}
+
+describe.skipIf(process.platform === 'win32')(
+  'BaseCliAdapter signal ladder (real processes)',
+  () => {
+    let adapter: ProcessCliAdapter;
+    let records: SpawnRecord[];
+    let workDir: string;
+
+    const signalLog = (): string[] =>
+      existsSync(adapter.logPath)
+        ? readFileSync(adapter.logPath, 'utf-8').split('\n').filter(Boolean)
+        : [];
+    const signalsReceived = (): string[] =>
+      signalLog().filter((l) => !l.startsWith('pid '));
+    const cliPid = (): number =>
+      Number(
+        signalLog()
+          .find((l) => l.startsWith('pid '))
+          ?.slice(4)
+      );
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    /** Resolves once the fake CLI has installed its signal handlers */
+    const cliReady = async (): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (!cliPid() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    const request = (timeoutMs: number): ExecutionRequest => ({
+      ...makeRequest({ context: { workingDirectory: workDir } }),
+      fidelityParams: { timeoutMs },
+    });
+
+    beforeEach(async () => {
+      shutdownCoordinator.reset();
+      runSpendTracker.reset();
+      runSpendTracker.setReportsDir(null);
+      workDir = mkdtempSync(join(tmpdir(), 'kill-path-'));
+      adapter = new ProcessCliAdapter();
+      adapter.logPath = join(workDir, 'signals.log');
+      await adapter.init({ type: 'cli' });
+      records = [];
+      adapter.setSpawnObserver({
+        onSpawnComplete: (record) => records.push(record),
+      });
+    });
+
+    afterEach(() => {
+      shutdownCoordinator.reset();
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it('default ladder is SIGINT → 3s → SIGTERM → 2s → SIGKILL (5s)', () => {
+      const ladder = adapter.defaultLadder();
+      expect(ladder.interruptGraceMs).toBe(3_000);
+      expect(ladder.terminateGraceMs).toBe(2_000);
+      expect(ladder.interruptGraceMs + ladder.terminateGraceMs).toBe(5_000);
+    });
+
+    it('clean exit: reported figures, no signals sent', async () => {
+      adapter.mode = 'finish';
+      const result = await adapter.execute(request(10_000));
+      expect(result.success).toBe(true);
+      expect(records).toHaveLength(1);
+      expect(records[0].exitReason).toBe('ok');
+      expect(records[0].costProvenance).toBe('reported');
+      expect(signalsReceived()).toEqual([]);
+    });
+
+    it('timeout: CLI honoring SIGINT emits result JSON → spawn event is reported', async () => {
+      adapter.mode = 'honor';
+      const result = await adapter.execute(request(300));
+
+      expect(result.success).toBe(false);
+      expect(records).toHaveLength(1);
+      const record = records[0];
+      expect(record.exitReason).toBe('timeout');
+      expect(record.costProvenance).toBe('reported');
+      expect(record.costUsd).toBeCloseTo(0.123, 6);
+      expect(record.salvaged).toBe(true);
+      expect(record.providerSessionId).toBe('fake-session');
+      expect(record.estimationMethods).not.toContain('kill_time');
+      // Exactly one interrupt, no escalation needed
+      expect(signalsReceived()).toEqual(['SIGINT']);
+    });
+
+    it('timeout: CLI ignoring SIGINT is escalated to SIGTERM then SIGKILL and actually exits', async () => {
+      adapter.mode = 'ignore';
+      const started = Date.now();
+      const result = await adapter.execute(request(200));
+      const elapsed = Date.now() - started;
+
+      expect(result.success).toBe(false);
+      expect(signalsReceived()).toEqual(['SIGINT', 'SIGTERM']);
+      // Asserted on exit, not child.killed: the process is gone
+      expect(isAlive(cliPid())).toBe(false);
+      expect(elapsed).toBeLessThan(5_000);
+      const record = records[0];
+      expect(record.exitReason).toBe('timeout');
+      expect(record.costProvenance).toBe('estimated');
+      expect(record.estimationMethods).toContain('kill_time');
+      expect(record.costUsd).toBeGreaterThan(0);
+    });
+
+    it('output written after the signal is captured and parsed', async () => {
+      adapter.mode = 'late';
+      const result = await adapter.execute(request(300));
+      expect(String(result.outputs.stdout)).toContain(
+        'partial work after signal'
+      );
+      expect(records[0].exitReason).toBe('timeout');
+      expect(signalsReceived()).toEqual(['SIGINT']);
+    });
+
+    it('shutdown: answering CLI is reported, event written before flush hooks', async () => {
+      adapter.mode = 'honor';
+      const recordsAtFlush: number[] = [];
+      const interruptedAtFlush: InterruptedSpawnSummary[] = [];
+      shutdownCoordinator.onFlush((interrupted) => {
+        recordsAtFlush.push(records.length);
+        interruptedAtFlush.push(...interrupted);
+      });
+
+      const pending = adapter.execute(request(60_000));
+      await cliReady();
+      expect(shutdownCoordinator.activeSpawnCount).toBe(1);
+      await shutdownCoordinator.shutdown();
+      const result = await pending;
+
+      expect(result.success).toBe(false);
+      expect(records).toHaveLength(1);
+      expect(records[0].exitReason).toBe('signal');
+      expect(records[0].costProvenance).toBe('reported');
+      expect(recordsAtFlush).toEqual([1]);
+      expect(interruptedAtFlush).toHaveLength(1);
+      expect(interruptedAtFlush[0]).toMatchObject({
+        workflowId: 'wf-1',
+        stage: 'implement',
+        backend: 'claude-code',
+      });
+      expect(interruptedAtFlush[0].costUsd).toBeCloseTo(0.123, 6);
+      expect(signalsReceived()).toEqual(['SIGINT']);
+      expect(shutdownCoordinator.activeSpawnCount).toBe(0);
+    });
+
+    it('shutdown: non-answering CLI gets an estimated event; a second shutdown does not re-signal', async () => {
+      adapter.mode = 'ignore';
+      const pending = adapter.execute(request(60_000));
+      await cliReady();
+      const first = shutdownCoordinator.shutdown();
+      const second = shutdownCoordinator.shutdown();
+      expect(second).toBe(first);
+      await first;
+      await pending;
+
+      expect(records).toHaveLength(1);
+      expect(records[0].exitReason).toBe('signal');
+      expect(records[0].costProvenance).toBe('estimated');
+      expect(records[0].estimationMethods).toContain('kill_time');
+      expect(signalsReceived()).toEqual(['SIGINT', 'SIGTERM']);
+      expect(isAlive(cliPid())).toBe(false);
+    });
+
+    it('shutdown after terminal Ctrl-C: no second SIGINT, ladder continues with SIGTERM', async () => {
+      adapter.mode = 'ignore';
+      const pending = adapter.execute(request(60_000));
+      await cliReady();
+      await shutdownCoordinator.shutdown({ alreadySignaled: true });
+      await pending;
+      expect(signalsReceived()).toEqual(['SIGTERM']);
+      expect(isAlive(cliPid())).toBe(false);
+    });
+
+    it('no new spawns once shutdown began, and no ledger event for them', async () => {
+      await shutdownCoordinator.shutdown();
+      const result = await adapter.execute(request(10_000));
+      expect(result.success).toBe(false);
+      expect(result.errors[0]).toBeInstanceOf(ShutdownInProgressError);
+      expect(records).toHaveLength(0);
+      expect(signalLog()).toEqual([]);
+    });
+  }
+);

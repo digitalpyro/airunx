@@ -587,7 +587,7 @@ export const StageRecordSchema = z.object({
   costUsd: z.number(),
   promptSummary: z.string().optional(),
   timestamp: z.string(),
-  status: z.enum(['completed', 'error', 'skipped']),
+  status: z.enum(['completed', 'error', 'skipped', 'killed']),
   costSummary: CostSummarySchema.optional(),
 });
 
@@ -762,7 +762,8 @@ export interface StageRecord {
   costUsd: number;
   promptSummary?: string; // first 200 chars of the task prompt
   timestamp: string; // ISO 8601 start time
-  status: 'completed' | 'error' | 'skipped';
+  /** `killed`: in flight when the run was shut down (final report only) */
+  status: 'completed' | 'error' | 'skipped' | 'killed';
   /** Provenance/billing-tagged cost accounting for this stage's spawns */
   costSummary?: CostSummary;
 }

@@ -45,6 +45,13 @@ const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
 const HEARTBEAT_UPDATE_INTERVAL_MS = 30_000;
 
+/**
+ * Outer grace between SIGTERM to `run` (pid only) and SIGKILL to its whole
+ * process group. `run` needs ≤ ~7s: its CLI signal ladder (5s) plus writing
+ * spawn events and the final run report.
+ */
+export const HEARTBEAT_CHILD_GRACE_MS = 15_000;
+
 // Timer reference type for Node.js
 type TimerRef = ReturnType<typeof setTimeout>;
 
@@ -55,6 +62,8 @@ export interface HeartbeatRunnerOptions {
   auditDir?: string;
   /** Additional CLI args forwarded to each `airunx run` invocation (e.g. --backend, --dotenv) */
   runArgs?: string[];
+  /** Override HEARTBEAT_CHILD_GRACE_MS (tests) */
+  childGraceMs?: number;
 }
 
 export class HeartbeatRunner {
@@ -64,6 +73,7 @@ export class HeartbeatRunner {
   private processLock: ProcessLock;
   private repo: string;
   private runArgs: string[];
+  private childGraceMs: number;
 
   private isRunning = false;
   private idleCycles = 0;
@@ -76,6 +86,7 @@ export class HeartbeatRunner {
   constructor(options: HeartbeatRunnerOptions) {
     this.repo = options.repo;
     this.runArgs = options.runArgs ?? [];
+    this.childGraceMs = options.childGraceMs ?? HEARTBEAT_CHILD_GRACE_MS;
     this.auditLogger = new AuditLogger(options.auditDir);
     this.circuitBreaker = new CircuitBreaker(getDefaultStateFilePath());
     this.processLock = new ProcessLock(
@@ -139,20 +150,12 @@ export class HeartbeatRunner {
     logger.info('Stopping heartbeat...');
     this.isRunning = false;
 
-    // Kill running child process and wait for it to exit
-    if (this.currentChild && !this.currentChild.killed) {
+    // Terminate the running child (SIGTERM → grace → group SIGKILL) and
+    // wait for it, so its final run report is on disk before we release
+    if (this.currentChild) {
       logger.info('Terminating running child process...');
-      this.currentChild.kill('SIGTERM');
-      // Wait for child to exit (spawnAirunx clears this.currentChild on close)
-      const deadline = Date.now() + 10_000;
-      while (this.currentChild && Date.now() < deadline) {
-        await this.sleep(100);
-      }
-      if (this.currentChild) {
-        logger.warn('Child process did not exit within 10s, sending SIGKILL');
-        this.currentChild.kill('SIGKILL');
-        this.currentChild = null;
-      }
+      await this.terminateChild(this.currentChild);
+      this.currentChild = null;
     }
 
     // Release current task if any
@@ -438,11 +441,75 @@ export class HeartbeatRunner {
   }
 
   /**
+   * Stop a `run` child: SIGTERM to its pid only (run interrupts its own CLIs
+   * once), wait up to the outer grace for it to exit, then SIGKILL its whole
+   * process group — always, so a CLI that outlived run is reaped too.
+   * Resolves once the group kill has been sent. Never rejects.
+   */
+  private async terminateChild(child: ChildProcess): Promise<void> {
+    const exited = (): boolean =>
+      child.exitCode !== null || child.signalCode !== null;
+    const closed = new Promise<void>((resolve) => {
+      if (exited()) resolve();
+      child.once('exit', () => resolve());
+      child.once('close', () => resolve());
+    });
+
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // Already gone
+    }
+
+    let timer: TimerRef | undefined;
+    const timedOut = await Promise.race([
+      closed.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), this.childGraceMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      logger.warn(
+        `Child did not exit within ${this.childGraceMs / 1000}s of SIGTERM, sending SIGKILL to its process group`
+      );
+    }
+    this.killChildGroup(child);
+  }
+
+  /**
+   * SIGKILL the child's process group (it is a group leader: spawned
+   * detached). Falls back to the pid when group signalling is unavailable.
+   */
+  private killChildGroup(child: ChildProcess): void {
+    if (child.pid === undefined) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already gone
+      }
+      return;
+    }
+    try {
+      if (process.platform === 'win32') {
+        child.kill('SIGKILL');
+      } else {
+        process.kill(-child.pid, 'SIGKILL');
+      }
+    } catch {
+      // ESRCH: the group is already empty
+    }
+  }
+
+  /**
    * Spawn `airunx` CLI as a child process and capture output.
    * Resolves the CLI entry point relative to this package using
    * cross-platform-safe path resolution (no URL.pathname).
    * Includes a configurable timeout (AIRUNX_CHILD_TIMEOUT_MS, default 150 min)
-   * with SIGTERM → SIGKILL escalation to prevent hung children from blocking the daemon.
+   * with SIGTERM → group SIGKILL escalation to prevent hung children from
+   * blocking the daemon. The child is spawned detached so it leads its own
+   * process group (its CLI children join it); it is still awaited and its
+   * stdio captured (never unref'd).
    */
   private spawnAirunx(
     args: string[]
@@ -458,6 +525,7 @@ export class HeartbeatRunner {
       const child = spawn(process.execPath, [cliPath, ...args], {
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
       });
 
       // Track child so stop() can terminate it on shutdown
@@ -473,12 +541,7 @@ export class HeartbeatRunner {
         logger.error(
           `Child process timed out after ${CHILD_TIMEOUT_MS / 60000}min, sending SIGTERM`
         );
-        child.kill('SIGTERM');
-        const killTimer = setTimeout(() => {
-          logger.error('Child did not exit after SIGTERM, sending SIGKILL');
-          child.kill('SIGKILL');
-        }, 10_000);
-        child.once('close', () => clearTimeout(killTimer));
+        void this.terminateChild(child);
       }, CHILD_TIMEOUT_MS);
 
       child.stdout.on('data', (data: Buffer) => {

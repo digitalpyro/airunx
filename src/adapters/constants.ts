@@ -57,9 +57,25 @@ export const FIDELITY_CLI_TIMEOUT: Record<ExecutionFidelityLevel, number> = {
 export const HANG_CHECK_INTERVAL_MS = 30000; // 30 seconds
 
 /**
+ * Signal ladder for stopping a CLI spawn (timeout, hang, or run shutdown):
+ * SIGINT → SIGINT_GRACE_PERIOD_MS → SIGTERM → SIGTERM_GRACE_PERIOD_MS →
+ * SIGKILL. SIGINT first lets a CLI finish its turn and print result JSON
+ * (reported cost); escalation is decided on actual exit, not `child.killed`.
+ * Total 5s, inside the heartbeat's 15s outer grace (HEARTBEAT_CHILD_GRACE_MS).
+ */
+export const SIGINT_GRACE_PERIOD_MS = 3000; // 3 seconds
+
+/**
  * Grace period before escalating SIGTERM to SIGKILL (in milliseconds)
  */
-export const SIGTERM_GRACE_PERIOD_MS = 5000; // 5 seconds
+export const SIGTERM_GRACE_PERIOD_MS = 2000; // 2 seconds
+
+/**
+ * After SIGKILL, how long to wait for the CLI's stdio to close before
+ * settling with the output collected so far (a grandchild holding the pipe
+ * open must not keep the spawn pending)
+ */
+export const POST_KILL_SETTLE_MS = 1000; // 1 second
 
 /**
  * Interval for polling hang detection (in milliseconds)

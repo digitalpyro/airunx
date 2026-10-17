@@ -751,6 +751,14 @@ export async function runOrchestrator(
         const issueUrl =
           parsed.type === 'github' ? parsed.metadata.url : undefined;
 
+        // SIGTERM (heartbeat) / SIGINT (Ctrl-C): interrupt in-flight CLIs
+        // once, let them report, flush the final run report, then exit
+        const { installShutdownSignalHandlers, shutdownCoordinator } =
+          await import('../../utils/shutdown-coordinator.js');
+        const uninstallShutdownHandlers = installShutdownSignalHandlers({
+          exit: (code) => process.exit(code),
+        });
+
         try {
           workflowResult = await executor.execute({
             input: parsed.title,
@@ -780,6 +788,11 @@ export async function runOrchestrator(
         } finally {
           globalThis.clearInterval(updateInterval);
           await verboseReporterHelper?.getReporter()?.stop();
+          // A shutdown in progress owns the exit (after its report flush)
+          if (shutdownCoordinator.isShuttingDown) {
+            await shutdownCoordinator.shutdown();
+          }
+          uninstallShutdownHandlers();
         }
 
         // Update spinner based on actual status

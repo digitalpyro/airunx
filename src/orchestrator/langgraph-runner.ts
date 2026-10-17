@@ -57,6 +57,11 @@ import {
   mergeCostSummaries,
 } from '../core/cost-accounting.js';
 import { formatHandoffContext } from './handoff-context.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+  type InterruptedSpawnSummary,
+} from '../utils/shutdown-coordinator.js';
 
 /**
  * Safety ceiling for LangGraph super-steps. Generous to avoid false trips;
@@ -149,6 +154,8 @@ export class LangGraphRunner {
   private workflowStartTime = 0;
   /** 0-indexed iteration count, kept in step with the judge's iterations */
   private currentIteration = 0;
+  /** Stages started but not yet returned, by name → start time (ISO) */
+  private inFlightStages = new Map<string, string>();
 
   constructor(
     adapter: ExecutionAdapter,
@@ -229,8 +236,11 @@ export class LangGraphRunner {
     stageName: string,
     node: () => Promise<Partial<GraphState>>
   ): Promise<Partial<GraphState>> {
+    this.inFlightStages.set(stageName, new Date().toISOString());
     try {
-      return await node();
+      const result = await node();
+      this.inFlightStages.delete(stageName);
+      return result;
     } catch (error) {
       this.auditLogger?.logStageError(
         workflowId,
@@ -336,6 +346,12 @@ export class LangGraphRunner {
     // Update workflow status
     await this.stateManager.updateStatus(this.workflowContext.id, 'running');
 
+    // On run shutdown (SIGTERM/SIGINT), write a final report that includes
+    // the in-flight stage's spend once interrupted spawns have settled
+    const unregisterFlush = shutdownCoordinator.onFlush((interrupted) =>
+      this.flushReportOnShutdown(interrupted)
+    );
+
     // Execute graph
     logger.info('Executing StateGraph');
     try {
@@ -423,7 +439,83 @@ export class LangGraphRunner {
       logger.error('StateGraph execution failed:', toError(error));
       await this.stateManager.updateStatus(this.workflowContext.id, 'failed');
       throw error;
+    } finally {
+      unregisterFlush();
     }
+  }
+
+  /**
+   * A stage interrupted by run shutdown stops here, still in flight: the
+   * shutdown flush owns its (killed) record, so it is never persisted twice
+   */
+  private assertNotShuttingDown(): void {
+    if (shutdownCoordinator.isShuttingDown) {
+      throw new ShutdownInProgressError();
+    }
+  }
+
+  /**
+   * Final run report on shutdown. Stages still in flight get a `killed`
+   * stage record carrying the spend of their interrupted spawns (reported
+   * when the CLI answered SIGINT with result JSON, else estimated — the
+   * cost summary labels which).
+   */
+  private async flushReportOnShutdown(
+    interrupted: readonly InterruptedSpawnSummary[]
+  ): Promise<void> {
+    const workflowId = this.workflowContext.id;
+    const context =
+      (await this.stateManager.load(workflowId)) ?? this.workflowContext;
+    const stageRecords = [...(context.stageRecords ?? [])];
+    let totalCost = context.metrics.totalCost ?? 0;
+    let totalTokens =
+      context.metrics.totalTokens ?? context.metrics.tokensUsed ?? 0;
+    let costSummary = context.metrics.costSummary;
+
+    for (const [stage, startedAt] of this.inFlightStages) {
+      // The node may already have persisted its own (error) record
+      if (
+        stageRecords.some((r) => r.stage === stage && r.timestamp >= startedAt)
+      ) {
+        continue;
+      }
+      const spawns = interrupted.filter(
+        (s) => s.workflowId === workflowId && s.stage === stage
+      );
+      const killed: StageRecord = {
+        stage,
+        agent:
+          spawns[0]?.agentRole ??
+          this.pipeline.stages.find((st) => st.name === stage)?.agent ??
+          stage,
+        backend:
+          spawns[0]?.backend ?? this.workflowContext.backend ?? 'unknown',
+        spawnCount: spawns.length,
+        durationMs: Date.now() - Date.parse(startedAt),
+        tokensUsed: spawns.reduce((sum, s) => sum + s.tokensUsed, 0),
+        costUsd: spawns.reduce((sum, s) => sum + (s.costUsd ?? 0), 0),
+        timestamp: startedAt,
+        status: 'killed',
+      };
+      const stageSummary = mergeCostSummaries(
+        ...spawns.map((s) => s.costSummary)
+      );
+      if (stageSummary) killed.costSummary = stageSummary;
+      stageRecords.push(killed);
+      totalCost += killed.costUsd;
+      totalTokens += killed.tokensUsed;
+      costSummary = mergeCostSummaries(costSummary, stageSummary);
+    }
+
+    this.writeRunReport(
+      {
+        ...context,
+        stageRecords,
+        metrics: { ...context.metrics, totalCost, totalTokens, costSummary },
+      },
+      Math.round(performance.now() - this.workflowStartTime),
+      'interrupted'
+    );
   }
 
   /**
@@ -713,6 +805,7 @@ export class LangGraphRunner {
       previousOutputs: state.stageOutputs,
       spawnContext: this.buildSpawnContext(state.workflowId, stageName),
     });
+    this.assertNotShuttingDown();
 
     if (!result.success) {
       this.auditLogger?.logStageError(
@@ -1092,6 +1185,7 @@ export class LangGraphRunner {
           ? issueCheckboxes
           : undefined,
     });
+    this.assertNotShuttingDown();
 
     // Build iteration history entry (will be enriched with cost data in state update)
     const stageOutput = state.stageOutputs[evaluatesStage];
@@ -1391,7 +1485,8 @@ export class LangGraphRunner {
    */
   private writeRunReport(
     context: WorkflowContext,
-    totalRuntimeMs: number
+    totalRuntimeMs: number,
+    statusOverride?: string
   ): void {
     try {
       const stageRecords = context.stageRecords || [];
@@ -1408,7 +1503,7 @@ export class LangGraphRunner {
         workflowId: context.id,
         taskTitle: context.taskTitle,
         pipelineName: context.pipelineName,
-        status: context.status,
+        status: statusOverride ?? context.status,
         startedAt: context.createdAt.toISOString(),
         completedAt: new Date().toISOString(),
         totalDurationMs: totalRuntimeMs,

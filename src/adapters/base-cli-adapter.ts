@@ -39,9 +39,15 @@ import {
   DEFAULT_CLI_TIMEOUT,
   HANG_CHECK_INTERVAL_MS,
   HANG_DETECTION_POLL_INTERVAL_MS,
+  SIGINT_GRACE_PERIOD_MS,
   SIGTERM_GRACE_PERIOD_MS,
+  POST_KILL_SETTLE_MS,
   APPROVAL_MODE_FLAGS,
 } from './constants.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+} from '../utils/shutdown-coordinator.js';
 import {
   KILL_TIME_ESTIMATION_METHOD,
   runSpendTracker,
@@ -88,6 +94,10 @@ interface SpawnOutcome {
   spendLostUsd?: number;
   /** Partial cost recovered from a failed spawn's output */
   spendSalvagedUsd?: number;
+  /** Stopped by run shutdown (feeds the final report) */
+  interrupted?: boolean;
+  /** Refused because the run was already shutting down (no process ran) */
+  notSpawned?: boolean;
 }
 
 /**
@@ -105,6 +115,33 @@ interface SpawnTiming {
  * (shorter exits are treated as rejections — auth, bad model — before work)
  */
 const MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS = 5_000;
+
+/** Signal ladder timings (see SIGINT_GRACE_PERIOD_MS in constants.ts) */
+export interface SignalLadder {
+  /** SIGINT → SIGTERM */
+  interruptGraceMs: number;
+  /** SIGTERM → SIGKILL */
+  terminateGraceMs: number;
+  /** SIGKILL → settle with collected output if stdio never closes */
+  postKillSettleMs: number;
+}
+
+/** True until the process has actually exited (not merely been signalled) */
+const processRunning = (child: ChildProcess): boolean =>
+  child.exitCode === null && child.signalCode === null;
+
+/**
+ * A spawn stopped by run shutdown (SIGINT/SIGTERM to `run`). Non-retryable:
+ * the run is exiting. Its stdout (possibly result JSON printed after SIGINT)
+ * is salvaged like any categorized failure.
+ */
+export class SpawnInterruptedError extends NonRetryableError {
+  signal: string | null = 'SIGINT';
+  constructor(cause: string) {
+    super(`CLI interrupted by run shutdown (${cause})`);
+    this.name = 'SpawnInterruptedError';
+  }
+}
 
 /** Exit reasons that mean the CLI was cut off before it could report cost */
 const KILLED_EXIT_REASONS: ReadonlySet<SpawnExitReason> = new Set([
@@ -321,28 +358,29 @@ export abstract class BaseCliAdapter extends BaseAdapter {
   }
 
   /**
-   * Kill process with escalation: SIGTERM → wait → SIGKILL
+   * Signal ladder timings. Overridable by subclasses (tests use short ones).
    */
-  private killProcess(child: ChildProcess, reason: string): void {
-    this.logger.debug(`Killing process (reason: ${reason}), sending SIGTERM`);
-    child.kill('SIGTERM');
-
-    globalThis.setTimeout(() => {
-      if (!child.killed) {
-        this.logger.debug('Process still alive after SIGTERM, sending SIGKILL');
-        child.kill('SIGKILL');
-      }
-    }, SIGTERM_GRACE_PERIOD_MS);
+  protected getSignalLadder(): SignalLadder {
+    return {
+      interruptGraceMs: SIGINT_GRACE_PERIOD_MS,
+      terminateGraceMs: SIGTERM_GRACE_PERIOD_MS,
+      postKillSettleMs: POST_KILL_SETTLE_MS,
+    };
   }
 
   /**
    * Execute CLI command with proper stdin handling, timeout, and hang detection.
    * Uses spawn instead of execFile to prevent hanging on interactive prompts.
    *
-   * Key improvements over execFileAsync:
    * - Closes stdin immediately to prevent interactive prompt waits
-   * - Implements hang detection (kills if no output for HANG_CHECK_INTERVAL_MS)
-   * - Proper process cleanup with SIGTERM → SIGKILL escalation
+   * - Hang detection (no output for HANG_CHECK_INTERVAL_MS after some output)
+   * - On timeout, hang, or run shutdown the signal ladder runs: SIGINT →
+   *   SIGTERM → SIGKILL, escalating only while the process has not actually
+   *   exited. The promise stays open until the process closes (or the ladder
+   *   gives up), so result JSON a CLI prints after SIGINT is captured and
+   *   parsed into reported figures.
+   * - The CLI is NOT detached: it stays in run's process group so the
+   *   heartbeat's final group SIGKILL reaches it.
    */
   protected async executeWithSpawn(
     cliConfig: CliAdapterConfig,
@@ -353,8 +391,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     // Pre-flight validation
     await this.validatePreFlight(workingDirectory);
 
+    // No new spawns once the run is shutting down
+    if (shutdownCoordinator.isShuttingDown) {
+      throw new ShutdownInProgressError();
+    }
+
     return new Promise((resolve, reject) => {
       const timeoutMs = timeoutOverrideMs ?? this.getTimeoutMs();
+      const ladder = this.getSignalLadder();
       let stdout = '';
       let stderr = '';
       let lastOutputTime = Date.now();
@@ -378,7 +422,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       // CRITICAL: Close stdin immediately to prevent interactive prompts
       child.stdin.end();
 
-      // Collect output
+      // Collect output (including anything written after a ladder signal)
       child.stdout.on('data', (data: Buffer) => {
         stdout += data.toString();
         lastOutputTime = Date.now();
@@ -393,81 +437,156 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         hasOutput = true;
       });
 
-      // Timer IDs for cleanup
-      let timeoutId: ReturnType<typeof globalThis.setTimeout>;
-      let hangCheckerId: ReturnType<typeof globalThis.setInterval>;
+      // Why the ladder started (undefined = not interrupted)
+      let interruptError: (() => Error) | undefined;
+      const timers: ReturnType<typeof globalThis.setTimeout>[] = [];
+      let timeoutId: ReturnType<typeof globalThis.setTimeout> | undefined;
+      let hangCheckerId: ReturnType<typeof globalThis.setInterval> | undefined;
+      let unregister: () => void = () => {};
 
-      // Cleanup function - must be defined before timers so handlers can call it
       const cleanup = (): void => {
         globalThis.clearTimeout(timeoutId);
         globalThis.clearInterval(hangCheckerId);
+        for (const timer of timers) globalThis.clearTimeout(timer);
+        unregister();
+      };
+
+      const settle = (error?: Error): void => {
+        if (isSettled) return;
+        isSettled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve({ stdout, stderr });
+      };
+
+      /** Rejection for an interrupted spawn, built at settle time */
+      const settleInterrupted = (): void => {
+        const error = interruptError!();
+        Object.assign(error, {
+          stdout,
+          stderr,
+          signal: child.signalCode ?? (error as ProcessError).signal,
+          ...timing(),
+        });
+        settle(error);
+      };
+
+      const sendSignal = (signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL'): void => {
+        if (!processRunning(child)) return;
+        this.logger.debug(`Sending ${signal} to CLI (pid ${child.pid})`);
+        try {
+          child.kill(signal);
+        } catch {
+          // Process already gone
+        }
+      };
+
+      /**
+       * Signal ladder: SIGINT → grace → SIGTERM → grace → SIGKILL. Each step
+       * runs only if the process has not exited (exitCode/signalCode), never
+       * on `child.killed` (Node sets it on delivery, not on exit).
+       */
+      const startLadder = (
+        makeError: () => Error,
+        alreadySignaled = false
+      ): void => {
+        if (interruptError || isSettled) return;
+        interruptError = makeError;
+        globalThis.clearTimeout(timeoutId);
+        globalThis.clearInterval(hangCheckerId);
+        if (!alreadySignaled) sendSignal('SIGINT');
+        timers.push(
+          globalThis.setTimeout(() => {
+            if (!processRunning(child)) return;
+            this.logger.debug(
+              'CLI still running after SIGINT, sending SIGTERM'
+            );
+            sendSignal('SIGTERM');
+            timers.push(
+              globalThis.setTimeout(() => {
+                if (processRunning(child)) {
+                  this.logger.warn(
+                    'CLI still running after SIGTERM, sending SIGKILL'
+                  );
+                  sendSignal('SIGKILL');
+                }
+                // Ladder complete: don't wait forever for stdio to close
+                timers.push(
+                  globalThis.setTimeout(
+                    settleInterrupted,
+                    ladder.postKillSettleMs
+                  )
+                );
+              }, ladder.terminateGraceMs)
+            );
+          }, ladder.interruptGraceMs)
+        );
       };
 
       // Timeout handler
       timeoutId = globalThis.setTimeout(() => {
         if (isSettled) return;
-        isSettled = true;
-        cleanup(); // Prevent resource leak
         this.logger.warn(`CLI execution timeout after ${timeoutMs}ms`);
-        this.killProcess(child, 'timeout');
-        // Attach stdout/stderr for debugging what happened before timeout
-        const timeoutError = new TimeoutError(timeoutMs, 'CLI execution');
-        Object.assign(timeoutError, { stdout, stderr, ...timing() });
-        reject(timeoutError);
+        startLadder(() => new TimeoutError(timeoutMs, 'CLI execution'));
       }, timeoutMs);
 
       // Hang detection - only kill if we HAD output and then stopped
       hangCheckerId = globalThis.setInterval(() => {
-        if (isSettled) return;
+        if (isSettled || interruptError) return;
         const timeSinceLastOutput = Date.now() - lastOutputTime;
         if (hasOutput && timeSinceLastOutput > HANG_CHECK_INTERVAL_MS) {
-          isSettled = true;
-          cleanup(); // Prevent resource leak
           this.logger.warn(
             `Process hang detected (no output for ${timeSinceLastOutput}ms)`
           );
-          this.killProcess(child, 'hang');
-          // Attach stdout/stderr for debugging what happened before hang
-          const hangError = new TimeoutError(
-            timeSinceLastOutput,
-            HANG_OPERATION
+          startLadder(
+            () => new TimeoutError(timeSinceLastOutput, HANG_OPERATION)
           );
-          Object.assign(hangError, { stdout, stderr, ...timing() });
-          reject(hangError);
         }
       }, HANG_DETECTION_POLL_INTERVAL_MS);
 
+      // Run shutdown interrupts this spawn (once) through the same ladder
+      if (child.pid !== undefined) {
+        unregister = shutdownCoordinator.registerSpawn({
+          interrupt: ({ alreadySignaled }) =>
+            startLadder(
+              () =>
+                new SpawnInterruptedError(
+                  alreadySignaled ? 'SIGINT' : 'shutdown'
+                ),
+              alreadySignaled
+            ),
+        });
+      }
+
       child.on('close', (code, signal) => {
-        cleanup();
+        if (isSettled) return;
 
-        if (isSettled) {
-          return; // Already rejected
-        }
-        isSettled = true;
-
-        if (signal) {
-          const error = Object.assign(
-            new Error(`Process killed by signal: ${signal}`),
-            { signal, stdout, stderr, ...timing() }
+        if (interruptError) {
+          settleInterrupted();
+        } else if (signal) {
+          settle(
+            Object.assign(new Error(`Process killed by signal: ${signal}`), {
+              signal,
+              stdout,
+              stderr,
+              ...timing(),
+            })
           );
-          reject(error);
         } else if (code !== 0) {
           // Create error object with additional properties for categorization
-          const error = Object.assign(
-            new Error(`CLI execution failed with exit code ${code}`),
-            { code, stderr, stdout, ...timing() }
+          settle(
+            Object.assign(
+              new Error(`CLI execution failed with exit code ${code}`),
+              { code, stderr, stdout, ...timing() }
+            )
           );
-          reject(error);
         } else {
-          resolve({ stdout, stderr });
+          settle();
         }
       });
 
       child.on('error', (error) => {
-        cleanup();
-        if (isSettled) return;
-        isSettled = true;
-        reject(error);
+        settle(error);
       });
     });
   }
@@ -483,10 +602,44 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     const spawnId = ulid();
     const startTime = Date.now();
     const outcome: SpawnOutcome = { exitReason: 'error', salvaged: false };
-    const result = await this.runSpawn(request, outcome, startTime);
-    result.spawnId = spawnId;
-    this.notifySpawnObserver(request, result, outcome, spawnId, startTime);
-    return result;
+    // Tracked so run shutdown waits for this spawn's ledger event
+    return shutdownCoordinator.trackSpawn(
+      (async (): Promise<ExecutionResult> => {
+        const result = await this.runSpawn(request, outcome, startTime);
+        result.spawnId = spawnId;
+        // A spawn refused because the run is shutting down never ran
+        if (outcome.notSpawned) return result;
+        this.notifySpawnObserver(request, result, outcome, spawnId, startTime);
+        if (outcome.interrupted) {
+          this.recordInterruptedSpawn(request, result, startTime);
+        }
+        return result;
+      })()
+    );
+  }
+
+  /**
+   * Hand a shutdown-interrupted spawn's spend to the shutdown coordinator,
+   * so the runner's final report includes the in-flight stage
+   */
+  private recordInterruptedSpawn(
+    request: ExecutionRequest,
+    result: ExecutionResult,
+    startTime: number
+  ): void {
+    const ctx = request.spawnContext;
+    shutdownCoordinator.recordInterruptedSpawn({
+      workflowId: ctx?.workflowId,
+      stage: ctx?.stage,
+      iteration: ctx?.iteration,
+      backend: this.name,
+      agentRole: request.agent.role,
+      startedAt: new Date(startTime).toISOString(),
+      durationMs: Date.now() - startTime,
+      tokensUsed: result.metrics.tokensUsed,
+      costUsd: result.metrics.cost,
+      costSummary: result.metrics.costSummary,
+    });
   }
 
   /**
@@ -654,6 +807,16 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       });
     } catch (error) {
       const duration = Date.now() - startTime;
+      if (error instanceof ShutdownInProgressError) {
+        outcome.notSpawned = true;
+        return {
+          success: false,
+          outputs: { error: error.message },
+          metrics: { tokensUsed: 0, duration, ...promptMetrics },
+          errors: [error],
+        };
+      }
+      outcome.interrupted = error instanceof SpawnInterruptedError;
       outcome.exitReason = this.classifyExit(error);
       outcome.errorCategory =
         error instanceof Error ? error.constructor.name : 'unknown';
@@ -668,10 +831,10 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         this.logger.error(`Execution failed: ${error.message}`);
 
         // Attempt to salvage cost data from partial output (e.g., timeout after real API work).
-        // NOTE: Claude Code with --output-format json writes the full JSON (including
-        // total_cost_usd and token counts) only on clean exit. On SIGTERM kill, stdout
-        // is typically empty — salvage will not recover cost data in that case.
-        // The primary defense against wasted spend is the per-run cost cap, not timeouts.
+        // The signal ladder starts with SIGINT and keeps collecting stdout until the
+        // CLI exits, so a CLI that finishes its turn and prints result JSON on SIGINT
+        // yields reported figures here. One killed without output gets the kill-time
+        // estimate below. The primary defense against wasted spend is the per-run cost cap.
         outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
         let metrics: ExecutionResult['metrics'] = {
           tokensUsed: 0,

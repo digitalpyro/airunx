@@ -8,8 +8,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import type { RunReport } from '../../src/core/types.js';
 
@@ -257,3 +265,147 @@ describe('HeartbeatRunner killed-run report hand-off', () => {
     expect(result.runReport?.stages[0].costUsd).toBe(1.5);
   });
 });
+
+// ─── Process topology (U9) — real processes ──────────────────────────────────
+
+const FIXTURES = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'fixtures',
+  'kill-path'
+);
+
+describe.skipIf(process.platform === 'win32')(
+  'HeartbeatRunner group kill (real processes)',
+  () => {
+    let tmpDir: string;
+    let origCwd: string;
+    let queue: GitHubTaskQueue;
+    let spawnOptions: Array<{ detached?: boolean }>;
+    const origTimeout = process.env.AIRUNX_CHILD_TIMEOUT_MS;
+
+    const logPath = (): string => join(tmpDir, 'signals.log');
+    const pidPath = (): string => join(tmpDir, 'grandchild.pid');
+    const grandchildPid = (): number =>
+      existsSync(pidPath()) ? Number(readFileSync(pidPath(), 'utf-8')) : 0;
+    const logLines = (): string[] =>
+      existsSync(logPath())
+        ? readFileSync(logPath(), 'utf-8').split('\n').filter(Boolean)
+        : [];
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitFor = async (
+      condition: () => boolean,
+      timeoutMs = 5_000
+    ): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return condition();
+    };
+
+    const makeRunner = (): HeartbeatRunner => {
+      const runner = new HeartbeatRunner({
+        repo: 'o/r',
+        lockPath: join(tmpDir, 'heartbeat.lock'),
+        auditDir: join(tmpDir, 'audit'),
+        childGraceMs: 300,
+      });
+      (runner as unknown as { taskQueue: GitHubTaskQueue }).taskQueue = queue;
+      return runner;
+    };
+
+    beforeEach(async () => {
+      vi.clearAllMocks();
+      tmpDir = mkdtempSync(join(tmpdir(), 'heartbeat-group-'));
+      origCwd = process.cwd();
+      process.chdir(tmpDir);
+      queue = new GitHubTaskQueue('o/r', 'me');
+      vi.spyOn(queue, 'pollTasks').mockResolvedValue([task]);
+      vi.spyOn(queue, 'checkoutTask').mockResolvedValue(true);
+      vi.spyOn(queue, 'updateHeartbeatTimestamp').mockResolvedValue();
+      vi.spyOn(queue, 'failTask').mockResolvedValue();
+      vi.spyOn(queue, 'releaseTask').mockResolvedValue();
+
+      // `airunx run` is replaced by fake-run.mjs: it ignores SIGTERM and
+      // owns a signal-ignoring fake CLI in its process group
+      const actual =
+        await vi.importActual<typeof import('child_process')>('child_process');
+      spawnOptions = [];
+      vi.mocked(spawn).mockImplementation(((
+        cmd: string,
+        _args: readonly string[],
+        options: { detached?: boolean }
+      ) => {
+        spawnOptions.push(options);
+        return actual.spawn(
+          cmd,
+          [
+            join(FIXTURES, 'fake-run.mjs'),
+            join(FIXTURES, 'fake-cli.mjs'),
+            logPath(),
+            pidPath(),
+          ],
+          options
+        );
+      }) as unknown as typeof spawn);
+    });
+
+    afterEach(() => {
+      const pid = grandchildPid();
+      if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL');
+      process.chdir(origCwd);
+      rmSync(tmpDir, { recursive: true, force: true });
+      if (origTimeout === undefined) delete process.env.AIRUNX_CHILD_TIMEOUT_MS;
+      else process.env.AIRUNX_CHILD_TIMEOUT_MS = origTimeout;
+    });
+
+    it('child timeout: SIGTERM to run only, then group SIGKILL leaves no CLI grandchild', async () => {
+      process.env.AIRUNX_CHILD_TIMEOUT_MS = '800';
+      const runner = makeRunner();
+
+      await runner.runOneCycle(config);
+
+      // run is spawned as a process-group leader
+      expect(spawnOptions[0].detached).toBe(true);
+      const pid = grandchildPid();
+      expect(pid).toBeGreaterThan(0);
+      // Killed grandchild is reparented and reaped; wait for it to vanish
+      expect(await waitFor(() => !isAlive(pid))).toBe(true);
+      // Heartbeat signalled only run (pid) before the final group SIGKILL:
+      // the CLI never saw SIGINT/SIGTERM from the heartbeat
+      const lines = logLines();
+      expect(lines.filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+      expect(lines.filter((l) => l === 'SIGINT' || l === 'SIGTERM')).toEqual(
+        []
+      );
+      const result = vi.mocked(queue.failTask).mock.calls[0][1];
+      expect(result.error?.message).toContain('[PROCESS TIMED OUT]');
+    });
+
+    it('stop(): waits out the grace, then group SIGKILL leaves no CLI grandchild', async () => {
+      process.env.AIRUNX_CHILD_TIMEOUT_MS = String(60 * 60 * 1000);
+      const runner = makeRunner();
+
+      const cycle = runner.runOneCycle(config);
+      expect(await waitFor(() => grandchildPid() > 0)).toBe(true);
+      const pid = grandchildPid();
+      expect(isAlive(pid)).toBe(true);
+
+      const started = Date.now();
+      await runner.stop();
+      await cycle;
+
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(await waitFor(() => !isAlive(pid))).toBe(true);
+      expect(logLines().filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+    });
+  }
+);
