@@ -23,6 +23,7 @@ import type {
   AdapterConfig,
   BackendAvailability,
   ExecutionRequest,
+  SpawnRecord,
 } from '../../src/core/adapter-types.js';
 import type {
   Pipeline,
@@ -254,3 +255,283 @@ describe.skipIf(process.platform === 'win32')(
     });
   }
 );
+
+describe('shutdown flush accounting', () => {
+  const WF = 'wf-flush-accounting';
+  let testDir: string;
+  let origCwd: string;
+  let stateManager: StateManager;
+
+  const T0 = new Date(Date.now() - 60_000).toISOString();
+  const at = (offsetMs: number): string =>
+    new Date(Date.parse(T0) + offsetMs).toISOString();
+
+  const spawnRecord = (
+    overrides: Partial<SpawnRecord> & Pick<SpawnRecord, 'stage' | 'startedAt'>
+  ): SpawnRecord => ({
+    spawnId: `s-${Math.random().toString(16).slice(2)}`,
+    workflowId: WF,
+    iteration: 1,
+    backend: 'claude-code',
+    agentRole: 'developer',
+    tokensUsed: 100,
+    endedAt: overrides.startedAt,
+    durationMs: 1_000,
+    exitReason: 'ok',
+    success: true,
+    salvaged: false,
+    costProvenance: 'reported',
+    billingBasis: 'api_equivalent',
+    ...overrides,
+  });
+
+  const pipeline = {
+    name: 'flush-pipeline',
+    description: 'Flush accounting pipeline',
+    default_fidelity: 'standard',
+    stages: [
+      { name: 'plan', agent: 'orchestrator', input: 'Plan' },
+      { name: 'implement', agent: 'developer', input: 'Implement' },
+    ],
+  } as Pipeline;
+
+  const planRecord = {
+    stage: 'plan',
+    agent: 'orchestrator',
+    backend: 'claude-code',
+    spawnCount: 1,
+    durationMs: 1_000,
+    tokensUsed: 50,
+    costUsd: 1,
+    timestamp: new Date(Date.parse(T0) - 10_000).toISOString(),
+    status: 'completed',
+  } as const;
+
+  const context = (): WorkflowContext => ({
+    id: WF,
+    input: 'Add a feature',
+    inputType: 'prompt',
+    mode: 'pipeline',
+    fidelityLevel: 'standard',
+    createdAt: new Date(),
+    status: 'running',
+    iterationCount: 0,
+    maxIterations: 1,
+    todos: [],
+    stageRecords: [planRecord],
+    metrics: {
+      tokensUsed: 50,
+      totalTokens: 50,
+      runtime: 0,
+      totalRuntimeMs: 0,
+      stagesCompleted: 1,
+      totalStages: 2,
+      errors: 0,
+      totalCost: 1,
+    },
+  });
+
+  interface RunnerInternals {
+    inFlightStages: Map<string, string>;
+    writeRunReport(context: WorkflowContext, totalRuntimeMs: number): void;
+  }
+
+  const makeRunner = (): LangGraphRunner & RunnerInternals => {
+    const runner = new LangGraphRunner({
+      adapter: new ProcessFixtureAdapter(testDir),
+      stateManager,
+      pipeline,
+      workflowContext: context(),
+    });
+    const internals = runner as unknown as RunnerInternals;
+    internals.inFlightStages.set('implement', T0);
+    // Same registration execute() makes
+    shutdownCoordinator.onFlush((spawns) =>
+      (
+        runner as unknown as {
+          flushReportOnShutdown(s: readonly unknown[]): Promise<void>;
+        }
+      ).flushReportOnShutdown(spawns)
+    );
+    return runner as LangGraphRunner & RunnerInternals;
+  };
+
+  const reportPath = (): string =>
+    join(testDir, '.airunx-state', 'reports', `${WF}.json`);
+  const readReport = (): RunReport =>
+    JSON.parse(readFileSync(reportPath(), 'utf-8')) as RunReport;
+
+  const shutdown = (): Promise<void> =>
+    shutdownCoordinator.shutdown({ timeoutMs: 50, flushTimeoutMs: 2_000 });
+
+  beforeEach(() => {
+    shutdownCoordinator.reset();
+    testDir = mkdtempSync(join(tmpdir(), 'airunx-flush-'));
+    origCwd = process.cwd();
+    process.chdir(testDir);
+    stateManager = new StateManager(join(testDir, 'state'));
+  });
+
+  afterEach(() => {
+    shutdownCoordinator.reset();
+    process.chdir(origCwd);
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('CE-like stage: killed cost = completed main spawn + interrupted sub-agent', async () => {
+    await stateManager.save(context());
+    makeRunner();
+    const observed: SpawnRecord[] = [];
+    const observer = shutdownCoordinator.observeSpawns({
+      onSpawnComplete: (record) => observed.push(record),
+    });
+    const request = {} as ExecutionRequest;
+
+    // Earlier stage and another workflow: excluded
+    observer.onSpawnComplete(
+      spawnRecord({ stage: 'plan', startedAt: at(-20_000), costUsd: 1 }),
+      request
+    );
+    observer.onSpawnComplete(
+      spawnRecord({
+        stage: 'implement',
+        startedAt: at(5),
+        costUsd: 9,
+        workflowId: 'other-wf',
+      }),
+      request
+    );
+    // CE main spawn completed before shutdown
+    observer.onSpawnComplete(
+      spawnRecord({ stage: 'implement', startedAt: at(10), costUsd: 0.5 }),
+      request
+    );
+    // Sub-agent interrupted: observed AND recorded as interrupted (deduped)
+    const sub = spawnRecord({
+      stage: 'implement',
+      startedAt: at(20),
+      agentRole: 'reviewer',
+      costUsd: 0.2,
+      costProvenance: 'estimated',
+      exitReason: 'signal',
+      success: false,
+    });
+    observer.onSpawnComplete(sub, request);
+    shutdownCoordinator.recordInterruptedSpawn({
+      workflowId: WF,
+      stage: 'implement',
+      backend: sub.backend,
+      agentRole: sub.agentRole,
+      startedAt: sub.startedAt,
+      durationMs: 1_000,
+      tokensUsed: 100,
+      costUsd: 0.2,
+    });
+    expect(observed).toHaveLength(4);
+
+    await shutdown();
+
+    const report = readReport();
+    expect(report.status).toBe('interrupted');
+    const killed = report.stages.find((s) => s.status === 'killed')!;
+    expect(killed.stage).toBe('implement');
+    expect(killed.spawnCount).toBe(2);
+    expect(killed.costUsd).toBeCloseTo(0.7, 6);
+    expect(report.totalCostUsd).toBeCloseTo(1.7, 6);
+  });
+
+  it('retry stage: failed attempts and a timeout ladder spawn all count', async () => {
+    await stateManager.save(context());
+    makeRunner();
+    const observer = shutdownCoordinator.observeSpawns();
+    const request = {} as ExecutionRequest;
+    // Two failed attempts (one in a timeout ladder when shutdown arrived)
+    observer.onSpawnComplete(
+      spawnRecord({
+        stage: 'implement',
+        startedAt: at(10),
+        costUsd: 0.1,
+        success: false,
+        exitReason: 'error',
+      }),
+      request
+    );
+    observer.onSpawnComplete(
+      spawnRecord({
+        stage: 'implement',
+        startedAt: at(2_000),
+        costUsd: 0.25,
+        success: false,
+        exitReason: 'timeout',
+        costProvenance: 'estimated',
+      }),
+      request
+    );
+    // An interrupted spawn the observer never saw (unwrapped adapter)
+    shutdownCoordinator.recordInterruptedSpawn({
+      workflowId: WF,
+      stage: 'implement',
+      backend: 'claude-code',
+      agentRole: 'developer',
+      startedAt: at(4_000),
+      durationMs: 1_000,
+      tokensUsed: 10,
+      costUsd: 0.05,
+    });
+
+    await shutdown();
+
+    const killed = readReport().stages.find((s) => s.status === 'killed')!;
+    expect(killed.spawnCount).toBe(3);
+    expect(killed.costUsd).toBeCloseTo(0.4, 6);
+    expect(killed.tokensUsed).toBe(210);
+  });
+
+  it('state unavailable: extends the last on-disk report, not the stale snapshot', async () => {
+    // No state file. Last incremental report has plan completed.
+    const runner = makeRunner();
+    const ctx = context();
+    runner.writeRunReport(ctx, 1_000);
+    shutdownCoordinator
+      .observeSpawns()
+      .onSpawnComplete(
+        spawnRecord({ stage: 'implement', startedAt: at(10), costUsd: 0.3 }),
+        {} as ExecutionRequest
+      );
+    // The in-memory snapshot has no completed stages (stale)
+    (
+      runner as unknown as { workflowContext: WorkflowContext }
+    ).workflowContext = {
+      ...ctx,
+      stageRecords: [],
+      metrics: { ...ctx.metrics, totalCost: 0 },
+    };
+
+    await shutdown();
+
+    const report = readReport();
+    expect(report.status).toBe('interrupted');
+    expect(report.stages.map((s) => [s.stage, s.status])).toEqual([
+      ['plan', 'completed'],
+      ['implement', 'killed'],
+    ]);
+    expect(report.totalCostUsd).toBeCloseTo(1.3, 6);
+    expect(report.timeline).toHaveLength(2);
+  });
+
+  it('neither state nor report: writes nothing', async () => {
+    makeRunner();
+    await shutdown();
+    expect(existsSync(reportPath())).toBe(false);
+  });
+
+  it('a late incremental write cannot overwrite the interrupted report', async () => {
+    await stateManager.save(context());
+    const runner = makeRunner();
+    await shutdown();
+    expect(readReport().status).toBe('interrupted');
+
+    runner.writeRunReport({ ...context(), status: 'running' }, 5);
+    expect(readReport().status).toBe('interrupted');
+  });
+});

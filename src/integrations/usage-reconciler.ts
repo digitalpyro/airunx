@@ -25,6 +25,10 @@ import { existsSync } from 'fs';
 import { AuditLogger, getDefaultAuditDir } from '../audit/audit-logger.js';
 import type { AuditEvent } from '../task-queue/types.js';
 import { spawnEventCostSummary } from '../core/run-cost-summary.js';
+import {
+  formatMicroUsd,
+  usdToMicroUsdOrUndefined,
+} from '../core/cost-accounting.js';
 import { redactSecrets } from '../utils/redaction.js';
 
 /** Bumped when the JSON shape of ReconcileReport changes incompatibly */
@@ -127,7 +131,7 @@ export function centsStringToMicroUsd(cents: string): number | undefined {
 /** OpenAI costs amount (float dollars) → micro-USD */
 export function dollarsToMicroUsd(dollars: unknown): number | undefined {
   if (typeof dollars === 'number') {
-    return Number.isFinite(dollars) ? Math.round(dollars * 1e6) : undefined;
+    return usdToMicroUsdOrUndefined(dollars);
   }
   if (typeof dollars === 'string') return decimalToMicroUsd(dollars, 6);
   return undefined;
@@ -887,9 +891,7 @@ export async function reconcileUsage(
 // ─── Rendering ──────────────────────────────────────────────────────────
 
 function usd(micro: number | null): string {
-  if (micro === null) return '-';
-  const sign = micro < 0 ? '-' : '';
-  return `${sign}$${(Math.abs(micro) / 1_000_000).toFixed(4)}`;
+  return micro === null ? '-' : formatMicroUsd(micro, { signed: true });
 }
 
 function statusCell(status: ReconcileStatus): string {

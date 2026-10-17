@@ -29,9 +29,41 @@ export function usdToMicroUsd(usd: number): number {
   return Number.isFinite(usd) ? Math.round(usd * 1_000_000) : 0;
 }
 
+/** USD → integer micro-USD; undefined / non-finite input stays undefined */
+export function usdToMicroUsdOrUndefined(
+  usd: number | undefined
+): number | undefined {
+  return usd === undefined || !Number.isFinite(usd)
+    ? undefined
+    : Math.round(usd * 1_000_000);
+}
+
 /** Integer micro-USD → USD */
 export function microUsdToUsd(microUsd: number): number {
   return microUsd / 1_000_000;
+}
+
+export interface FormatMicroUsdOptions {
+  /** Decimal places (default 4, so small spawns stay visible) */
+  places?: number;
+  /**
+   * Put the minus sign before the dollar sign ("-$1.00") instead of after
+   * it ("$-1.00"); for figures that can go negative, such as drift
+   */
+  signed?: boolean;
+}
+
+/** Micro-USD → "$1.2345" (the one micro-USD display formatter) */
+export function formatMicroUsd(
+  microUsd: number,
+  options: FormatMicroUsdOptions = {}
+): string {
+  const places = options.places ?? 4;
+  if (options.signed) {
+    const sign = microUsd < 0 ? '-' : '';
+    return `${sign}$${microUsdToUsd(Math.abs(microUsd)).toFixed(places)}`;
+  }
+  return `$${microUsdToUsd(microUsd).toFixed(places)}`;
 }
 
 /** Zeroed token usage */
@@ -215,7 +247,7 @@ export function provenanceMix(summary: CostSummary): ProvenanceMix {
   };
 }
 
-const usd = (micro: number): string => `$${microUsdToUsd(micro).toFixed(2)}`;
+const usd = (micro: number): string => formatMicroUsd(micro, { places: 2 });
 
 /**
  * One-line run summary (R9), e.g.

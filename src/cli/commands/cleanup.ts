@@ -16,6 +16,7 @@ import { loadSettings } from '../../utils/settings.js';
 import { createLogger } from '../../utils/logger.js';
 import { findStaleRepos } from '../../utils/repo-resolver.js';
 import { spawnAsync } from '../../utils/async-spawn.js';
+import { assertValidWorkflowId } from '../../utils/workflow-id.js';
 
 const logger = createLogger('cleanup');
 
@@ -116,6 +117,11 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
   const spinner = ora('Analyzing cleanup targets...').start();
 
   try {
+    // The ID becomes a state-file path; reject traversal before any I/O
+    if (options.workflowId !== undefined) {
+      assertValidWorkflowId(options.workflowId);
+    }
+
     // Load settings and resolve project directory
     const settings = loadSettings();
     const projectDir = resolveProjectDirectory(options.project, settings);

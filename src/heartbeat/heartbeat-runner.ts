@@ -8,7 +8,6 @@
 
 /* eslint-disable no-undef */
 import { spawn, type ChildProcess } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { GitHubTaskQueue } from '../task-queue/github-task-queue.js';
 import { AuditLogger } from '../audit/audit-logger.js';
@@ -19,7 +18,8 @@ import {
 } from '../utils/circuit-breaker.js';
 import { createLogger } from '../utils/logger.js';
 import { getPackageRoot } from '../utils/paths.js';
-import { generateWorkflowId, getRunReportPath } from '../utils/workflow-id.js';
+import { generateWorkflowId } from '../utils/workflow-id.js';
+import { loadRunReport } from '../utils/run-report-io.js';
 import { formatCostSummaryLine } from '../core/cost-accounting.js';
 import type {
   HeartbeatConfig,
@@ -82,6 +82,13 @@ export class HeartbeatRunner {
   private currentChild: ChildProcess | null = null;
   private backoffAttempt = 0;
   private heartbeatInterval: TimerRef | null = null;
+  /** In-flight stop(); repeat stop signals share it */
+  private stopPromise: Promise<void> | null = null;
+  /**
+   * One termination sequence per child, shared by the child timeout and
+   * stop(): a second SIGTERM would make `run` abandon its graceful shutdown
+   */
+  private terminations = new WeakMap<ChildProcess, Promise<void>>();
 
   constructor(options: HeartbeatRunnerOptions) {
     this.repo = options.repo;
@@ -120,6 +127,7 @@ export class HeartbeatRunner {
     }
 
     this.isRunning = true;
+    this.stopPromise = null;
     this.auditLogger.logHeartbeatStart({ config: fullConfig });
 
     logger.info('Heartbeat started');
@@ -146,7 +154,13 @@ export class HeartbeatRunner {
   /**
    * Stop the heartbeat execution loop gracefully.
    */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    // A second SIGINT/SIGTERM must not restart (and re-signal) the stop
+    if (!this.stopPromise) this.stopPromise = this.runStop();
+    return this.stopPromise;
+  }
+
+  private async runStop(): Promise<void> {
     logger.info('Stopping heartbeat...');
     this.isRunning = false;
 
@@ -444,9 +458,19 @@ export class HeartbeatRunner {
    * Stop a `run` child: SIGTERM to its pid only (run interrupts its own CLIs
    * once), wait up to the outer grace for it to exit, then SIGKILL its whole
    * process group — always, so a CLI that outlived run is reaped too.
-   * Resolves once the group kill has been sent. Never rejects.
+   * Resolves once the group kill has been sent. Never rejects. Repeat calls
+   * for the same child (timeout, then stop) share the first sequence.
    */
-  private async terminateChild(child: ChildProcess): Promise<void> {
+  private terminateChild(child: ChildProcess): Promise<void> {
+    let termination = this.terminations.get(child);
+    if (!termination) {
+      termination = this.runTermination(child);
+      this.terminations.set(child, termination);
+    }
+    return termination;
+  }
+
+  private async runTermination(child: ChildProcess): Promise<void> {
     const exited = (): boolean =>
       child.exitCode !== null || child.signalCode !== null;
     const closed = new Promise<void>((resolve) => {
@@ -563,6 +587,15 @@ export class HeartbeatRunner {
       child.on('close', (code) => {
         clearTimeout(timer);
         this.currentChild = null;
+        // `run` exited (on its own or signalled): reap anything it left in
+        // its process group (CLI dev servers, orphaned CLIs). ESRCH = empty.
+        if (process.platform !== 'win32' && child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {
+            // Group already empty
+          }
+        }
         resolve(
           timedOut
             ? {
@@ -649,11 +682,7 @@ export class HeartbeatRunner {
    */
   private readRunReportFile(workflowId: string): RunReport | undefined {
     try {
-      const reportPath = getRunReportPath(workflowId);
-      if (!existsSync(reportPath)) return undefined;
-      const parsed = JSON.parse(readFileSync(reportPath, 'utf-8')) as RunReport;
-      if (!parsed || !Array.isArray(parsed.stages)) return undefined;
-      return parsed;
+      return loadRunReport(workflowId) ?? undefined;
     } catch (error) {
       logger.warn(`Could not read run report for ${workflowId}:`, error);
       return undefined;

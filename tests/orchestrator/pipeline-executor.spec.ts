@@ -259,16 +259,59 @@ pipelines:
 
     it('should use a pre-assigned workflowId instead of minting one', async () => {
       await setupStandardPipelineConfig();
+      const id = `workflow-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const statePath = path.join('.airunx-state', 'workflows', `${id}.json`);
 
-      const result = await pipelineExecutor.execute({
-        input: 'Test task',
-        inputType: 'prompt',
-        workflowId: 'workflow-123-abcdef01',
-      });
+      try {
+        const result = await pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: id,
+        });
 
-      expect(result.id).toBe('workflow-123-abcdef01');
-      const status = await pipelineExecutor.getStatus('workflow-123-abcdef01');
-      expect(status?.id).toBe('workflow-123-abcdef01');
+        expect(result.id).toBe(id);
+        const status = await pipelineExecutor.getStatus(id);
+        expect(status?.id).toBe(id);
+      } finally {
+        await rm(statePath, { force: true });
+      }
+    });
+
+    it('should reject a reused workflowId (existing state or run report)', async () => {
+      await setupStandardPipelineConfig();
+      const id = `workflow-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const statePath = path.join('.airunx-state', 'workflows', `${id}.json`);
+      const reportPath = path.join('.airunx-state', 'reports', `${id}.json`);
+
+      try {
+        await pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: id,
+        });
+        await expect(
+          pipelineExecutor.execute({
+            input: 'Test task',
+            inputType: 'prompt',
+            workflowId: id,
+          })
+        ).rejects.toThrow(/already in use/);
+
+        // A run report alone also marks the ID as used
+        await rm(statePath, { force: true });
+        await mkdir(path.dirname(reportPath), { recursive: true });
+        await writeFile(reportPath, '{}', 'utf-8');
+        await expect(
+          pipelineExecutor.execute({
+            input: 'Test task',
+            inputType: 'prompt',
+            workflowId: id,
+          })
+        ).rejects.toThrow(/fresh --workflow-id/);
+      } finally {
+        await rm(statePath, { force: true });
+        await rm(reportPath, { force: true });
+      }
     });
 
     it('should mint a pattern-valid workflowId when none is given', async () => {

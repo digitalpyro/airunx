@@ -8,12 +8,11 @@
  */
 
 import chalk from 'chalk';
-import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
+import { existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import type { Command } from 'commander';
 import { AuditLogger, getDefaultAuditDir } from '../../audit/audit-logger.js';
 import type { AuditEvent } from '../../task-queue/types.js';
-import type { RunReport } from '../../core/types.js';
 import {
   summarizeRunCosts,
   type RunCostSummary,
@@ -21,9 +20,9 @@ import {
 import {
   RUN_REPORTS_DIR,
   assertValidWorkflowId,
-  getRunReportPath,
   isValidWorkflowId,
 } from '../../utils/workflow-id.js';
+import { loadRunReport } from '../../utils/run-report-io.js';
 import { formatRunCosts } from '../formatters/costs-formatter.js';
 import {
   formatReconcileReport,
@@ -60,20 +59,8 @@ export function findLatestRunId(
   return latest?.id;
 }
 
-/** Read a run report; null when absent or unparsable */
-export function loadRunReport(
-  workflowId: string,
-  reportsDir: string = RUN_REPORTS_DIR
-): RunReport | null {
-  const path = getRunReportPath(workflowId, reportsDir);
-  if (!existsSync(path)) return null;
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
-    return parsed && typeof parsed === 'object' ? (parsed as RunReport) : null;
-  } catch {
-    return null;
-  }
-}
+/** Read a run report; null when absent, unparsable or not report-shaped */
+export { loadRunReport };
 
 /** A run's audit events (deduped by event_id) plus skipped-line count */
 export async function loadRunEvents(

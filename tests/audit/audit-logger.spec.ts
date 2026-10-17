@@ -4,7 +4,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -19,8 +21,8 @@ import {
   AuditLogger,
   MAX_AUDIT_RECORD_BYTES,
   createAuditSpawnObserver,
-  toMicroUsd,
 } from '../../src/audit/audit-logger.js';
+import { usdToMicroUsdOrUndefined as toMicroUsd } from '../../src/core/cost-accounting.js';
 import type {
   ExecutionRequest,
   SpawnRecord,
@@ -334,6 +336,17 @@ describe('AuditLogger', () => {
         logger.logStageStart('wf-1', 'plan');
         expect(statSync(logDir).mode & 0o777).toBe(0o700);
         expect(statSync(logger.getLogPath()).mode & 0o777).toBe(0o600);
+      }
+    );
+
+    it.skipIf(process.platform === 'win32')(
+      'tightens a pre-existing world-readable audit directory',
+      () => {
+        const dir = join(logDir, 'preexisting');
+        mkdirSync(dir, { mode: 0o755 });
+        chmodSync(dir, 0o755);
+        new AuditLogger(dir);
+        expect(statSync(dir).mode & 0o777).toBe(0o700);
       }
     );
 

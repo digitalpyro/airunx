@@ -16,6 +16,12 @@
 
 import type { EventEmitter } from 'events';
 import type { CostSummary } from '../core/types.js';
+import type {
+  ExecutionRequest,
+  SpawnObserver,
+  SpawnRecord,
+} from '../core/adapter-types.js';
+import { spawnCostSummary } from '../core/cost-accounting.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('shutdown');
@@ -36,8 +42,12 @@ export interface InterruptibleSpawn {
   interrupt(options: { alreadySignaled: boolean }): void;
 }
 
-/** Spend of one spawn that was cut off by shutdown, for the final report */
-export interface InterruptedSpawnSummary {
+/**
+ * Spend of one spawn, for the final report: every completed spawn (via
+ * observeSpawns) plus spawns cut off by shutdown (recordInterruptedSpawn)
+ */
+export interface SpawnSpendSummary {
+  spawnId?: string;
   workflowId?: string;
   stage?: string;
   iteration?: number;
@@ -51,10 +61,49 @@ export interface InterruptedSpawnSummary {
   costSummary?: CostSummary;
 }
 
-/** Runs after interrupted spawns settled, before the process exits */
+/** @deprecated Use SpawnSpendSummary */
+export type InterruptedSpawnSummary = SpawnSpendSummary;
+
+/**
+ * Runs after interrupted spawns settled, before the process exits. Receives
+ * every recorded spawn of this process (completed and interrupted, deduped);
+ * filter by workflowId/stage/startedAt.
+ */
 export type ShutdownFlushHook = (
-  interrupted: readonly InterruptedSpawnSummary[]
+  spawns: readonly SpawnSpendSummary[]
 ) => void | Promise<void>;
+
+/** Spend summary of a ledger SpawnRecord */
+export function spawnSpendFromRecord(record: SpawnRecord): SpawnSpendSummary {
+  return {
+    spawnId: record.spawnId,
+    workflowId: record.workflowId,
+    stage: record.stage,
+    iteration: record.iteration,
+    backend: record.backend,
+    agentRole: record.agentRole,
+    startedAt: record.startedAt,
+    durationMs: record.durationMs,
+    tokensUsed: record.tokensUsed,
+    costUsd: record.costUsd,
+    costSummary: spawnCostSummary({
+      costUsd: record.costUsd,
+      costProvenance: record.costProvenance,
+      billingBasis: record.billingBasis ?? 'unknown',
+      tokens: record.tokens,
+      tokenProvenance: record.tokenProvenance,
+      pricingVersion:
+        record.costProvenance === 'reported'
+          ? undefined
+          : record.pricingVersion,
+      estimationMethods: record.estimationMethods,
+      unmodeledModifiers: record.unmodeledModifiers,
+    }),
+  };
+}
+
+const spawnKey = (s: SpawnSpendSummary): string =>
+  [s.workflowId, s.stage, s.startedAt, s.backend, s.agentRole].join('|');
 
 export interface ShutdownOptions {
   /** CLIs already received SIGINT from the terminal (see InterruptibleSpawn) */
@@ -91,7 +140,8 @@ const withTimeout = async (
 export class ShutdownCoordinator {
   private spawns = new Set<InterruptibleSpawn>();
   private pending = new Set<Promise<unknown>>();
-  private interrupted: InterruptedSpawnSummary[] = [];
+  private interrupted: SpawnSpendSummary[] = [];
+  private completed: SpawnSpendSummary[] = [];
   private flushHooks = new Set<ShutdownFlushHook>();
   private shutdownPromise: Promise<void> | null = null;
 
@@ -130,8 +180,62 @@ export class ShutdownCoordinator {
   }
 
   /** Record the spend of a spawn cut off by shutdown */
-  recordInterruptedSpawn(summary: InterruptedSpawnSummary): void {
+  recordInterruptedSpawn(summary: SpawnSpendSummary): void {
     this.interrupted.push(summary);
+  }
+
+  /**
+   * Record the spend of a completed spawn (any outcome — success, failure,
+   * timeout/hang ladder, interrupt), so a shutdown flush can total every
+   * spawn of the in-flight stage, not only the ones shutdown cut off
+   */
+  recordSpawn(summary: SpawnSpendSummary): void {
+    this.completed.push(summary);
+  }
+
+  /**
+   * Wrap a SpawnObserver so every completed spawn is also recorded here.
+   * Never throws from recording; the inner observer is called unchanged.
+   */
+  observeSpawns(inner?: SpawnObserver): SpawnObserver {
+    const observer: SpawnObserver = {
+      onSpawnComplete: (record: SpawnRecord, request: ExecutionRequest) => {
+        try {
+          this.recordSpawn(spawnSpendFromRecord(record));
+        } catch (error) {
+          logger.warn(
+            `Failed to record spawn spend: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+        inner?.onSpawnComplete(record, request);
+      },
+    };
+    if (inner?.onAttempt) observer.onAttempt = inner.onAttempt.bind(inner);
+    if (inner?.onDelegation) {
+      observer.onDelegation = inner.onDelegation.bind(inner);
+    }
+    return observer;
+  }
+
+  /**
+   * Interrupted spawns (their adapter-built cost summary is authoritative)
+   * plus completed spawns not among them — an observed interrupted spawn is
+   * reported both ways
+   */
+  recordedSpawns(): SpawnSpendSummary[] {
+    const remaining = new Map<string, number>();
+    for (const s of this.interrupted) {
+      const key = spawnKey(s);
+      remaining.set(key, (remaining.get(key) ?? 0) + 1);
+    }
+    const others = this.completed.filter((s) => {
+      const key = spawnKey(s);
+      const left = remaining.get(key) ?? 0;
+      if (left === 0) return true;
+      remaining.set(key, left - 1);
+      return false;
+    });
+    return [...others, ...this.interrupted];
   }
 
   /** Register a final flush (e.g. the runner's run report). Returns unregister. */
@@ -179,11 +283,11 @@ export class ShutdownCoordinator {
       logger.warn('Shutdown: spawns did not settle in time; flushing anyway');
     }
 
-    const interrupted = [...this.interrupted];
+    const spawns = this.recordedSpawns();
     for (const hook of [...this.flushHooks]) {
       try {
         const ok = await withTimeout(
-          Promise.resolve().then(() => hook(interrupted)),
+          Promise.resolve().then(() => hook(spawns)),
           options.flushTimeoutMs ?? SHUTDOWN_FLUSH_TIMEOUT_MS
         );
         if (!ok) logger.warn('Shutdown flush hook timed out');
@@ -200,6 +304,7 @@ export class ShutdownCoordinator {
     this.spawns.clear();
     this.pending.clear();
     this.interrupted = [];
+    this.completed = [];
     this.flushHooks.clear();
     this.shutdownPromise = null;
   }

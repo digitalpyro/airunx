@@ -8,11 +8,10 @@ import type {
   CostTotals,
   RunCostSummary,
 } from '../../core/run-cost-summary.js';
+import { formatMicroUsd } from '../../core/cost-accounting.js';
 
-/** Micro-USD → "$1.2345" (4 places so small spawns stay visible) */
-export function formatMicroUsd(microUsd: number): string {
-  return `$${(microUsd / 1_000_000).toFixed(4)}`;
-}
+// Re-exported so existing importers keep working; defined in cost-accounting
+export { formatMicroUsd };
 
 function mixCell(t: CostTotals): string {
   if (t.totalMicroUsd <= 0) {

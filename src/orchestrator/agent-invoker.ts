@@ -43,6 +43,10 @@ import {
   type AdapterFactory,
 } from '../adapters/adapter-factory.js';
 import type { ProviderRouter } from './provider-router.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+} from '../utils/shutdown-coordinator.js';
 
 const logger = createLogger('agent-invoker');
 
@@ -52,6 +56,17 @@ const logger = createLogger('agent-invoker');
 function errorCategoryOf(error: Error): string {
   const ctorName = error.constructor?.name;
   return ctorName && ctorName !== 'Error' ? ctorName : error.name || 'Error';
+}
+
+/**
+ * True for a result the adapter refused because the run is shutting down:
+ * no process ran, so it is no attempt, no spawn and no spend
+ */
+function isShutdownRefusal(result: ExecutionResult): boolean {
+  return (
+    !result.success &&
+    (result.errors ?? []).some((e) => e instanceof ShutdownInProgressError)
+  );
 }
 
 /**
@@ -375,7 +390,18 @@ export class AgentInvoker {
       switchedTo = undefined;
       try {
         logger.info(`Attempt ${attempt}/${this.fidelityParams.retryCount}`);
-        result = await adapter.execute(request);
+        const executed = await adapter.execute(request);
+        if (isShutdownRefusal(executed)) {
+          // Never spawned: not an attempt, no spawn count, stop retrying
+          logger.info('Run is shutting down; not retrying');
+          lastError = executed.errors[0];
+          result = {
+            ...executed,
+            metrics: { ...executed.metrics, spawnCount: 0 },
+          };
+          break;
+        }
+        result = executed;
         attemptResult = result;
 
         if (result.success) {
@@ -435,8 +461,17 @@ export class AgentInvoker {
           error: result.errors?.[0],
           result: attemptResult,
         });
+        if (shutdownCoordinator.isShuttingDown) {
+          logger.info('Run is shutting down; not retrying');
+          break;
+        }
       } catch (error) {
         lastError = toError(error);
+        if (lastError instanceof ShutdownInProgressError) {
+          // Refused before spawning: not an attempt; stop retrying
+          logger.info('Run is shutting down; not retrying');
+          break;
+        }
         logger.warn(`Attempt ${attempt} failed:`, error);
 
         // Check if this is a configuration error that warrants fallback
@@ -469,6 +504,11 @@ export class AgentInvoker {
           break;
         }
 
+        if (shutdownCoordinator.isShuttingDown) {
+          logger.info('Run is shutting down; not retrying');
+          break;
+        }
+
         // If this is not the last attempt, wait before retrying
         if (attempt < this.fidelityParams.retryCount) {
           const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
@@ -480,13 +520,23 @@ export class AgentInvoker {
       }
     }
 
-    // All retries exhausted - update circuit breaker
-    logger.error(
-      `Agent execution failed after ${this.fidelityParams.retryCount} attempts`
-    );
+    const shutdownRefused = lastError instanceof ShutdownInProgressError;
 
-    // Only count retryable errors toward circuit breaker
-    if (this.circuitBreaker && lastError && isRetryableError(lastError)) {
+    // All retries exhausted - update circuit breaker
+    if (!shutdownRefused) {
+      logger.error(
+        `Agent execution failed after ${this.fidelityParams.retryCount} attempts`
+      );
+    }
+
+    // Only count retryable errors toward circuit breaker (a shutdown
+    // refusal says nothing about the backend)
+    if (
+      this.circuitBreaker &&
+      lastError &&
+      !shutdownRefused &&
+      isRetryableError(lastError)
+    ) {
       await this.circuitBreaker.recordFailure(backend, lastError);
     }
 
@@ -510,6 +560,8 @@ export class AgentInvoker {
           duration: 0,
           cost: 0,
           provider: backend,
+          // A shutdown refusal never spawned
+          ...(shutdownRefused ? { spawnCount: 0 } : {}),
         },
         errors: lastError ? [lastError] : [new Error('Unknown error')],
       },

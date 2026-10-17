@@ -68,4 +68,14 @@ describe('query_audit tool', () => {
     const events = await queryAuditTool.execute({}, context);
     expect(events.every((e) => e.workflowId === 'wf-agent')).toBe(true);
   });
+
+  it('documents the hidden ledger event types in its description', () => {
+    const eventTypesDoc = (
+      queryAuditTool.parameters.properties.eventTypes as { description: string }
+    ).description;
+    for (const type of LEDGER_EVENT_TYPES) {
+      expect(queryAuditTool.description).toContain(type);
+      expect(eventTypesDoc).toContain(type);
+    }
+  });
 });

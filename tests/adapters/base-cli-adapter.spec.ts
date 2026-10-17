@@ -774,7 +774,7 @@ const FAKE_CLI = join(
 /** Runs tests/fixtures/kill-path/fake-cli.mjs as the CLI, short ladder */
 class ProcessCliAdapter extends BaseCliAdapter {
   name = 'claude-code' as const;
-  public mode: 'honor' | 'ignore' | 'late' | 'finish' = 'honor';
+  public mode: 'honor' | 'ignore' | 'late' | 'finish' | 'grandchild' = 'honor';
   public logPath = '';
   public ladder: SignalLadder = {
     interruptGraceMs: 300,
@@ -921,6 +921,42 @@ describe.skipIf(process.platform === 'win32')(
       expect(record.costProvenance).toBe('estimated');
       expect(record.estimationMethods).toContain('kill_time');
       expect(record.costUsd).toBeGreaterThan(0);
+    });
+
+    it('CLI exits on SIGINT but a grandchild holds stdio open: still settles within the ladder bound', async () => {
+      adapter.mode = 'grandchild';
+      const grandchildPid = (): number =>
+        Number(
+          signalLog()
+            .find((l) => l.startsWith('grandchild '))
+            ?.slice('grandchild '.length)
+        );
+      try {
+        const started = Date.now();
+        const result = await adapter.execute(request(300));
+        const elapsed = Date.now() - started;
+
+        expect(result.success).toBe(false);
+        expect(
+          signalsReceived().filter((l) => !l.startsWith('grandchild '))
+        ).toEqual(['SIGINT']);
+        expect(isAlive(cliPid())).toBe(false);
+        // Grandchild still holds the pipe: settled by the post-exit fallback
+        expect(isAlive(grandchildPid())).toBe(true);
+        // timeout (300) + postKillSettleMs (300) + slack; never the 30s sleep
+        expect(elapsed).toBeLessThan(2_500);
+        expect(records).toHaveLength(1);
+        expect(records[0].exitReason).toBe('timeout');
+      } finally {
+        const pid = grandchildPid();
+        if (pid) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // already gone
+          }
+        }
+      }
     });
 
     it('output written after the signal is captured and parsed', async () => {

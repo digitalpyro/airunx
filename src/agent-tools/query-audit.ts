@@ -24,7 +24,9 @@ export const queryAuditTool = {
   description:
     'Query audit log for past execution events in the current workflow. ' +
     'Use this to learn from history and understand what has happened. ' +
-    'Results are limited to the current workflow for security.',
+    'Results are limited to the current workflow for security. ' +
+    `Cost-ledger events (${LEDGER_EVENT_TYPES.join(', ')}) are hidden ` +
+    'unless requested by name in eventTypes.',
   parameters: {
     type: 'object' as const,
     properties: {
@@ -32,7 +34,9 @@ export const queryAuditTool = {
         type: 'array',
         items: { type: 'string' },
         description:
-          'Filter by event types (e.g., "task_completed", "stage_error")',
+          'Filter by event types (e.g., "task_completed", "stage_error"). ' +
+          `Ledger event types (${LEDGER_EVENT_TYPES.join(', ')}) are ` +
+          'excluded by default and only returned when listed here by name.',
       },
       since: {
         type: 'string',

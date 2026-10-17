@@ -21,7 +21,7 @@ import type { ProviderRouter } from './provider-router.js';
 import { StateManager } from './state-manager.js';
 import { LangGraphRunner } from './langgraph-runner.js';
 import { TodoManager } from '../utils/todo-manager.js';
-import { DEFAULT_TODO_DIR } from './constants.js';
+import { DEFAULT_STATE_DIR, DEFAULT_TODO_DIR } from './constants.js';
 import { FidelityExecutor } from './fidelity-executor.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
@@ -39,6 +39,7 @@ import { loadSettings } from '../utils/settings.js';
 import {
   assertValidWorkflowId,
   generateWorkflowId,
+  getRunReportPath,
 } from '../utils/workflow-id.js';
 
 const logger = createLogger('pipeline-executor');
@@ -341,6 +342,16 @@ export class PipelineExecutor {
     let workflowId: string;
     if (options.workflowId !== undefined) {
       assertValidWorkflowId(options.workflowId);
+      // A reused ID would merge two runs' ledgers, state and run report
+      if (
+        existsSync(join(DEFAULT_STATE_DIR, `${options.workflowId}.json`)) ||
+        existsSync(getRunReportPath(options.workflowId))
+      ) {
+        throw new Error(
+          `Workflow ID '${options.workflowId}' is already in use (existing state or run report). ` +
+            `Pass a fresh --workflow-id (or omit it to generate one).`
+        );
+      }
       workflowId = options.workflowId;
     } else {
       workflowId = generateWorkflowId();

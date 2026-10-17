@@ -4,7 +4,7 @@
  * Provides common CLI execution logic to reduce duplication
  */
 
-import { exec, execFile, spawn, type ChildProcess } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { stat } from 'fs/promises';
 import {
@@ -52,6 +52,11 @@ import {
   KILL_TIME_ESTIMATION_METHOD,
   runSpendTracker,
 } from './spend-estimator.js';
+import { createKillLadder, type SignalLadder } from './kill-ladder.js';
+import {
+  PROVIDER_ADMIN_KEY_DENYLIST,
+  withoutProviderAdminKeys,
+} from '../utils/env-filter.js';
 import { loadSettings } from '../utils/settings.js';
 import { createLogger } from '../utils/logger.js';
 import { ulid } from '../utils/ulid.js';
@@ -116,19 +121,7 @@ interface SpawnTiming {
  */
 const MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS = 5_000;
 
-/** Signal ladder timings (see SIGINT_GRACE_PERIOD_MS in constants.ts) */
-export interface SignalLadder {
-  /** SIGINT → SIGTERM */
-  interruptGraceMs: number;
-  /** SIGTERM → SIGKILL */
-  terminateGraceMs: number;
-  /** SIGKILL → settle with collected output if stdio never closes */
-  postKillSettleMs: number;
-}
-
-/** True until the process has actually exited (not merely been signalled) */
-const processRunning = (child: ChildProcess): boolean =>
-  child.exitCode === null && child.signalCode === null;
+export type { SignalLadder } from './kill-ladder.js';
 
 /**
  * A spawn stopped by run shutdown (SIGINT/SIGTERM to `run`). Non-retryable:
@@ -439,7 +432,6 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
       // Why the ladder started (undefined = not interrupted)
       let interruptError: (() => Error) | undefined;
-      const timers: ReturnType<typeof globalThis.setTimeout>[] = [];
       let timeoutId: ReturnType<typeof globalThis.setTimeout> | undefined;
       let hangCheckerId: ReturnType<typeof globalThis.setInterval> | undefined;
       let unregister: () => void = () => {};
@@ -447,7 +439,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       const cleanup = (): void => {
         globalThis.clearTimeout(timeoutId);
         globalThis.clearInterval(hangCheckerId);
-        for (const timer of timers) globalThis.clearTimeout(timer);
+        killLadder.dispose();
         unregister();
       };
 
@@ -471,21 +463,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         settle(error);
       };
 
-      const sendSignal = (signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL'): void => {
-        if (!processRunning(child)) return;
-        this.logger.debug(`Sending ${signal} to CLI (pid ${child.pid})`);
-        try {
-          child.kill(signal);
-        } catch {
-          // Process already gone
-        }
-      };
+      const killLadder = createKillLadder({
+        child,
+        timings: ladder,
+        onGiveUp: settleInterrupted,
+        logger: this.logger,
+      });
 
-      /**
-       * Signal ladder: SIGINT → grace → SIGTERM → grace → SIGKILL. Each step
-       * runs only if the process has not exited (exitCode/signalCode), never
-       * on `child.killed` (Node sets it on delivery, not on exit).
-       */
+      /** Interrupt the CLI through the kill ladder (once) */
       const startLadder = (
         makeError: () => Error,
         alreadySignaled = false
@@ -494,33 +479,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         interruptError = makeError;
         globalThis.clearTimeout(timeoutId);
         globalThis.clearInterval(hangCheckerId);
-        if (!alreadySignaled) sendSignal('SIGINT');
-        timers.push(
-          globalThis.setTimeout(() => {
-            if (!processRunning(child)) return;
-            this.logger.debug(
-              'CLI still running after SIGINT, sending SIGTERM'
-            );
-            sendSignal('SIGTERM');
-            timers.push(
-              globalThis.setTimeout(() => {
-                if (processRunning(child)) {
-                  this.logger.warn(
-                    'CLI still running after SIGTERM, sending SIGKILL'
-                  );
-                  sendSignal('SIGKILL');
-                }
-                // Ladder complete: don't wait forever for stdio to close
-                timers.push(
-                  globalThis.setTimeout(
-                    settleInterrupted,
-                    ladder.postKillSettleMs
-                  )
-                );
-              }, ladder.terminateGraceMs)
-            );
-          }, ladder.interruptGraceMs)
-        );
+        killLadder.start(alreadySignaled);
       };
 
       // Timeout handler
@@ -1283,7 +1242,12 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       await execAsync(`which ${cliConfig.cliCommand}`);
 
       try {
-        const { stdout } = await execAsync(`${cliConfig.cliCommand} --version`);
+        const { stdout } = await execAsync(
+          `${cliConfig.cliCommand} --version`,
+          {
+            env: withoutProviderAdminKeys(),
+          }
+        );
         return {
           available: true,
           version: stdout.trim(),
@@ -1341,12 +1305,10 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     'TZ',
   ];
 
-  /** CI-standard vars auto-included when CI=true is detected */
   /** Never passed to CLI children, whatever the allowlists say */
-  private static readonly ENV_DENYLIST = [
-    'ANTHROPIC_ADMIN_KEY',
-    'OPENAI_ADMIN_KEY',
-  ];
+  private static readonly ENV_DENYLIST = PROVIDER_ADMIN_KEY_DENYLIST;
+
+  /** CI-standard vars auto-included when CI=true is detected */
 
   private static readonly CI_VARS = [
     'CI',

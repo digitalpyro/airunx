@@ -661,12 +661,19 @@ export async function runOrchestrator(
         );
         const { AuditLogger, createAuditSpawnObserver, getDefaultAuditDir } =
           await import('../../audit/audit-logger.js');
-        const spawnObserver = createAuditSpawnObserver(
-          new AuditLogger(getDefaultAuditDir()),
-          (error) =>
-            logger.warn(
-              `Failed to record llm_spawn event: ${error instanceof Error ? error.message : String(error)}`
-            )
+        // Also recorded by the shutdown coordinator, so a killed run's final
+        // report totals every spawn of the in-flight stage
+        const { shutdownCoordinator: spawnRecorder } = await import(
+          '../../utils/shutdown-coordinator.js'
+        );
+        const spawnObserver = spawnRecorder.observeSpawns(
+          createAuditSpawnObserver(
+            new AuditLogger(getDefaultAuditDir()),
+            (error) =>
+              logger.warn(
+                `Failed to record llm_spawn event: ${error instanceof Error ? error.message : String(error)}`
+              )
+          )
         );
         const adapterFactory = createAdapterFactory(config, { spawnObserver });
 

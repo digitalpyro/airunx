@@ -282,6 +282,8 @@ describe.skipIf(process.platform === 'win32')(
     let origCwd: string;
     let queue: GitHubTaskQueue;
     let spawnOptions: Array<{ detached?: boolean }>;
+    /** Extra fake-run.mjs args (e.g. `exit`) */
+    let runMode: string[];
     const origTimeout = process.env.AIRUNX_CHILD_TIMEOUT_MS;
 
     const logPath = (): string => join(tmpDir, 'signals.log');
@@ -311,12 +313,12 @@ describe.skipIf(process.platform === 'win32')(
       return condition();
     };
 
-    const makeRunner = (): HeartbeatRunner => {
+    const makeRunner = (childGraceMs = 300): HeartbeatRunner => {
       const runner = new HeartbeatRunner({
         repo: 'o/r',
         lockPath: join(tmpDir, 'heartbeat.lock'),
         auditDir: join(tmpDir, 'audit'),
-        childGraceMs: 300,
+        childGraceMs,
       });
       (runner as unknown as { taskQueue: GitHubTaskQueue }).taskQueue = queue;
       return runner;
@@ -339,6 +341,7 @@ describe.skipIf(process.platform === 'win32')(
       const actual =
         await vi.importActual<typeof import('child_process')>('child_process');
       spawnOptions = [];
+      runMode = [];
       vi.mocked(spawn).mockImplementation(((
         cmd: string,
         _args: readonly string[],
@@ -352,6 +355,7 @@ describe.skipIf(process.platform === 'win32')(
             join(FIXTURES, 'fake-cli.mjs'),
             logPath(),
             pidPath(),
+            ...runMode,
           ],
           options
         );
@@ -406,6 +410,56 @@ describe.skipIf(process.platform === 'win32')(
       expect(Date.now() - started).toBeLessThan(5_000);
       expect(await waitFor(() => !isAlive(pid))).toBe(true);
       expect(logLines().filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+    });
+
+    it('stop() twice: run receives exactly one SIGTERM', async () => {
+      process.env.AIRUNX_CHILD_TIMEOUT_MS = String(60 * 60 * 1000);
+      const runner = makeRunner();
+
+      const cycle = runner.runOneCycle(config);
+      expect(await waitFor(() => grandchildPid() > 0)).toBe(true);
+      const pid = grandchildPid();
+
+      const first = runner.stop();
+      const second = runner.stop();
+      expect(second).toBe(first);
+      await Promise.all([first, second]);
+      await cycle;
+
+      expect(await waitFor(() => !isAlive(pid))).toBe(true);
+      expect(logLines().filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+    });
+
+    it('child timeout then stop(): one shared SIGTERM + grace sequence', async () => {
+      process.env.AIRUNX_CHILD_TIMEOUT_MS = '300';
+      const runner = makeRunner(1_000);
+
+      const cycle = runner.runOneCycle(config);
+      expect(
+        await waitFor(() => logLines().includes('run SIGTERM'), 5_000)
+      ).toBe(true);
+      const pid = grandchildPid();
+
+      // Heartbeat stop arrives during the timeout's grace window
+      await runner.stop();
+      await cycle;
+
+      expect(await waitFor(() => !isAlive(pid))).toBe(true);
+      expect(logLines().filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+    });
+
+    it('run exits on its own: CLI left in its process group is reaped', async () => {
+      process.env.AIRUNX_CHILD_TIMEOUT_MS = String(60 * 60 * 1000);
+      runMode = ['exit'];
+      const runner = makeRunner();
+
+      await runner.runOneCycle(config);
+
+      const pid = grandchildPid();
+      expect(pid).toBeGreaterThan(0);
+      expect(await waitFor(() => !isAlive(pid))).toBe(true);
+      // Never signalled through SIGTERM: run exited by itself
+      expect(logLines().filter((l) => l === 'run SIGTERM')).toEqual([]);
     });
   }
 );

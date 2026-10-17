@@ -5,13 +5,7 @@
 
 import { performance } from 'perf_hooks';
 import { spawnAsync } from '../utils/async-spawn.js';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { StateGraph, END, START } from '@langchain/langgraph';
 import type {
@@ -47,7 +41,7 @@ import {
   type IterationEntry,
 } from './iteration-history.js';
 import { FidelityExecutor } from './fidelity-executor.js';
-import { RUN_REPORTS_DIR, getRunReportPath } from '../utils/workflow-id.js';
+import { loadRunReport, writeRunReportFile } from '../utils/run-report-io.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
@@ -60,7 +54,7 @@ import { formatHandoffContext } from './handoff-context.js';
 import {
   ShutdownInProgressError,
   shutdownCoordinator,
-  type InterruptedSpawnSummary,
+  type SpawnSpendSummary,
 } from '../utils/shutdown-coordinator.js';
 
 /**
@@ -68,6 +62,16 @@ import {
  * the application's own IterationManager enforces the real iteration limit.
  */
 const LANGGRAPH_RECURSION_CEILING = 1000;
+
+/** Run-report timeline entry for a stage record */
+function timelineEventOf(sr: StageRecord): TimelineEvent {
+  return {
+    timestamp: sr.timestamp,
+    event: `${sr.stage} complete (${(sr.durationMs / 1000).toFixed(1)}s)`,
+    durationMs: sr.durationMs,
+    details: sr.agent !== sr.stage ? sr.agent : undefined,
+  };
+}
 
 const logger = createLogger('langgraph-runner');
 
@@ -156,6 +160,11 @@ export class LangGraphRunner {
   private currentIteration = 0;
   /** Stages started but not yet returned, by name → start time (ISO) */
   private inFlightStages = new Map<string, string>();
+  /**
+   * Set once the shutdown flush starts: the final `interrupted` report owns
+   * the file, so late incremental writes must not overwrite it
+   */
+  private shutdownFlushStarted = false;
 
   constructor(
     adapter: ExecutionAdapter,
@@ -348,8 +357,8 @@ export class LangGraphRunner {
 
     // On run shutdown (SIGTERM/SIGINT), write a final report that includes
     // the in-flight stage's spend once interrupted spawns have settled
-    const unregisterFlush = shutdownCoordinator.onFlush((interrupted) =>
-      this.flushReportOnShutdown(interrupted)
+    const unregisterFlush = shutdownCoordinator.onFlush((spawns) =>
+      this.flushReportOnShutdown(spawns)
     );
 
     // Execute graph
@@ -456,66 +465,119 @@ export class LangGraphRunner {
 
   /**
    * Final run report on shutdown. Stages still in flight get a `killed`
-   * stage record carrying the spend of their interrupted spawns (reported
-   * when the CLI answered SIGINT with result JSON, else estimated — the
-   * cost summary labels which).
+   * stage record carrying the spend of every spawn they made since they
+   * started — completed earlier spawns (CE main spawn, failed retries),
+   * spawns finished but not yet persisted, timed-out ladders, and spawns
+   * shutdown interrupted (reported when the CLI answered SIGINT with result
+   * JSON, else estimated — the cost summary labels which).
+   *
+   * Base: the persisted state; if that is unavailable, the last on-disk run
+   * report (never the stale in-memory context, which would drop completed
+   * stages); if neither exists, nothing is written.
    */
   private async flushReportOnShutdown(
-    interrupted: readonly InterruptedSpawnSummary[]
+    spawns: readonly SpawnSpendSummary[]
   ): Promise<void> {
+    this.shutdownFlushStarted = true;
     const workflowId = this.workflowContext.id;
-    const context =
-      (await this.stateManager.load(workflowId)) ?? this.workflowContext;
-    const stageRecords = [...(context.stageRecords ?? [])];
-    let totalCost = context.metrics.totalCost ?? 0;
-    let totalTokens =
-      context.metrics.totalTokens ?? context.metrics.tokensUsed ?? 0;
-    let costSummary = context.metrics.costSummary;
+    const totalRuntimeMs = Math.round(
+      performance.now() - this.workflowStartTime
+    );
 
+    let context: WorkflowContext | null = null;
+    try {
+      context = await this.stateManager.load(workflowId);
+    } catch (error) {
+      logger.warn('Shutdown flush: could not load workflow state:', error);
+    }
+
+    let base: RunReport | null;
+    if (context) {
+      base = this.buildRunReport(context, totalRuntimeMs);
+    } else {
+      try {
+        base = loadRunReport(workflowId);
+      } catch {
+        base = null;
+      }
+      if (!base) {
+        logger.warn(
+          'Shutdown flush: no workflow state or run report to extend; skipping final report'
+        );
+        return;
+      }
+      logger.warn(
+        'Shutdown flush: workflow state unavailable; extending the last run report'
+      );
+    }
+
+    const killed = this.killedStageRecords(base.stages, spawns);
+    let costSummary = base.costSummary;
+    for (const record of killed) {
+      costSummary = mergeCostSummaries(costSummary, record.costSummary);
+    }
+    const report: RunReport = {
+      ...base,
+      status: 'interrupted',
+      completedAt: new Date().toISOString(),
+      totalDurationMs: context ? base.totalDurationMs : totalRuntimeMs,
+      totalTokens:
+        (base.totalTokens ?? 0) +
+        killed.reduce((sum, r) => sum + r.tokensUsed, 0),
+      totalCostUsd:
+        base.totalCostUsd + killed.reduce((sum, r) => sum + r.costUsd, 0),
+      stages: [...base.stages, ...killed],
+      timeline: [...base.timeline, ...killed.map(timelineEventOf)],
+      ...(costSummary
+        ? { costSummary, costSummaryLine: formatCostSummaryLine(costSummary) }
+        : {}),
+    };
+    this.persistRunReport(report);
+  }
+
+  /**
+   * `killed` records for in-flight stages that have not persisted their own
+   * record since they started, totalling every spawn of that stage run
+   */
+  private killedStageRecords(
+    existing: readonly StageRecord[],
+    spawns: readonly SpawnSpendSummary[]
+  ): StageRecord[] {
+    const workflowId = this.workflowContext.id;
+    const killed: StageRecord[] = [];
     for (const [stage, startedAt] of this.inFlightStages) {
       // The node may already have persisted its own (error) record
-      if (
-        stageRecords.some((r) => r.stage === stage && r.timestamp >= startedAt)
-      ) {
+      if (existing.some((r) => r.stage === stage && r.timestamp >= startedAt)) {
         continue;
       }
-      const spawns = interrupted.filter(
-        (s) => s.workflowId === workflowId && s.stage === stage
+      const stageSpawns = spawns.filter(
+        (s) =>
+          s.workflowId === workflowId &&
+          s.stage === stage &&
+          s.startedAt >= startedAt
       );
-      const killed: StageRecord = {
+      const record: StageRecord = {
         stage,
         agent:
-          spawns[0]?.agentRole ??
+          stageSpawns[0]?.agentRole ??
           this.pipeline.stages.find((st) => st.name === stage)?.agent ??
           stage,
         backend:
-          spawns[0]?.backend ?? this.workflowContext.backend ?? 'unknown',
-        spawnCount: spawns.length,
+          stageSpawns[0]?.backend ?? this.workflowContext.backend ?? 'unknown',
+        spawnCount: stageSpawns.length,
         durationMs: Date.now() - Date.parse(startedAt),
-        tokensUsed: spawns.reduce((sum, s) => sum + s.tokensUsed, 0),
-        costUsd: spawns.reduce((sum, s) => sum + (s.costUsd ?? 0), 0),
+        tokensUsed: stageSpawns.reduce((sum, s) => sum + s.tokensUsed, 0),
+        costUsd: stageSpawns.reduce((sum, s) => sum + (s.costUsd ?? 0), 0),
         timestamp: startedAt,
         status: 'killed',
       };
       const stageSummary = mergeCostSummaries(
-        ...spawns.map((s) => s.costSummary)
+        ...stageSpawns.map((s) => s.costSummary)
       );
-      if (stageSummary) killed.costSummary = stageSummary;
-      stageRecords.push(killed);
-      totalCost += killed.costUsd;
-      totalTokens += killed.tokensUsed;
-      costSummary = mergeCostSummaries(costSummary, stageSummary);
+      if (stageSummary) record.costSummary = stageSummary;
+      killed.push(record);
     }
-
-    this.writeRunReport(
-      {
-        ...context,
-        stageRecords,
-        metrics: { ...context.metrics, totalCost, totalTokens, costSummary },
-      },
-      Math.round(performance.now() - this.workflowStartTime),
-      'interrupted'
-    );
+    return killed;
   }
 
   /**
@@ -1482,57 +1544,58 @@ export class LangGraphRunner {
   /**
    * Build and write a structured RunReport JSON to disk.
    * Consumers (issue comments, dashboards) read this file to render rich tables.
+   * Skipped once the shutdown flush started (it writes the final report).
    */
   private writeRunReport(
     context: WorkflowContext,
-    totalRuntimeMs: number,
-    statusOverride?: string
+    totalRuntimeMs: number
   ): void {
+    if (this.shutdownFlushStarted) {
+      logger.debug('Skipping run report write: shutdown flush owns the file');
+      return;
+    }
     try {
-      const stageRecords = context.stageRecords || [];
+      this.persistRunReport(this.buildRunReport(context, totalRuntimeMs));
+    } catch (err) {
+      // Non-fatal: don't crash the pipeline if report building fails
+      logger.warn('Failed to write run report:', err);
+    }
+  }
 
-      // Build timeline from stage records
-      const timeline: TimelineEvent[] = stageRecords.map((sr) => ({
-        timestamp: sr.timestamp,
-        event: `${sr.stage} complete (${(sr.durationMs / 1000).toFixed(1)}s)`,
-        durationMs: sr.durationMs,
-        details: sr.agent !== sr.stage ? sr.agent : undefined,
-      }));
+  /** RunReport for a workflow context */
+  private buildRunReport(
+    context: WorkflowContext,
+    totalRuntimeMs: number
+  ): RunReport {
+    const stageRecords = context.stageRecords || [];
+    return {
+      workflowId: context.id,
+      taskTitle: context.taskTitle,
+      pipelineName: context.pipelineName,
+      status: context.status,
+      startedAt: new Date(context.createdAt).toISOString(),
+      completedAt: new Date().toISOString(),
+      totalDurationMs: totalRuntimeMs,
+      totalTokens: context.metrics.totalTokens ?? context.metrics.tokensUsed,
+      totalCostUsd: context.metrics.totalCost ?? 0,
+      iterationCount: context.iterationCount ?? 1,
+      maxIterations: context.maxIterations ?? 1,
+      iterations: context.iterationHistory?.entries ?? [],
+      stages: stageRecords,
+      timeline: stageRecords.map(timelineEventOf),
+      ...(context.metrics.costSummary
+        ? {
+            costSummary: context.metrics.costSummary,
+            costSummaryLine: formatCostSummaryLine(context.metrics.costSummary),
+          }
+        : {}),
+    };
+  }
 
-      const report: RunReport = {
-        workflowId: context.id,
-        taskTitle: context.taskTitle,
-        pipelineName: context.pipelineName,
-        status: statusOverride ?? context.status,
-        startedAt: context.createdAt.toISOString(),
-        completedAt: new Date().toISOString(),
-        totalDurationMs: totalRuntimeMs,
-        totalTokens: context.metrics.totalTokens ?? context.metrics.tokensUsed,
-        totalCostUsd: context.metrics.totalCost ?? 0,
-        iterationCount: context.iterationCount ?? 1,
-        maxIterations: context.maxIterations ?? 1,
-        iterations: context.iterationHistory?.entries ?? [],
-        stages: stageRecords,
-        timeline,
-        ...(context.metrics.costSummary
-          ? {
-              costSummary: context.metrics.costSummary,
-              costSummaryLine: formatCostSummaryLine(
-                context.metrics.costSummary
-              ),
-            }
-          : {}),
-      };
-
-      // Validates the ID (path-safe) before touching the filesystem
-      const reportPath = getRunReportPath(context.id);
-      if (!existsSync(RUN_REPORTS_DIR)) {
-        mkdirSync(RUN_REPORTS_DIR, { recursive: true });
-      }
-      // Atomic write: write to tmp file then rename to avoid partial reads
-      const tmpPath = reportPath + '.tmp';
-      writeFileSync(tmpPath, JSON.stringify(report, null, 2));
-      renameSync(tmpPath, reportPath);
+  /** Atomic, owner-only report write. Never throws. */
+  private persistRunReport(report: RunReport): void {
+    try {
+      const reportPath = writeRunReportFile(report);
       logger.info(`Run report written to ${reportPath}`);
     } catch (err) {
       // Non-fatal: don't crash the pipeline if report writing fails

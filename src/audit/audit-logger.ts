@@ -12,6 +12,7 @@
 import {
   closeSync,
   existsSync,
+  chmodSync,
   fchmodSync,
   mkdirSync,
   openSync,
@@ -29,6 +30,7 @@ import type {
   SpawnRecord,
 } from '../core/adapter-types.js';
 import type { CostSummary } from '../core/types.js';
+import { usdToMicroUsdOrUndefined } from '../core/cost-accounting.js';
 import { isSensitiveKey, redactSecrets } from '../utils/redaction.js';
 import { ulid } from '../utils/ulid.js';
 
@@ -160,15 +162,6 @@ function capRecordSize(entry: AuditEvent): AuditEvent {
 }
 
 /**
- * Convert USD to integer micro-USD (undefined stays undefined)
- */
-export function toMicroUsd(usd: number | undefined): number | undefined {
-  return usd === undefined || !Number.isFinite(usd)
-    ? undefined
-    : Math.round(usd * 1_000_000);
-}
-
-/**
  * Compact, numbers-only view of a CostSummary for decision events
  */
 export function compactCostSummary(
@@ -217,9 +210,15 @@ export class AuditLogger {
   constructor(logDir: string = '.airunx-state/audit') {
     this.logDir = logDir;
 
-    // Ensure directory exists (owner-only when we create it)
+    // Ensure directory exists, owner-only (also tightens a pre-existing dir)
     if (!existsSync(logDir)) {
       mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    } else {
+      try {
+        chmodSync(logDir, 0o700);
+      } catch {
+        // Not our directory / unsupported FS — keep logging
+      }
     }
   }
 
@@ -299,7 +298,7 @@ export class AuditLogger {
         input_tokens: record.inputTokens,
         output_tokens: record.outputTokens,
         cost_usd: record.costUsd,
-        cost_micro_usd: toMicroUsd(record.costUsd),
+        cost_micro_usd: usdToMicroUsdOrUndefined(record.costUsd),
         started_at: record.startedAt,
         ended_at: record.endedAt,
         duration_ms: record.durationMs,
@@ -311,7 +310,7 @@ export class AuditLogger {
         // U3: provenance, billing basis, normalized tokens
         cost_provenance: record.costProvenance ?? 'missing',
         billing_basis: record.billingBasis,
-        derived_cost_micro_usd: toMicroUsd(record.derivedCostUsd),
+        derived_cost_micro_usd: usdToMicroUsdOrUndefined(record.derivedCostUsd),
         pricing_version: record.pricingVersion,
         unmodeled_modifiers: record.unmodeledModifiers,
         token_provenance: record.tokenProvenance,
@@ -336,10 +335,18 @@ export class AuditLogger {
         cost_basis: record.costBasis,
         // U5: killed-spawn spend (estimated lost / salvaged partial)
         ...(record.spendLostUsd !== undefined
-          ? { spend_lost_micro_usd: toMicroUsd(record.spendLostUsd) }
+          ? {
+              spend_lost_micro_usd: usdToMicroUsdOrUndefined(
+                record.spendLostUsd
+              ),
+            }
           : {}),
         ...(record.spendSalvagedUsd !== undefined
-          ? { spend_salvaged_micro_usd: toMicroUsd(record.spendSalvagedUsd) }
+          ? {
+              spend_salvaged_micro_usd: usdToMicroUsdOrUndefined(
+                record.spendSalvagedUsd
+              ),
+            }
           : {}),
       },
     });
@@ -370,7 +377,7 @@ export class AuditLogger {
         fallback_to: record.fallbackTo,
         salvaged: record.outcome === 'failure',
         cost_usd: record.costUsd,
-        cost_micro_usd: toMicroUsd(record.costUsd),
+        cost_micro_usd: usdToMicroUsdOrUndefined(record.costUsd),
         cost_summary: compactCostSummary(record.costSummary),
       },
     });
@@ -396,13 +403,15 @@ export class AuditLogger {
         gap_count: decision.gapCount,
         will_iterate: decision.willIterate,
         iteration_cost_usd: decision.iterationCostUsd,
-        iteration_cost_micro_usd: toMicroUsd(decision.iterationCostUsd),
+        iteration_cost_micro_usd: usdToMicroUsdOrUndefined(
+          decision.iterationCostUsd
+        ),
         projected_rerun_cost_usd: decision.projectedRerunCostUsd,
-        projected_rerun_cost_micro_usd: toMicroUsd(
+        projected_rerun_cost_micro_usd: usdToMicroUsdOrUndefined(
           decision.projectedRerunCostUsd
         ),
         remaining_iterations: decision.remainingIterations,
-        run_cost_micro_usd: toMicroUsd(decision.runCostUsd),
+        run_cost_micro_usd: usdToMicroUsdOrUndefined(decision.runCostUsd),
       },
     });
   }
@@ -777,7 +786,10 @@ function taskCostFields(cost?: TaskCostDetails): Record<string, unknown> {
   if (!cost) return {};
   return {
     ...(cost.costUsd !== undefined
-      ? { cost_usd: cost.costUsd, cost_micro_usd: toMicroUsd(cost.costUsd) }
+      ? {
+          cost_usd: cost.costUsd,
+          cost_micro_usd: usdToMicroUsdOrUndefined(cost.costUsd),
+        }
       : {}),
     ...(cost.costSummaryLine
       ? { cost_summary_line: cost.costSummaryLine }

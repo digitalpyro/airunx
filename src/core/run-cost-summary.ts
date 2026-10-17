@@ -290,16 +290,34 @@ function computeDrivers(
     ...sumSpawns(spawns, (e) => (num(e.details?.iteration) ?? 1) > 1),
   });
 
-  // Retry waste: spend of failed attempts
+  // Retry waste: spend of the spawns behind failed attempts. Summed from
+  // each failed spawn's own llm_spawn event (once per spawn_id), never from
+  // attempt cost fields: an attempt's cost can fold in earlier spawns (e.g.
+  // a Codex model-rejected spawn folded into its retry), which would double
+  // count. Attempts without a spawn_id (legacy) fall back to their own cost.
+  const failedSpawnIds = new Set<string>();
   let retryMicro = 0;
   let retryCount = 0;
   for (const e of events) {
     if (e.event !== 'attempt') continue;
     const d = e.details ?? {};
     if (d.outcome !== 'failure') continue;
+    if (e.spawn_id) {
+      failedSpawnIds.add(e.spawn_id);
+      continue;
+    }
     retryMicro += microFrom(d, 'cost_micro_usd', 'cost_usd') ?? 0;
     retryCount++;
   }
+  const countedSpawnIds = new Set<string>();
+  const failedSpawns = sumSpawns(spawns, (e) => {
+    if (!e.spawn_id || !failedSpawnIds.has(e.spawn_id)) return false;
+    if (countedSpawnIds.has(e.spawn_id)) return false;
+    countedSpawnIds.add(e.spawn_id);
+    return true;
+  });
+  retryMicro += failedSpawns.microUsd;
+  retryCount += failedSpawns.count;
   drivers.push({
     kind: 'retry_waste',
     label: 'Retry waste (failed attempts)',

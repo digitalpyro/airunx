@@ -3,7 +3,7 @@
  * Validates agent execution with fidelity parameters and retry logic
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { AgentInvoker } from '../../src/orchestrator/agent-invoker.js';
 import type {
   AttemptRecord,
@@ -17,6 +17,10 @@ import type { AdapterFactory } from '../../src/adapters/adapter-factory.js';
 import type { ProviderRouter } from '../../src/orchestrator/provider-router.js';
 import { spawnCostSummary } from '../../src/core/cost-accounting.js';
 import { ConfigurationError, TimeoutError } from '../../src/utils/errors.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+} from '../../src/utils/shutdown-coordinator.js';
 
 // Mock settings to prevent AGENTS.md loading during tests (use defaults)
 vi.mock('../../src/utils/settings.js', () => ({
@@ -934,5 +938,89 @@ describe('Agent Invoker attempt events (U4)', () => {
       projectContext: { workingDirectory: '/test' },
     });
     expect(result.success).toBe(true);
+  });
+
+  describe('after run shutdown starts', () => {
+    const refused = (): ExecutionResult => ({
+      success: false,
+      outputs: { error: 'Shutdown in progress: no new CLI spawns' },
+      metrics: { tokensUsed: 0, duration: 0 },
+      errors: [new ShutdownInProgressError()],
+    });
+
+    afterEach(() => {
+      shutdownCoordinator.reset();
+    });
+
+    it('a not-spawned refusal is no attempt, no spawn and stops retrying', async () => {
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute)
+        .mockResolvedValueOnce(failed(0.1, 's1'))
+        .mockResolvedValueOnce(refused())
+        .mockResolvedValueOnce(succeeded(0.3, 's3'));
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(2);
+      expect(result.success).toBe(false);
+      expect(attempts.map((a) => [a.attempt, a.outcome])).toEqual([
+        [1, 'failure'],
+      ]);
+      // Only the real (failed) spawn counts
+      expect(result.metrics.spawnCount).toBe(1);
+      expect(result.metrics.cost).toBeCloseTo(0.1);
+    });
+
+    it('a thrown ShutdownInProgressError counts zero spawns and no attempts', async () => {
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute).mockRejectedValue(
+        new ShutdownInProgressError()
+      );
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const started = Date.now();
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(1);
+      expect(Date.now() - started).toBeLessThan(500); // no retry backoff
+      expect(attempts).toEqual([]);
+      expect(result.metrics.spawnCount).toBe(0);
+    });
+
+    it('a spawn failing during shutdown is recorded once and not retried', async () => {
+      void shutdownCoordinator.shutdown({ timeoutMs: 10, flushTimeoutMs: 10 });
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute)
+        .mockRejectedValueOnce(new Error('interrupted'))
+        .mockResolvedValueOnce(succeeded(0.3, 's2'));
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const started = Date.now();
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(1);
+      expect(Date.now() - started).toBeLessThan(500); // no retry backoff
+      expect(result.success).toBe(false);
+      expect(attempts.map((a) => a.outcome)).toEqual(['failure']);
+    });
   });
 });

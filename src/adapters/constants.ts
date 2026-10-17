@@ -71,9 +71,10 @@ export const SIGINT_GRACE_PERIOD_MS = 3000; // 3 seconds
 export const SIGTERM_GRACE_PERIOD_MS = 2000; // 2 seconds
 
 /**
- * After SIGKILL, how long to wait for the CLI's stdio to close before
- * settling with the output collected so far (a grandchild holding the pipe
- * open must not keep the spawn pending)
+ * Once an interrupted CLI has exited (at any ladder step) or been
+ * SIGKILLed, how long to wait for its stdio to close before settling with
+ * the output collected so far (a grandchild holding the pipe open must not
+ * keep the spawn pending)
  */
 export const POST_KILL_SETTLE_MS = 1000; // 1 second
 
