@@ -87,9 +87,9 @@ export class CodexAdapter extends BaseCliAdapter {
     // The pre-push git hook provides the actual git push block.
     const isPipelineMode =
       request.context.additionalContext?.pipelineMode === true;
-    // Codex rejects a repeated --sandbox, so skip it when the approval mode already sets one.
+    // --approve-for-me already implies workspace-write and Codex rejects it alongside --sandbox.
     const sandboxFlags =
-      isPipelineMode && !approvalFlags.includes('--sandbox')
+      isPipelineMode && !approvalFlags.includes('--approve-for-me')
         ? ['--sandbox', 'workspace-write']
         : [];
 

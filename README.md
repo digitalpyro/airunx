@@ -90,7 +90,7 @@ Authentication options:
 - **Subscription**: `codex login` (uses your ChatGPT Plus/Team quota)
 - **API Key**: `export OPENAI_API_KEY=sk-...` (pay-per-token)
 
-Use Codex CLI 0.163.0 or newer for the GPT-6 models. The default AGENTS.md sets `gpt-6.1-sol` for codex roles; agents with no `Model` run on the Codex CLI's own default. Older CLIs reject GPT-6 on a ChatGPT login, and airunx then retries once on the CLI's own default model.
+Use Codex CLI 0.163.0 or newer for the GPT-6 models. The default AGENTS.md sets `gpt-6.1-sol` for codex roles; agents with no `Model` run on the Codex CLI's own default. Older CLIs reject GPT-6 on a ChatGPT login, and airunx then retries once on the CLI's own default model. The default `auto` approval mode also needs 0.163.0, because it passes `--approve-for-me` (the replacement for the removed `--full-auto`).
 
 **Option C: Cursor CLI (experimental — least tested backend)**
 
@@ -1053,7 +1053,7 @@ AIRunX supports 3 approval modes to control CLI adapter permission handling:
 | Mode       | Description                         | Adapter Flags                                                                                                        |
 | ---------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | **manual** | Interactive prompts for all actions | No auto-approval flags                                                                                               |
-| **auto**   | Auto-approve all actions (default)  | Codex: `--sandbox workspace-write`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
+| **auto**   | Auto-approve all actions (default)  | Codex: `--approve-for-me`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
 | **yolo**   | Skip all approvals and sandboxing   | Codex: `--dangerously-bypass-approvals-and-sandbox`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags |
 
 ### Configuration

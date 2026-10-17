@@ -126,8 +126,9 @@ export const APPROVAL_MODE_FLAGS: Record<
 > = {
   codex: {
     manual: [],
-    // --full-auto was removed in Codex CLI 0.163; it was shorthand for this sandbox.
-    auto: ['--sandbox', 'workspace-write'],
+    // Codex CLI 0.163 replaced --full-auto with --approve-for-me: no prompts,
+    // workspace-write sandbox, escalation requests auto-reviewed.
+    auto: ['--approve-for-me'],
     yolo: ['--dangerously-bypass-approvals-and-sandbox'],
   },
   'claude-code': {
