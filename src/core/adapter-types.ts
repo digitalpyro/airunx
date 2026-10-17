@@ -304,6 +304,10 @@ export interface SpawnRecord {
   costBasis?: Record<string, string>;
   /** OTel GenAI semconv version the token fields map to */
   semconvVersion?: string;
+  /** Kill-time estimate (USD) for a spawn that ended without cost JSON */
+  spendLostUsd?: number;
+  /** Partial cost (USD) recovered from a failed spawn's output */
+  spendSalvagedUsd?: number;
 }
 
 /**

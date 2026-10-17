@@ -17,6 +17,11 @@ import type {
 import type { ModelPricing } from '../../src/adapters/pricing.js';
 import { CompoundEngineeringAdapter } from '../../src/adapters/compound-engineering-adapter.js';
 import { TimeoutError } from '../../src/utils/errors.js';
+import {
+  KILL_ESTIMATE_BYTES_PER_TOKEN,
+  KILL_ESTIMATE_CAP_FLOOR_MULTIPLIER,
+  runSpendTracker,
+} from '../../src/adapters/spend-estimator.js';
 
 // Concrete test subclass to access protected methods
 class TestableCliAdapter extends BaseCliAdapter {
@@ -506,6 +511,174 @@ describe('BaseCliAdapter spawn observer', () => {
     });
     const result = await adapter.execute(makeRequest());
     expect(result.success).toBe(true);
+  });
+});
+
+describe('BaseCliAdapter kill-time spend estimation', () => {
+  let adapter: StubSpawnAdapter;
+  let records: SpawnRecord[];
+  /** stub-model input price, USD per 1M tokens */
+  const INPUT_PRICE = 3;
+  const floorFor = (promptBytes: number): number =>
+    (promptBytes / KILL_ESTIMATE_BYTES_PER_TOKEN) * (INPUT_PRICE / 1_000_000);
+
+  beforeEach(async () => {
+    runSpendTracker.reset();
+    runSpendTracker.setReportsDir(null); // no historical rate from disk
+    adapter = new StubSpawnAdapter();
+    await adapter.init({ type: 'cli' });
+    records = [];
+    adapter.setSpawnObserver({
+      onSpawnComplete: (record) => records.push(record),
+    });
+  });
+
+  const killed = (
+    timing: { spawnStartedAt?: number; lastOutputAt?: number },
+    kind: 'signal' | 'hang' = 'signal'
+  ): Error =>
+    kind === 'signal'
+      ? Object.assign(new Error('Process killed by signal: SIGTERM'), {
+          signal: 'SIGTERM',
+          stdout: '',
+          stderr: '',
+          ...timing,
+        })
+      : Object.assign(new TimeoutError(300_000, 'Process hang detected'), {
+          stdout: '',
+          stderr: '',
+          ...timing,
+        });
+
+  it('SIGTERM-killed spawn with empty stdout gets an estimated non-zero cost', async () => {
+    adapter.spawnResult = killed({ spawnStartedAt: Date.now() });
+
+    const result = await adapter.execute(makeRequest());
+
+    const record = records[0];
+    const floor = floorFor(record.promptBytes!);
+    expect(record.exitReason).toBe('signal');
+    expect(record.costProvenance).toBe('estimated');
+    expect(record.estimationMethods).toEqual(['kill_time']);
+    expect(record.costUsd).toBeGreaterThan(0);
+    // No burn rate observed yet → the prompt-bytes floor alone
+    expect(record.costUsd).toBeCloseTo(floor, 10);
+    expect(record.spendLostUsd).toBe(record.costUsd);
+    expect(record.spendSalvagedUsd).toBeUndefined();
+    expect(result.metrics.cost).toBe(record.costUsd);
+    expect(result.metrics.costSummary).toMatchObject({
+      provenance: 'estimated',
+      estimatedSpawns: 1,
+      missingCostSpawns: 0,
+      estimationMethods: ['kill_time'],
+    });
+    expect(result.metrics.costSummary!.estimatedMicroUsd).toBeGreaterThan(0);
+  });
+
+  it('long-elapsed active spawn: burn-rate estimate exceeds the floor', async () => {
+    // Earlier spawn in this run: $1.00 over 100s → $0.01/s
+    runSpendTracker.record({
+      backend: 'claude-code',
+      costUsd: 1,
+      activeMs: 100_000,
+    });
+    const now = Date.now();
+    adapter.spawnResult = killed({
+      spawnStartedAt: now - 60_000,
+      lastOutputAt: now,
+    });
+
+    await adapter.execute(makeRequest());
+
+    const record = records[0];
+    expect(record.costUsd!).toBeGreaterThan(floorFor(record.promptBytes!));
+    expect(record.costUsd!).toBeCloseTo(0.6, 2); // 60s × $0.01/s
+    expect(record.costUsd!).toBeLessThan(1); // below the cap
+  });
+
+  it('long-idle hang: estimate is bounded by the cap, not wall clock', async () => {
+    runSpendTracker.record({
+      backend: 'claude-code',
+      costUsd: 1,
+      activeMs: 100_000,
+    });
+    const now = Date.now();
+    // Started 2h ago, went silent 1h ago, killed now
+    adapter.spawnResult = killed(
+      { spawnStartedAt: now - 2 * 3_600_000, lastOutputAt: now - 3_600_000 },
+      'hang'
+    );
+
+    await adapter.execute(makeRequest());
+
+    const record = records[0];
+    expect(record.exitReason).toBe('hang');
+    // 3600s active × $0.01/s = $36 → capped at the largest observed spawn
+    expect(record.costUsd).toBe(1);
+    expect(record.spendLostUsd).toBe(1);
+  });
+
+  it('caps at floor × multiplier when no spawn cost has been observed', () => {
+    runSpendTracker.setReportsDir(null);
+    const estimate = runSpendTracker.estimateKillTimeSpend({
+      backend: 'codex',
+      activeMs: 3_600_000,
+      promptBytes: 4_000,
+      inputPricePer1M: 1,
+    });
+    // No rate at all → floor only
+    expect(estimate.costUsd).toBeCloseTo(0.001, 10);
+    expect(estimate.capUsd).toBeCloseTo(
+      0.001 * KILL_ESTIMATE_CAP_FLOOR_MULTIPLIER,
+      10
+    );
+    expect(estimate.rateSource).toBe('none');
+  });
+
+  it('clean exit still prefers CLI-reported figures', async () => {
+    await adapter.execute(makeRequest());
+
+    const record = records[0];
+    expect(record.exitReason).toBe('ok');
+    expect(record.costUsd).toBe(0.0123);
+    expect(record.costProvenance).toBe('reported');
+    expect(record.estimationMethods).not.toContain('kill_time');
+    expect(record.spendLostUsd).toBeUndefined();
+  });
+
+  it('records salvaged partial cost as spend_salvaged without estimating', async () => {
+    const timeout = new TimeoutError(1000, 'CLI execution');
+    Object.assign(timeout, {
+      stdout: JSON.stringify({ result: 'partial', total_cost_usd: 0.2 }),
+      stderr: '',
+    });
+    adapter.spawnResult = timeout;
+
+    await adapter.execute(makeRequest());
+
+    const record = records[0];
+    expect(record.salvaged).toBe(true);
+    expect(record.costProvenance).toBe('reported');
+    expect(record.spendSalvagedUsd).toBe(0.2);
+    expect(record.spendLostUsd).toBeUndefined();
+  });
+
+  it('does not estimate a quick non-zero exit (rejection before work)', async () => {
+    const now = Date.now();
+    adapter.spawnResult = Object.assign(new Error('exit 1'), {
+      code: 1,
+      stdout: 'Error: invalid model',
+      stderr: '',
+      spawnStartedAt: now - 500,
+      lastOutputAt: now,
+    });
+
+    const result = await adapter.execute(makeRequest());
+
+    expect(records[0].exitReason).toBe('error');
+    expect(records[0].costProvenance).toBeUndefined();
+    expect(records[0].spendLostUsd).toBeUndefined();
+    expect(result.metrics.cost).toBe(0);
   });
 });
 

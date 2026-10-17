@@ -40,6 +40,8 @@ export interface TaskResult {
     tokensUsed?: number;
     durationMs?: number;
     iterations?: number;
+    /** Provenance/billing-labeled spend, e.g. "… — 60% reported/derived, 40% estimated" */
+    costSummaryLine?: string;
   };
   /** Structured run report for rich completion comments */
   runReport?: RunReport;

@@ -239,6 +239,10 @@ program
     '--ci-verification-gate',
     'After PR creation, poll GitHub Actions and iterate on CI failures (up to 3 attempts). Overrides ci_verification_gate setting.'
   )
+  .option(
+    '--workflow-id <id>',
+    'Use this workflow ID instead of minting one (A-Z, a-z, 0-9, _ or -; max 64 chars). Set by the heartbeat to locate the run report.'
+  )
   .action(runOrchestrator);
 
 program

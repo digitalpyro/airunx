@@ -257,6 +257,43 @@ pipelines:
       expect(result.inputType).toBe('prompt');
     });
 
+    it('should use a pre-assigned workflowId instead of minting one', async () => {
+      await setupStandardPipelineConfig();
+
+      const result = await pipelineExecutor.execute({
+        input: 'Test task',
+        inputType: 'prompt',
+        workflowId: 'workflow-123-abcdef01',
+      });
+
+      expect(result.id).toBe('workflow-123-abcdef01');
+      const status = await pipelineExecutor.getStatus('workflow-123-abcdef01');
+      expect(status?.id).toBe('workflow-123-abcdef01');
+    });
+
+    it('should mint a pattern-valid workflowId when none is given', async () => {
+      await setupStandardPipelineConfig();
+
+      const result = await pipelineExecutor.execute({
+        input: 'Test task',
+        inputType: 'prompt',
+      });
+
+      expect(result.id).toMatch(/^workflow-\d+-[0-9a-f]{8}$/);
+    });
+
+    it('should reject an invalid workflowId before creating state', async () => {
+      await setupStandardPipelineConfig();
+
+      await expect(
+        pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: '../../x',
+        })
+      ).rejects.toThrow(/Invalid workflow ID/);
+    });
+
     it('should use specified pipeline if found', async () => {
       await mkdir(TEST_CONFIG_DIR, { recursive: true });
       const yamlContent = `

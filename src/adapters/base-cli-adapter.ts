@@ -42,6 +42,10 @@ import {
   SIGTERM_GRACE_PERIOD_MS,
   APPROVAL_MODE_FLAGS,
 } from './constants.js';
+import {
+  KILL_TIME_ESTIMATION_METHOD,
+  runSpendTracker,
+} from './spend-estimator.js';
 import { loadSettings } from '../utils/settings.js';
 import { createLogger } from '../utils/logger.js';
 import { ulid } from '../utils/ulid.js';
@@ -80,7 +84,34 @@ interface SpawnOutcome {
   outputTokens?: number;
   /** Provenance-tagged cost facts (undefined when nothing was parsed) */
   cost?: SpawnCostAccounting;
+  /** Kill-time estimate for a spawn that ended without cost JSON */
+  spendLostUsd?: number;
+  /** Partial cost recovered from a failed spawn's output */
+  spendSalvagedUsd?: number;
 }
+
+/**
+ * Spawn timing attached to executeWithSpawn rejections, so the kill-time
+ * estimate measures active time (start → last output), not kill time
+ */
+interface SpawnTiming {
+  spawnStartedAt?: number;
+  /** Epoch ms of the last stdout/stderr chunk; undefined = no output */
+  lastOutputAt?: number;
+}
+
+/**
+ * Minimum active time before a non-zero exit without cost JSON is estimated
+ * (shorter exits are treated as rejections — auth, bad model — before work)
+ */
+const MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS = 5_000;
+
+/** Exit reasons that mean the CLI was cut off before it could report cost */
+const KILLED_EXIT_REASONS: ReadonlySet<SpawnExitReason> = new Set([
+  'timeout',
+  'hang',
+  'signal',
+]);
 
 /**
  * Provenance-tagged cost facts for one spawn
@@ -146,7 +177,7 @@ export interface CliAdapterConfig {
  * Used by executeWithSpawn rejections and categorizeError
  * Includes stdout as some tools output error info to stdout
  */
-export interface ProcessError extends Error {
+export interface ProcessError extends Error, SpawnTiming {
   code?: number | string;
   signal?: string | null;
   stdout?: string;
@@ -329,6 +360,10 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       let lastOutputTime = Date.now();
       let hasOutput = false;
       let isSettled = false;
+      // Kill-time estimation measures active time to the last real output
+      const spawnStartedAt = Date.now();
+      let lastOutputAt: number | undefined;
+      const timing = (): SpawnTiming => ({ spawnStartedAt, lastOutputAt });
 
       this.logger.debug(`Executing: ${cliConfig.cliCommand} ${args.join(' ')}`);
       this.logger.debug(`Working directory: ${workingDirectory}`);
@@ -347,12 +382,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       child.stdout.on('data', (data: Buffer) => {
         stdout += data.toString();
         lastOutputTime = Date.now();
+        lastOutputAt = lastOutputTime;
         hasOutput = true;
       });
 
       child.stderr.on('data', (data: Buffer) => {
         stderr += data.toString();
         lastOutputTime = Date.now();
+        lastOutputAt = lastOutputTime;
         hasOutput = true;
       });
 
@@ -375,7 +412,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         this.killProcess(child, 'timeout');
         // Attach stdout/stderr for debugging what happened before timeout
         const timeoutError = new TimeoutError(timeoutMs, 'CLI execution');
-        Object.assign(timeoutError, { stdout, stderr });
+        Object.assign(timeoutError, { stdout, stderr, ...timing() });
         reject(timeoutError);
       }, timeoutMs);
 
@@ -395,7 +432,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
             timeSinceLastOutput,
             HANG_OPERATION
           );
-          Object.assign(hangError, { stdout, stderr });
+          Object.assign(hangError, { stdout, stderr, ...timing() });
           reject(hangError);
         }
       }, HANG_DETECTION_POLL_INTERVAL_MS);
@@ -411,14 +448,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         if (signal) {
           const error = Object.assign(
             new Error(`Process killed by signal: ${signal}`),
-            { signal }
+            { signal, stdout, stderr, ...timing() }
           );
           reject(error);
         } else if (code !== 0) {
           // Create error object with additional properties for categorization
           const error = Object.assign(
             new Error(`CLI execution failed with exit code ${code}`),
-            { code, stderr, stdout }
+            { code, stderr, stdout, ...timing() }
           );
           reject(error);
         } else {
@@ -522,6 +559,8 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         providerUsage: outcome.cost?.providerUsage,
         costBasis: outcome.cost?.costBasis,
         semconvVersion: GENAI_SEMCONV_VERSION,
+        spendLostUsd: outcome.spendLostUsd,
+        spendSalvagedUsd: outcome.spendSalvagedUsd,
       };
       observer.onSpawnComplete(record, request);
     } catch (error) {
@@ -604,6 +643,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       outcome.cost = accounting;
 
       const duration = Date.now() - startTime;
+      this.observeSpend(accounting, duration);
       return this.createSuccessResult(result.outputs, {
         tokensUsed: result.tokensUsed,
         duration,
@@ -669,6 +709,21 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           }
         }
 
+        const lost = this.applyKillTimeAccounting(
+          request,
+          processError,
+          outcome,
+          startTime,
+          promptMetrics.promptBytes
+        );
+        if (lost) {
+          metrics = {
+            ...metrics,
+            cost: lost.costUsd,
+            costSummary: this.toCostSummary(lost),
+          };
+        }
+
         return {
           success: false,
           outputs: {
@@ -709,7 +764,15 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       const categorizedError = this.categorizeError(execError);
       outcome.errorCategory = categorizedError.constructor.name;
       // No output was parsed: the cost is unknown (the legacy float stays 0)
+      // unless the CLI was cut off mid-work, which gets a bounded estimate
       outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
+      const lost = this.applyKillTimeAccounting(
+        request,
+        execError,
+        outcome,
+        startTime,
+        promptMetrics.promptBytes
+      );
 
       return {
         success: false,
@@ -723,12 +786,114 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         metrics: {
           tokensUsed: 0,
           duration,
-          cost: 0,
+          cost: lost?.costUsd ?? 0,
           costSummary: this.toCostSummary(outcome.cost),
           ...promptMetrics,
         },
         errors: [categorizedError],
       };
+    }
+  }
+
+  /**
+   * Feed a completed spawn's trusted (reported/derived) cost into the run's
+   * burn-rate tracker
+   */
+  private observeSpend(
+    accounting: SpawnCostAccounting,
+    activeMs: number
+  ): void {
+    if (
+      accounting.costUsd === undefined ||
+      (accounting.costProvenance !== 'reported' &&
+        accounting.costProvenance !== 'derived')
+    ) {
+      return;
+    }
+    runSpendTracker.record({
+      backend: this.name,
+      costUsd: accounting.costUsd,
+      activeMs,
+    });
+  }
+
+  /**
+   * Failed-spawn spend accounting. A salvaged cost is recorded as
+   * `spend_salvaged`. A spawn cut off (timeout/hang/signal, or a non-zero
+   * exit after ≥5s of real output) with no cost gets a bounded kill-time estimate,
+   * recorded as `spend_lost` and returned (outcome.cost is replaced).
+   * Pre-spawn failures (no process ran, no output) stay unknown.
+   */
+  private applyKillTimeAccounting(
+    request: ExecutionRequest,
+    error: ProcessError,
+    outcome: SpawnOutcome,
+    startTime: number,
+    promptBytes: number | undefined
+  ): SpawnCostAccounting | undefined {
+    const spawnStart = error.spawnStartedAt ?? startTime;
+    const activeMs =
+      error.lastOutputAt !== undefined
+        ? Math.max(0, error.lastOutputAt - spawnStart)
+        : 0;
+
+    if (outcome.cost?.costUsd !== undefined) {
+      outcome.spendSalvagedUsd = outcome.cost.costUsd;
+      this.observeSpend(outcome.cost, activeMs);
+      return undefined;
+    }
+
+    const cutOff = KILLED_EXIT_REASONS.has(outcome.exitReason);
+    // A non-zero exit is estimated only when the CLI clearly did work:
+    // it spawned, wrote stdout, and stayed active past a quick rejection
+    const exitedAfterWork =
+      outcome.exitReason === 'error' &&
+      error.spawnStartedAt !== undefined &&
+      !!error.stdout?.trim() &&
+      activeMs >= MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS;
+    if (!cutOff && !exitedAfterWork) return undefined;
+
+    try {
+      const cliConfig = this.getCliConfig();
+      const model = this.getSpawnModel(request) ?? cliConfig.defaultModel;
+      const pricing = getModelPricing(
+        model,
+        cliConfig.pricingMap,
+        cliConfig.defaultModel
+      );
+      const estimate = runSpendTracker.estimateKillTimeSpend({
+        backend: this.name,
+        activeMs,
+        promptBytes: promptBytes ?? 0,
+        inputPricePer1M: pricing.input,
+      });
+      if (!(estimate.costUsd > 0)) return undefined;
+
+      const accounting: SpawnCostAccounting = {
+        ...outcome.cost,
+        costUsd: estimate.costUsd,
+        costProvenance: 'estimated',
+        pricingVersion: PRICING_VERSION,
+        estimationMethods: [
+          ...new Set([
+            ...(outcome.cost?.estimationMethods ?? []),
+            KILL_TIME_ESTIMATION_METHOD,
+          ]),
+        ],
+        unmodeledModifiers: outcome.cost?.unmodeledModifiers ?? [],
+      };
+      outcome.cost = accounting;
+      outcome.spendLostUsd = estimate.costUsd;
+      this.logger.warn(
+        `Spawn ended (${outcome.exitReason}) without cost data; estimated lost spend $${estimate.costUsd.toFixed(4)} ` +
+          `(active ${(activeMs / 1000).toFixed(1)}s, rate source ${estimate.rateSource}, bound ${estimate.bound})`
+      );
+      return accounting;
+    } catch (estimateError) {
+      this.logger.warn(
+        `Kill-time estimate failed: ${estimateError instanceof Error ? estimateError.message : String(estimateError)}`
+      );
+      return undefined;
     }
   }
 

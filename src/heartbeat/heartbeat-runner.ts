@@ -7,8 +7,8 @@
  */
 
 /* eslint-disable no-undef */
-import crypto from 'crypto';
 import { spawn, type ChildProcess } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { GitHubTaskQueue } from '../task-queue/github-task-queue.js';
 import { AuditLogger } from '../audit/audit-logger.js';
@@ -19,6 +19,8 @@ import {
 } from '../utils/circuit-breaker.js';
 import { createLogger } from '../utils/logger.js';
 import { getPackageRoot } from '../utils/paths.js';
+import { generateWorkflowId, getRunReportPath } from '../utils/workflow-id.js';
+import { formatCostSummaryLine } from '../core/cost-accounting.js';
 import type {
   HeartbeatConfig,
   GitHubTask,
@@ -26,6 +28,7 @@ import type {
   CycleResult,
 } from '../task-queue/types.js';
 import type {
+  CostSummary,
   ExecutionFidelityLevel,
   RunReport,
   StageRecord,
@@ -215,7 +218,9 @@ export class HeartbeatRunner {
       }
 
       this.currentTask = task;
-      this.currentWorkflowId = this.generateWorkflowId();
+      // Pre-generated and passed to `run --workflow-id`, so the heartbeat's
+      // events share the pipeline's ID and the run report's path is known
+      this.currentWorkflowId = generateWorkflowId();
       this.auditLogger.logTaskClaimed(
         this.currentWorkflowId,
         task.id,
@@ -232,8 +237,10 @@ export class HeartbeatRunner {
       const result = await this.executePipeline(
         task,
         pipeline,
-        config.fidelityLevel
+        config.fidelityLevel,
+        this.currentWorkflowId
       );
+      const costDetails = taskCostDetails(result);
 
       // Stop heartbeat updates
       this.stopHeartbeatUpdates();
@@ -244,7 +251,8 @@ export class HeartbeatRunner {
         if (!result.prUrl) {
           this.auditLogger.logTaskCompletedNoPR(
             this.currentWorkflowId!,
-            task.id
+            task.id,
+            costDetails
           );
         }
 
@@ -254,7 +262,8 @@ export class HeartbeatRunner {
           this.auditLogger.logTaskCompleted(
             this.currentWorkflowId!,
             task.id,
-            result.prUrl
+            result.prUrl,
+            costDetails
           );
           logger.info(`Task #${task.id} completed successfully`);
         } else {
@@ -265,7 +274,8 @@ export class HeartbeatRunner {
         this.auditLogger.logTaskFailed(
           this.currentWorkflowId!,
           task.id,
-          result.error?.message || 'Unknown error'
+          result.error?.message || 'Unknown error',
+          costDetails
         );
         logger.warn(`Task #${task.id} failed: ${result.error?.message}`);
       }
@@ -334,7 +344,8 @@ export class HeartbeatRunner {
   private async executePipeline(
     task: GitHubTask,
     pipelineName: string,
-    fidelityLevel?: ExecutionFidelityLevel
+    fidelityLevel: ExecutionFidelityLevel | undefined,
+    workflowId: string
   ): Promise<TaskResult> {
     const args = [
       'run',
@@ -343,6 +354,8 @@ export class HeartbeatRunner {
       pipelineName,
       '--format',
       'json',
+      '--workflow-id',
+      workflowId,
       ...this.runArgs,
     ];
     if (fidelityLevel) {
@@ -354,6 +367,25 @@ export class HeartbeatRunner {
     try {
       const result = await this.spawnAirunx(args);
 
+      // Final stdout JSON is preferred, but a killed/timed-out child leaves
+      // none — fall back to the incrementally-written run report, taking
+      // whichever has more stage records.
+      const json = result.stdout.trim()
+        ? this.parseJsonFromStdout(result.stdout)
+        : null;
+      const jsonMetrics = this.metricsFromJson(json);
+      const jsonReport = this.buildRunReport(json, jsonMetrics);
+      const fileReport = this.readRunReportFile(workflowId);
+      const useFile =
+        fileReport !== undefined &&
+        fileReport.stages.length > (jsonReport?.stages.length ?? 0);
+      const runReport = useFile ? fileReport : jsonReport;
+      const metrics =
+        useFile && fileReport
+          ? this.metricsFromReport(fileReport)
+          : (jsonMetrics ??
+            (fileReport ? this.metricsFromReport(fileReport) : undefined));
+
       if (result.exitCode !== 0) {
         return {
           status: 'failed',
@@ -362,11 +394,10 @@ export class HeartbeatRunner {
             result.stderr.trim() ||
               `airunx run failed with exit code ${result.exitCode}`
           ),
+          metrics,
+          runReport,
         };
       }
-
-      // Parse JSON output from --format json
-      const json = this.parseJsonFromStdout(result.stdout);
 
       const deliverables: string[] = [];
       if (json?.commitSha) deliverables.push(`commit:${json.commitSha}`);
@@ -382,32 +413,6 @@ export class HeartbeatRunner {
       // Extract failure reason from pipeline JSON (set by CI fallback, test gate, etc.)
       const failureReason =
         typeof json?.failureReason === 'string' ? json.failureReason : null;
-
-      // Extract metrics from pipeline JSON output
-      const jsonMetrics = json?.metrics as Record<string, unknown> | undefined;
-      const metrics = jsonMetrics
-        ? {
-            costUsd:
-              typeof jsonMetrics.cost === 'number'
-                ? jsonMetrics.cost
-                : undefined,
-            tokensUsed:
-              typeof jsonMetrics.tokensUsed === 'number'
-                ? jsonMetrics.tokensUsed
-                : undefined,
-            durationMs:
-              typeof jsonMetrics.durationMs === 'number'
-                ? jsonMetrics.durationMs
-                : undefined,
-            iterations:
-              typeof jsonMetrics.iterations === 'number'
-                ? jsonMetrics.iterations
-                : undefined,
-          }
-        : undefined;
-
-      // Build RunReport from structured stage data when available
-      const runReport = this.buildRunReport(json, metrics);
 
       return {
         status: isSuccess ? 'completed' : 'failed',
@@ -537,6 +542,62 @@ export class HeartbeatRunner {
   }
 
   /**
+   * Extract summary metrics from `airunx run --format json` output
+   */
+  private metricsFromJson(
+    json: Record<string, unknown> | null
+  ): TaskResult['metrics'] {
+    const jsonMetrics = json?.metrics as Record<string, unknown> | undefined;
+    if (!jsonMetrics) return undefined;
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' ? v : undefined;
+    return {
+      costUsd: num(jsonMetrics.cost),
+      tokensUsed: num(jsonMetrics.tokensUsed),
+      durationMs: num(jsonMetrics.durationMs),
+      iterations: num(jsonMetrics.iterations),
+      costSummaryLine:
+        typeof jsonMetrics.costSummaryLine === 'string'
+          ? jsonMetrics.costSummaryLine
+          : undefined,
+    };
+  }
+
+  /**
+   * Summary metrics from a run report read off disk
+   */
+  private metricsFromReport(report: RunReport): TaskResult['metrics'] {
+    return {
+      costUsd: report.totalCostUsd,
+      tokensUsed: report.totalTokens,
+      durationMs: report.totalDurationMs,
+      iterations: report.iterationCount,
+      costSummaryLine:
+        report.costSummaryLine ??
+        (report.costSummary
+          ? formatCostSummaryLine(report.costSummary)
+          : undefined),
+    };
+  }
+
+  /**
+   * Read `.airunx-state/reports/<workflowId>.json` (the report `run` writes
+   * after every stage). Undefined when absent or unreadable.
+   */
+  private readRunReportFile(workflowId: string): RunReport | undefined {
+    try {
+      const reportPath = getRunReportPath(workflowId);
+      if (!existsSync(reportPath)) return undefined;
+      const parsed = JSON.parse(readFileSync(reportPath, 'utf-8')) as RunReport;
+      if (!parsed || !Array.isArray(parsed.stages)) return undefined;
+      return parsed;
+    } catch (error) {
+      logger.warn(`Could not read run report for ${workflowId}:`, error);
+      return undefined;
+    }
+  }
+
+  /**
    * Build a RunReport from parsed JSON output of `airunx run --format json`.
    * Returns undefined if stage records are not available.
    */
@@ -563,6 +624,9 @@ export class HeartbeatRunner {
       details: sr.agent !== sr.stage ? sr.agent : undefined,
     }));
 
+    const jsonMetrics = json.metrics as Record<string, unknown> | undefined;
+    const costSummary = jsonMetrics?.costSummary as CostSummary | undefined;
+
     return {
       workflowId: typeof json.workflowId === 'string' ? json.workflowId : '',
       taskTitle:
@@ -586,6 +650,15 @@ export class HeartbeatRunner {
         : [],
       stages: stageRecords,
       timeline,
+      ...(costSummary && typeof costSummary === 'object'
+        ? {
+            costSummary,
+            costSummaryLine:
+              typeof jsonMetrics?.costSummaryLine === 'string'
+                ? jsonMetrics.costSummaryLine
+                : formatCostSummaryLine(costSummary),
+          }
+        : {}),
     };
   }
 
@@ -640,15 +713,6 @@ export class HeartbeatRunner {
   }
 
   /**
-   * Generate a unique workflow ID.
-   */
-  private generateWorkflowId(): string {
-    const timestamp = Date.now();
-    const random = crypto.randomBytes(4).toString('hex');
-    return `heartbeat-${timestamp}-${random}`;
-  }
-
-  /**
    * Resolve partial config with defaults.
    */
   private resolveConfig(partial?: Partial<HeartbeatConfig>): HeartbeatConfig {
@@ -683,4 +747,18 @@ export class HeartbeatRunner {
     this.processLock.release();
     logger.info('Heartbeat cleanup complete');
   }
+}
+
+/**
+ * Cost fields for heartbeat task_* audit events (undefined when the run
+ * produced no cost figures)
+ */
+function taskCostDetails(
+  result: TaskResult
+): { costUsd?: number; costSummaryLine?: string } | undefined {
+  const costUsd = result.metrics?.costUsd ?? result.runReport?.totalCostUsd;
+  const costSummaryLine =
+    result.metrics?.costSummaryLine ?? result.runReport?.costSummaryLine;
+  if (costUsd === undefined && costSummaryLine === undefined) return undefined;
+  return { costUsd, costSummaryLine };
 }

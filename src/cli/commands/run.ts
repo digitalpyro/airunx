@@ -54,6 +54,7 @@ import {
 import { VerboseReporter } from '../../orchestrator/verbose-reporter.js';
 import type { StateManager } from '../../orchestrator/state-manager.js';
 import { resolveRepoLocation } from '../../utils/repo-resolver.js';
+import { isValidWorkflowId } from '../../utils/workflow-id.js';
 import { GitHubCLI } from '../../integrations/github-cli.js';
 
 /**
@@ -160,6 +161,11 @@ interface RunOptions {
   dotenv?: string;
   /** Poll GitHub Actions after PR creation and iterate on CI failures (overrides setting) */
   ciVerificationGate?: boolean;
+  /**
+   * Pre-assigned workflow ID (the heartbeat passes one so it can find the
+   * run report after a kill). Validated before any file access.
+   */
+  workflowId?: string;
 }
 
 export async function runOrchestrator(
@@ -174,6 +180,19 @@ export async function runOrchestrator(
   // Stored for restoration in case of future library usage outside CLI context.
   const originalConsoleLog = console.log;
   if (options.format === 'json') console.log = console.error;
+
+  // Validate --workflow-id before anything touches the filesystem: it names
+  // the run report file, so a crafted ID must never reach a path.
+  if (
+    options.workflowId !== undefined &&
+    !isValidWorkflowId(options.workflowId)
+  ) {
+    logger.error(
+      `Error: Invalid --workflow-id ${JSON.stringify(options.workflowId)} (expected 1-64 characters of A-Z, a-z, 0-9, '_' or '-')`
+    );
+    process.exit(1);
+    return;
+  }
 
   // Handle --dotenv override (highest priority for env loading)
   // Note: We use --dotenv instead of --env-file to avoid collision with Node.js 20+ built-in --env-file
@@ -756,6 +775,7 @@ export async function runOrchestrator(
             ciVerificationGate:
               options.ciVerificationGate ?? settings.ci_verification_gate,
             markIssueCheckboxes: settings.mark_issue_checkboxes,
+            workflowId: options.workflowId,
           });
         } finally {
           globalThis.clearInterval(updateInterval);

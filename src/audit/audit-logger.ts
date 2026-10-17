@@ -334,6 +334,13 @@ export class AuditLogger {
           : {}),
         provider_usage: record.providerUsage,
         cost_basis: record.costBasis,
+        // U5: killed-spawn spend (estimated lost / salvaged partial)
+        ...(record.spendLostUsd !== undefined
+          ? { spend_lost_micro_usd: toMicroUsd(record.spendLostUsd) }
+          : {}),
+        ...(record.spendSalvagedUsd !== undefined
+          ? { spend_salvaged_micro_usd: toMicroUsd(record.spendSalvagedUsd) }
+          : {}),
       },
     });
   }
@@ -472,11 +479,16 @@ export class AuditLogger {
   /**
    * Log a task completed event
    */
-  logTaskCompleted(workflowId: string, taskId: string, prUrl?: string): void {
+  logTaskCompleted(
+    workflowId: string,
+    taskId: string,
+    prUrl?: string,
+    cost?: TaskCostDetails
+  ): void {
     this.log({
       event: 'task_completed',
       workflowId,
-      details: { taskId, prUrl },
+      details: { taskId, prUrl, ...taskCostFields(cost) },
     });
   }
 
@@ -484,22 +496,31 @@ export class AuditLogger {
    * Log when a task completed pipeline execution but produced no PR or deliverables.
    * Distinct from task_failed (pipeline threw) and task_completed (PR created).
    */
-  logTaskCompletedNoPR(workflowId: string, taskId: string): void {
+  logTaskCompletedNoPR(
+    workflowId: string,
+    taskId: string,
+    cost?: TaskCostDetails
+  ): void {
     this.log({
       event: 'task_completed_no_pr',
       workflowId,
-      details: { taskId },
+      details: { taskId, ...taskCostFields(cost) },
     });
   }
 
   /**
    * Log a task failed event
    */
-  logTaskFailed(workflowId: string, taskId: string, error: string): void {
+  logTaskFailed(
+    workflowId: string,
+    taskId: string,
+    error: string,
+    cost?: TaskCostDetails
+  ): void {
     this.log({
       event: 'task_failed',
       workflowId,
-      details: { taskId, error },
+      details: { taskId, error, ...taskCostFields(cost) },
     });
   }
 
@@ -743,6 +764,25 @@ function parseAuditLine(line: string): AuditEvent | null {
     // Torn or malformed line
   }
   return null;
+}
+
+/** Run cost carried on heartbeat task_* events */
+export interface TaskCostDetails {
+  costUsd?: number;
+  /** Provenance/billing label from the run report */
+  costSummaryLine?: string;
+}
+
+function taskCostFields(cost?: TaskCostDetails): Record<string, unknown> {
+  if (!cost) return {};
+  return {
+    ...(cost.costUsd !== undefined
+      ? { cost_usd: cost.costUsd, cost_micro_usd: toMicroUsd(cost.costUsd) }
+      : {}),
+    ...(cost.costSummaryLine
+      ? { cost_summary_line: cost.costSummaryLine }
+      : {}),
+  };
 }
 
 /**

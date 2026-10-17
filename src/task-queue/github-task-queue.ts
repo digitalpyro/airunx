@@ -430,6 +430,7 @@ function formatMetricsLine(metrics?: TaskResult['metrics']): string {
     parts.push(`Duration: ${(metrics.durationMs / 1000).toFixed(1)}s`);
   if (metrics.iterations != null)
     parts.push(`Iterations: ${metrics.iterations}`);
+  if (metrics.costSummaryLine) parts.push(`Spend: ${metrics.costSummaryLine}`);
 
   return parts.length > 0 ? `\n\n:bar_chart: ${parts.join(' | ')}` : '';
 }

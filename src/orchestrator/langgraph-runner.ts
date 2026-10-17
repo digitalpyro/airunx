@@ -47,6 +47,7 @@ import {
   type IterationEntry,
 } from './iteration-history.js';
 import { FidelityExecutor } from './fidelity-executor.js';
+import { RUN_REPORTS_DIR, getRunReportPath } from '../utils/workflow-id.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
@@ -1428,11 +1429,11 @@ export class LangGraphRunner {
           : {}),
       };
 
-      const reportsDir = join('.airunx-state', 'reports');
-      if (!existsSync(reportsDir)) {
-        mkdirSync(reportsDir, { recursive: true });
+      // Validates the ID (path-safe) before touching the filesystem
+      const reportPath = getRunReportPath(context.id);
+      if (!existsSync(RUN_REPORTS_DIR)) {
+        mkdirSync(RUN_REPORTS_DIR, { recursive: true });
       }
-      const reportPath = join(reportsDir, `${context.id}.json`);
       // Atomic write: write to tmp file then rename to avoid partial reads
       const tmpPath = reportPath + '.tmp';
       writeFileSync(tmpPath, JSON.stringify(report, null, 2));

@@ -170,14 +170,9 @@ describe('runOrchestrator', () => {
 
       // Should have gotten past input validation
       // (may exit for other reasons like missing config, but not for missing input)
-      const exitCalls = exitSpy.mock.calls.filter(
-        ([code]) => code === 1
-      );
+      const exitCalls = exitSpy.mock.calls.filter(([code]) => code === 1);
       // Check that the error is NOT about missing input
-      const logCalls = vi
-        .mocked(console.log)
-        .mock.calls.flat()
-        .join(' ');
+      const logCalls = vi.mocked(console.log).mock.calls.flat().join(' ');
       expect(logCalls).not.toContain('Input or --prd required');
     });
 
@@ -194,11 +189,44 @@ describe('runOrchestrator', () => {
       await runOrchestrator(undefined, { prd: prdPath });
 
       // Should not have the "Input or --prd required" error
-      const logCalls = vi
-        .mocked(console.error)
-        .mock.calls.flat()
-        .join(' ');
+      const logCalls = vi.mocked(console.error).mock.calls.flat().join(' ');
       expect(logCalls).not.toContain('Input or --prd required');
+    });
+  });
+
+  describe('--workflow-id validation', () => {
+    it('rejects a path-traversal ID before any file access', async () => {
+      const { loadSettings } = await import('../../../src/utils/settings.js');
+      const { resolvePRD } = await import(
+        '../../../src/parsers/prd-resolver.js'
+      );
+      const envPath = join(tmpDir, 'never-read.env');
+
+      await runOrchestrator('implement auth', {
+        workflowId: '../../x',
+        dotenv: envPath,
+        prd: join(tmpDir, 'never-read.md'),
+      });
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      const errors = vi.mocked(console.error).mock.calls.flat().join(' ');
+      expect(errors).toContain('Invalid --workflow-id');
+      // Nothing downstream ran: no dotenv check, settings load, or PRD read
+      expect(errors).not.toContain('Env file not found');
+      expect(loadSettings).not.toHaveBeenCalled();
+      expect(resolvePRD).not.toHaveBeenCalled();
+    });
+
+    it('accepts a valid ID', async () => {
+      process.chdir(tmpDir);
+
+      await runOrchestrator('implement auth', {
+        workflowId: 'workflow-123-abcdef01',
+      });
+
+      const errors = vi.mocked(console.error).mock.calls.flat().join(' ');
+      expect(errors).not.toContain('Invalid --workflow-id');
     });
   });
 
@@ -228,10 +256,7 @@ describe('runOrchestrator', () => {
       await runOrchestrator('test', { fidelity: 'fast' });
 
       // Check that the fidelity error was NOT logged
-      const errorCalls = vi
-        .mocked(console.log)
-        .mock.calls.flat()
-        .join(' ');
+      const errorCalls = vi.mocked(console.log).mock.calls.flat().join(' ');
       expect(errorCalls).not.toContain('Invalid fidelity level');
     });
   });
