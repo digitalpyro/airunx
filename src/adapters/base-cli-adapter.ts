@@ -21,8 +21,20 @@ import type {
   SpawnExitReason,
   SpawnRecord,
 } from '../core/adapter-types.js';
-import { calculateCost, getModelPricing } from './pricing.js';
-import type { ModelPricing } from './pricing.js';
+import {
+  PRICING_VERSION,
+  bucketsFromUsage,
+  calculateCacheAwareCost,
+  getCacheRates,
+  getModelPricing,
+} from './pricing.js';
+import type { CacheRates, ModelPricing } from './pricing.js';
+import type { CostProvenance, NormalizedTokenUsage } from '../core/types.js';
+import { GENAI_SEMCONV_VERSION } from '../core/types.js';
+import {
+  billingBasisForAuth,
+  spawnCostSummary,
+} from '../core/cost-accounting.js';
 import {
   DEFAULT_CLI_TIMEOUT,
   HANG_CHECK_INTERVAL_MS,
@@ -66,6 +78,26 @@ interface SpawnOutcome {
   /** CLI-reported token counts (undefined when not reported) */
   inputTokens?: number;
   outputTokens?: number;
+  /** Provenance-tagged cost facts (undefined when nothing was parsed) */
+  cost?: SpawnCostAccounting;
+}
+
+/**
+ * Provenance-tagged cost facts for one spawn
+ */
+interface SpawnCostAccounting {
+  /** Headline cost; undefined = missing */
+  costUsd?: number;
+  costProvenance?: CostProvenance;
+  /** Token×pricing figure, also kept when a reported cost exists */
+  derivedCostUsd?: number;
+  pricingVersion?: string;
+  tokens?: NormalizedTokenUsage;
+  tokenProvenance?: 'reported' | 'estimated';
+  estimationMethods: string[];
+  unmodeledModifiers: string[];
+  providerUsage?: Record<string, number>;
+  costBasis?: Record<string, string>;
 }
 
 /**
@@ -79,6 +111,18 @@ export interface ParsedCliOutput {
   totalCostUsd?: number;
   /** Provider session/thread ID when the CLI reports one */
   sessionId?: string;
+  /** Normalized (inclusive) token usage, when the provider reports it */
+  usage?: NormalizedTokenUsage;
+  /** Normalized usage per model (priced per model when present) */
+  usageByModel?: Record<string, NormalizedTokenUsage>;
+  /** Allowlisted numeric copy of the provider's raw usage fields */
+  providerUsage?: Record<string, number>;
+  /** True when tokensUsed came from the chars÷4 estimate */
+  tokensEstimated?: boolean;
+  /** Claude Code modelUsage[*].costBasis, keyed by model */
+  costBasis?: Record<string, string>;
+  /** Known pricing modifiers the table does not model */
+  unmodeledModifiers?: string[];
 }
 
 /**
@@ -91,6 +135,8 @@ export interface CliAdapterConfig {
   installInstructions: string;
   /** Pricing model to use for cost calculation */
   pricingMap: Record<string, ModelPricing>;
+  /** Per-model prompt-cache rates (missing → input rate, one-time warning) */
+  cachePricingMap?: Record<string, CacheRates>;
   /** Default model if not specified */
   defaultModel: string;
 }
@@ -465,6 +511,17 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         salvaged: outcome.salvaged,
         errorCategory: outcome.errorCategory,
         providerSessionId: outcome.providerSessionId,
+        costProvenance: outcome.cost?.costProvenance,
+        billingBasis: billingBasisForAuth(this.getAuthMode()),
+        derivedCostUsd: outcome.cost?.derivedCostUsd,
+        pricingVersion: outcome.cost?.pricingVersion,
+        unmodeledModifiers: outcome.cost?.unmodeledModifiers ?? [],
+        tokens: outcome.cost?.tokens,
+        tokenProvenance: outcome.cost?.tokenProvenance,
+        estimationMethods: outcome.cost?.estimationMethods ?? [],
+        providerUsage: outcome.cost?.providerUsage,
+        costBasis: outcome.cost?.costBasis,
+        semconvVersion: GENAI_SEMCONV_VERSION,
       };
       observer.onSpawnComplete(record, request);
     } catch (error) {
@@ -540,58 +597,19 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       outcome.inputTokens = result.inputTokens;
       outcome.outputTokens = result.outputTokens;
 
-      // Calculate cost using centralized pricing
-      // Use actual input/output tokens when available from CLI response,
-      // otherwise fall back to 50/50 estimation
-      const model =
-        this.config?.model || agent.preferredModel || cliConfig.defaultModel;
-      const pricing = getModelPricing(
-        model,
-        cliConfig.pricingMap,
-        cliConfig.defaultModel
-      );
-
-      // Determine input/output tokens for accurate cost calculation
-      let inputTokens: number;
-      let outputTokens: number;
-
-      if (
-        result.inputTokens !== undefined &&
-        result.outputTokens !== undefined
-      ) {
-        // Best case: we have both from the CLI response
-        inputTokens = result.inputTokens;
-        outputTokens = result.outputTokens;
-      } else if (result.inputTokens !== undefined) {
-        // We have input tokens, derive output from total
-        inputTokens = result.inputTokens;
-        outputTokens = Math.max(0, result.tokensUsed - inputTokens);
-      } else if (result.outputTokens !== undefined) {
-        // We have output tokens, derive input from total
-        outputTokens = result.outputTokens;
-        inputTokens = Math.max(0, result.tokensUsed - outputTokens);
-      } else {
-        // No breakdown available, estimate 50/50 split
-        inputTokens = result.tokensUsed * ESTIMATED_CLI_INPUT_TOKEN_RATIO;
-        outputTokens =
-          result.tokensUsed * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO);
-      }
-
-      // Prefer CLI-reported cost when available (e.g., Claude Code's total_cost_usd)
-      // This accounts for cache tokens, thinking tokens, and exact model pricing
-      // Fall back to local calculation, or undefined when tokens are 0
-      const cost =
-        result.totalCostUsd ??
-        (result.tokensUsed > 0
-          ? calculateCost(inputTokens, outputTokens, pricing)
-          : undefined);
+      // Provenance-tagged cost: CLI-reported cost wins; otherwise token
+      // counts × versioned pricing (derived), or the 50/50 / chars÷4
+      // fallback (estimated). Undefined when nothing was spent or parsed.
+      const accounting = this.accountSpawnCost(result, request);
+      outcome.cost = accounting;
 
       const duration = Date.now() - startTime;
       return this.createSuccessResult(result.outputs, {
         tokensUsed: result.tokensUsed,
         duration,
-        cost,
+        cost: accounting.costUsd,
         spawnCount: 1, // Single CLI spawn for base adapter
+        costSummary: this.toCostSummary(accounting),
         ...promptMetrics,
       });
     } catch (error) {
@@ -614,9 +632,11 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         // total_cost_usd and token counts) only on clean exit. On SIGTERM kill, stdout
         // is typically empty — salvage will not recover cost data in that case.
         // The primary defense against wasted spend is the per-run cost cap, not timeouts.
+        outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
         let metrics: ExecutionResult['metrics'] = {
           tokensUsed: 0,
           duration,
+          costSummary: this.toCostSummary(outcome.cost),
           ...promptMetrics,
         };
         if (processError.stdout?.trim()) {
@@ -630,30 +650,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
             outcome.outputTokens = partial.outputTokens;
             if (partial.tokensUsed > 0 || partial.totalCostUsd) {
               outcome.salvaged = true;
-              // Calculate cost from tokens if totalCostUsd not available
-              let salvagedCost = partial.totalCostUsd;
-              if (salvagedCost === undefined && partial.tokensUsed > 0) {
-                const model =
-                  this.config?.model ||
-                  agent.preferredModel ||
-                  cliConfig.defaultModel;
-                const pricing = getModelPricing(
-                  model,
-                  cliConfig.pricingMap,
-                  cliConfig.defaultModel
-                );
-                const inTokens =
-                  partial.inputTokens ??
-                  partial.tokensUsed * ESTIMATED_CLI_INPUT_TOKEN_RATIO;
-                const outTokens =
-                  partial.outputTokens ??
-                  partial.tokensUsed * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO);
-                salvagedCost = calculateCost(inTokens, outTokens, pricing);
-              }
+              const accounting = this.accountSpawnCost(partial, request);
+              outcome.cost = accounting;
+              const salvagedCost = accounting.costUsd;
               metrics = {
                 tokensUsed: partial.tokensUsed,
                 duration,
                 cost: salvagedCost,
+                costSummary: this.toCostSummary(accounting),
                 ...promptMetrics,
               };
               this.logger.warn(
@@ -704,6 +708,8 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       // Categorize error for smart retry logic
       const categorizedError = this.categorizeError(execError);
       outcome.errorCategory = categorizedError.constructor.name;
+      // No output was parsed: the cost is unknown (the legacy float stays 0)
+      outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
 
       return {
         success: false,
@@ -718,11 +724,178 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           tokensUsed: 0,
           duration,
           cost: 0,
+          costSummary: this.toCostSummary(outcome.cost),
           ...promptMetrics,
         },
         errors: [categorizedError],
       };
     }
+  }
+
+  /**
+   * Assign provenance to a parsed spawn's cost and tokens.
+   * - CLI-reported cost → `reported` (the token-derived figure is kept too)
+   * - real token counts × pricing → `derived` (stamped with PRICING_VERSION)
+   * - 50/50 split or chars÷4 tokens → `estimated`
+   * Cost is computed over disjoint buckets only (uncached input, cache read,
+   * each cache-write tier, output), so cache tokens are never double-priced.
+   */
+  protected accountSpawnCost(
+    parsed: ParsedCliOutput,
+    request: ExecutionRequest
+  ): SpawnCostAccounting {
+    const cliConfig = this.getCliConfig();
+    const estimationMethods: string[] = [];
+    let tokenProvenance: 'reported' | 'estimated' = 'reported';
+    let tokens = parsed.usage;
+
+    if (!tokens) {
+      const total = parsed.tokensUsed;
+      const zeroCache = { cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
+      if (
+        parsed.inputTokens !== undefined &&
+        parsed.outputTokens !== undefined
+      ) {
+        tokens = {
+          inputTokens: parsed.inputTokens,
+          outputTokens: parsed.outputTokens,
+          ...zeroCache,
+        };
+      } else if (parsed.inputTokens !== undefined) {
+        tokens = {
+          inputTokens: parsed.inputTokens,
+          outputTokens: Math.max(0, total - parsed.inputTokens),
+          ...zeroCache,
+        };
+      } else if (parsed.outputTokens !== undefined) {
+        tokens = {
+          inputTokens: Math.max(0, total - parsed.outputTokens),
+          outputTokens: parsed.outputTokens,
+          ...zeroCache,
+        };
+      } else if (total > 0) {
+        // No breakdown available, estimate 50/50 split
+        tokens = {
+          inputTokens: total * ESTIMATED_CLI_INPUT_TOKEN_RATIO,
+          outputTokens: total * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO),
+          ...zeroCache,
+        };
+        estimationMethods.push('split_50_50');
+        tokenProvenance = 'estimated';
+      }
+    }
+    if (parsed.tokensEstimated) {
+      estimationMethods.unshift('chars_div_4');
+      tokenProvenance = 'estimated';
+    }
+
+    // Token-derived figure (per model when the CLI breaks usage down)
+    let derivedCostUsd: number | undefined;
+    const priceUsage = (model: string, usage: NormalizedTokenUsage): number =>
+      calculateCacheAwareCost(
+        bucketsFromUsage(usage),
+        getModelPricing(model, cliConfig.pricingMap, cliConfig.defaultModel),
+        getCacheRates(model, cliConfig.cachePricingMap, cliConfig.defaultModel),
+        model
+      );
+    if (tokens && tokens.inputTokens + tokens.outputTokens > 0) {
+      const byModel = parsed.usageByModel;
+      derivedCostUsd =
+        byModel && Object.keys(byModel).length > 0
+          ? Object.entries(byModel).reduce(
+              (sum, [model, usage]) => sum + priceUsage(model, usage),
+              0
+            )
+          : priceUsage(
+              this.config?.model ||
+                request.agent.preferredModel ||
+                cliConfig.defaultModel,
+              tokens
+            );
+    }
+
+    let costUsd: number | undefined;
+    let costProvenance: CostProvenance | undefined;
+    if (parsed.totalCostUsd !== undefined) {
+      costUsd = parsed.totalCostUsd;
+      costProvenance = 'reported';
+    } else if (derivedCostUsd !== undefined) {
+      costUsd = derivedCostUsd;
+      costProvenance =
+        tokenProvenance === 'estimated' ? 'estimated' : 'derived';
+    }
+
+    if (tokenProvenance === 'estimated') {
+      this.logger.warn(
+        `Spawn tokens estimated (${estimationMethods.join(', ')}); cost is approximate`
+      );
+    }
+
+    return {
+      costUsd,
+      costProvenance,
+      derivedCostUsd,
+      pricingVersion:
+        derivedCostUsd !== undefined ? PRICING_VERSION : undefined,
+      tokens,
+      tokenProvenance: tokens ? tokenProvenance : undefined,
+      estimationMethods,
+      unmodeledModifiers: parsed.unmodeledModifiers ?? [],
+      providerUsage: parsed.providerUsage,
+      costBasis: parsed.costBasis,
+    };
+  }
+
+  /**
+   * One-spawn CostSummary for ExecutionResult metrics
+   */
+  private toCostSummary(
+    accounting: SpawnCostAccounting
+  ): ExecutionResult['metrics']['costSummary'] {
+    return spawnCostSummary({
+      costUsd: accounting.costUsd,
+      costProvenance: accounting.costProvenance,
+      billingBasis: billingBasisForAuth(this.getAuthMode()),
+      tokens: accounting.tokens,
+      tokenProvenance: accounting.tokenProvenance,
+      pricingVersion:
+        accounting.costProvenance === 'reported'
+          ? undefined
+          : accounting.pricingVersion,
+      estimationMethods: accounting.estimationMethods,
+      unmodeledModifiers: accounting.unmodeledModifiers,
+    });
+  }
+
+  /**
+   * Generic usage normalization for JSON CLI output (OpenAI-style inclusive
+   * input; cached tokens from `cached_input_tokens` or
+   * `prompt_tokens_details.cached_tokens`). Subclasses override for
+   * provider-specific shapes.
+   */
+  protected extractUsage(
+    parsed: Record<string, unknown>,
+    inputTokens: number | undefined,
+    outputTokens: number | undefined
+  ): Partial<ParsedCliOutput> {
+    if (inputTokens === undefined || outputTokens === undefined) return {};
+    const usage = (parsed.usage ?? {}) as Record<string, unknown>;
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const details = (usage.prompt_tokens_details ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const cacheRead =
+      num(usage.cached_input_tokens) ?? num(details.cached_tokens) ?? 0;
+    return {
+      usage: {
+        inputTokens,
+        outputTokens,
+        cacheReadInputTokens: Math.min(cacheRead, inputTokens),
+        cacheWriteInputTokens: 0,
+      },
+    };
   }
 
   /**
@@ -964,13 +1137,20 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         const sessionId =
           typeof rawSessionId === 'string' ? rawSessionId : undefined;
 
-        const tokensUsed =
+        const reportedTotal =
           getNumeric(parsed.tokens_used) ??
           getNumeric(parsed.tokensUsed) ??
           getNumeric(parsed.usage?.total_tokens) ??
           (inputTokens !== undefined && outputTokens !== undefined
             ? inputTokens + outputTokens
-            : this.estimateTokens(stdout));
+            : undefined);
+        const tokensEstimated = reportedTotal === undefined;
+        const tokensUsed = reportedTotal ?? this.estimateTokens(stdout);
+        const usageFields = this.extractUsage(
+          parsed,
+          inputTokens,
+          outputTokens
+        );
 
         return {
           outputs: {
@@ -990,6 +1170,8 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           outputTokens,
           totalCostUsd,
           sessionId,
+          ...(tokensEstimated ? { tokensEstimated } : {}),
+          ...usageFields,
         };
       }
     } catch (parseError) {
@@ -1014,6 +1196,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         recommendations: [],
       },
       tokensUsed: this.estimateTokens(stdout),
+      tokensEstimated: true,
     };
   }
 }

@@ -7,9 +7,16 @@ import * as path from 'path';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex-adapter.js';
 import type {
+  AdapterConfig,
   ExecutionRequest,
   ExecutionResult,
+  SpawnRecord,
 } from '../../src/core/adapter-types.js';
+import {
+  OPENAI_CACHE_PRICING,
+  OPENAI_PRICING,
+  calculateCost,
+} from '../../src/adapters/pricing.js';
 
 // Create a test subclass to access protected methods
 class TestableCodexAdapter extends CodexAdapter {
@@ -160,7 +167,8 @@ describe('CodexAdapter', () => {
       const request = createMockRequest({
         context: { workingDirectory: '/test/path' },
       });
-      const specialPrompt = 'test with "quotes" and \'single quotes\' and $vars';
+      const specialPrompt =
+        'test with "quotes" and \'single quotes\' and $vars';
 
       const args = adapter.testBuildCliArgs(request, specialPrompt);
 
@@ -253,5 +261,146 @@ describe('CodexAdapter', () => {
     it('should have type set to cli', () => {
       expect(adapter.type).toBe('cli');
     });
+  });
+});
+
+/** CodexAdapter with the CLI spawn stubbed and auth mode settable */
+class StubbedCodexAdapter extends CodexAdapter {
+  public stdout = '';
+  public records: SpawnRecord[] = [];
+
+  setSubscription(subscription: boolean): void {
+    (this as unknown as { useSubscriptionAuth: boolean }).useSubscriptionAuth =
+      subscription;
+  }
+
+  async init(config: AdapterConfig): Promise<void> {
+    this.config = config;
+    this.initialized = true;
+    this.setSpawnObserver({
+      onSpawnComplete: (record) => this.records.push(record),
+    });
+  }
+
+  protected async executeWithSpawn(): Promise<{
+    stdout: string;
+    stderr: string;
+  }> {
+    return { stdout: this.stdout, stderr: '' };
+  }
+}
+
+const jsonl = (...events: object[]): string =>
+  events.map((e) => JSON.stringify(e)).join('\n');
+
+describe('CodexAdapter normalized tokens and cache-aware cost', () => {
+  let adapter: StubbedCodexAdapter;
+
+  beforeEach(async () => {
+    adapter = new StubbedCodexAdapter();
+    await adapter.init({ type: 'cli', model: 'gpt-5.6-terra' });
+  });
+
+  it('subtracts cached tokens from input before pricing (no double count)', async () => {
+    adapter.stdout = jsonl(
+      { type: 'thread.started', thread_id: 'th-1' },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 60_000,
+          cached_input_tokens: 50_000,
+          output_tokens: 4_000,
+          reasoning_output_tokens: 1_500,
+        },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 40_000,
+          cached_input_tokens: 30_000,
+          output_tokens: 1_000,
+          reasoning_output_tokens: 500,
+        },
+      },
+      { type: 'item.completed', item: { text: 'done' } }
+    );
+    const result = await adapter.execute(createMockRequest());
+    const [record] = adapter.records;
+
+    // input_tokens is already inclusive of cached tokens
+    expect(record.tokens).toEqual({
+      inputTokens: 100_000,
+      outputTokens: 5_000,
+      cacheReadInputTokens: 80_000,
+      cacheWriteInputTokens: 0,
+      reasoningOutputTokens: 2_000,
+    });
+    const p = OPENAI_PRICING['gpt-5.6-terra'];
+    const c = OPENAI_CACHE_PRICING['gpt-5.6-terra'];
+    const expected =
+      (20_000 * p.input + 80_000 * c.cacheRead + 5_000 * p.output) / 1e6;
+    expect(result.metrics.cost).toBeCloseTo(expected, 12);
+    // Cheaper than pricing every input token at the full rate
+    expect(result.metrics.cost!).toBeLessThan(calculateCost(100_000, 5_000, p));
+    expect(record.costProvenance).toBe('derived');
+    expect(record.providerUsage).toEqual({
+      input_tokens: 100_000,
+      cached_input_tokens: 80_000,
+      output_tokens: 5_000,
+      reasoning_output_tokens: 2_000,
+    });
+    // Legacy totals unchanged (no breakdown summing)
+    expect(result.metrics.tokensUsed).toBe(105_000);
+  });
+
+  it('records cache_write_input_tokens when present', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: {
+        input_tokens: 1_000,
+        cached_input_tokens: 200,
+        cache_write_input_tokens: 300,
+        output_tokens: 10,
+      },
+    });
+    await adapter.execute(createMockRequest());
+    expect(adapter.records[0].tokens).toMatchObject({
+      inputTokens: 1_000,
+      cacheReadInputTokens: 200,
+      cacheWriteInputTokens: 300,
+    });
+  });
+
+  it('handles absent cache fields as zero cache tokens', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: { input_tokens: 1_000, output_tokens: 100 },
+    });
+    const result = await adapter.execute(createMockRequest());
+    expect(adapter.records[0].tokens).toEqual({
+      inputTokens: 1_000,
+      outputTokens: 100,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 0,
+    });
+    expect(result.metrics.cost).toBeCloseTo(
+      calculateCost(1_000, 100, OPENAI_PRICING['gpt-5.6-terra']),
+      12
+    );
+  });
+
+  it('tags billing basis from the resolved auth mode', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: { input_tokens: 1_000, output_tokens: 100 },
+    });
+    adapter.setSubscription(true);
+    await adapter.execute(createMockRequest());
+    adapter.setSubscription(false);
+    await adapter.execute(createMockRequest());
+    expect(adapter.records.map((r) => r.billingBasis)).toEqual([
+      'api_equivalent',
+      'billed',
+    ]);
   });
 });

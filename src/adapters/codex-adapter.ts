@@ -23,7 +23,7 @@ import type {
   ExecutionResult,
   SpawnAuthMode,
 } from '../core/adapter-types.js';
-import { OPENAI_PRICING } from './pricing.js';
+import { OPENAI_CACHE_PRICING, OPENAI_PRICING } from './pricing.js';
 import {
   DEFAULT_API_KEY_ENV,
   DEFAULT_CLI_EXECUTABLES,
@@ -68,6 +68,7 @@ export class CodexAdapter extends BaseCliAdapter {
       cliCommand: DEFAULT_CLI_EXECUTABLES.CODEX,
       installInstructions: 'npm install -g @openai/codex',
       pricingMap: OPENAI_PRICING,
+      cachePricingMap: OPENAI_CACHE_PRICING,
       defaultModel: DEFAULT_MODELS.OPENAI,
     };
   }
@@ -132,6 +133,13 @@ export class CodexAdapter extends BaseCliAdapter {
     const lines = stdout.trim().split('\n');
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCachedInputTokens = 0;
+    let totalCacheWriteInputTokens = 0;
+    let totalReasoningOutputTokens = 0;
+    let sawUsage = false;
+    let sawReasoning = false;
+    const num = (v: unknown): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : 0;
     let agentText = '';
     let parsedAnyEvent = false;
     let threadId: string | undefined;
@@ -144,8 +152,19 @@ export class CodexAdapter extends BaseCliAdapter {
           // OpenAI convention: input_tokens already includes cached_input_tokens,
           // and output_tokens already includes reasoning_output_tokens.
           // Do NOT sum the breakdowns — that would double-count.
-          totalInputTokens += event.usage.input_tokens ?? 0;
-          totalOutputTokens += event.usage.output_tokens ?? 0;
+          sawUsage = true;
+          totalInputTokens += num(event.usage.input_tokens);
+          totalOutputTokens += num(event.usage.output_tokens);
+          totalCachedInputTokens += num(event.usage.cached_input_tokens);
+          totalCacheWriteInputTokens += num(
+            event.usage.cache_write_input_tokens
+          );
+          if (typeof event.usage.reasoning_output_tokens === 'number') {
+            sawReasoning = true;
+            totalReasoningOutputTokens += num(
+              event.usage.reasoning_output_tokens
+            );
+          }
         }
         if (
           event.type === 'thread.started' &&
@@ -168,6 +187,39 @@ export class CodexAdapter extends BaseCliAdapter {
 
     const tokensUsed = totalInputTokens + totalOutputTokens;
 
+    // Normalized usage: codex input_tokens is already inclusive of cached
+    // (and cache-write) tokens, so it is used as-is; pricing subtracts the
+    // cache buckets to get uncached input (see bucketsFromUsage).
+    const cacheRead = Math.min(totalCachedInputTokens, totalInputTokens);
+    const cacheWrite = Math.min(
+      totalCacheWriteInputTokens,
+      totalInputTokens - cacheRead
+    );
+    const usageFields: Partial<ParsedCliOutput> = sawUsage
+      ? {
+          usage: {
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            cacheReadInputTokens: cacheRead,
+            cacheWriteInputTokens: cacheWrite,
+            ...(sawReasoning
+              ? { reasoningOutputTokens: totalReasoningOutputTokens }
+              : {}),
+          },
+          providerUsage: {
+            input_tokens: totalInputTokens,
+            cached_input_tokens: totalCachedInputTokens,
+            output_tokens: totalOutputTokens,
+            ...(totalCacheWriteInputTokens > 0
+              ? { cache_write_input_tokens: totalCacheWriteInputTokens }
+              : {}),
+            ...(sawReasoning
+              ? { reasoning_output_tokens: totalReasoningOutputTokens }
+              : {}),
+          },
+        }
+      : {};
+
     return {
       outputs: {
         analysis:
@@ -180,6 +232,7 @@ export class CodexAdapter extends BaseCliAdapter {
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
       sessionId: threadId,
+      ...usageFields,
     };
   }
 

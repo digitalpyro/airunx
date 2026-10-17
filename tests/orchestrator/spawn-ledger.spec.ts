@@ -26,12 +26,15 @@ import {
   createAuditSpawnObserver,
 } from '../../src/audit/audit-logger.js';
 import type { AuditEvent } from '../../src/audit/audit-logger.js';
+import { provenanceMix } from '../../src/core/cost-accounting.js';
 
 /** Fixture CLI: each spawn reports a distinct cost; the judge proceeds */
 class FixtureCliAdapter extends BaseCliAdapter {
   name = 'claude-code' as const;
   private spawnIndex = 0;
   private lastRole = '';
+  /** Role whose spawn prints plain text (forces the estimated fallback) */
+  public plainTextRole?: string;
 
   protected getCliConfig(): CliAdapterConfig {
     return {
@@ -56,6 +59,9 @@ class FixtureCliAdapter extends BaseCliAdapter {
       this.lastRole === 'code-judge'
         ? 'DECISION: PROCEED\nREASON: All criteria met'
         : `Work for spawn ${this.spawnIndex}`;
+    if (this.lastRole === this.plainTextRole) {
+      return { stdout: 'x'.repeat(4000), stderr: '' };
+    }
     return {
       stdout: JSON.stringify({
         result,
@@ -200,5 +206,82 @@ describe('llm_spawn ledger (fixture-driven run)', () => {
       expect(start).toBeGreaterThanOrEqual(0);
       expect(complete).toBeGreaterThan(start);
     }
+  });
+
+  it('aggregates provenance per stage and reports the run mix', async () => {
+    const stateManager = new StateManager(join(testDir, 'state'));
+    const adapter = new FixtureCliAdapter();
+    adapter.plainTextRole = 'developer';
+    await adapter.init({ type: 'cli' });
+
+    const pipeline = {
+      name: 'mix-pipeline',
+      description: 'Mixed provenance pipeline',
+      default_fidelity: 'standard',
+      stages: [
+        { name: 'plan', agent: 'orchestrator', input: 'Plan the work' },
+        { name: 'implement', agent: 'developer', input: 'Implement it' },
+        { name: 'judge', agent: 'code-judge', evaluatesStage: 'implement' },
+      ],
+    } as Pipeline;
+    const workflowContext: WorkflowContext = {
+      id: 'wf-mix-fixture',
+      input: 'Add a feature',
+      inputType: 'prompt',
+      mode: 'pipeline',
+      fidelityLevel: 'standard',
+      createdAt: new Date(),
+      status: 'initializing',
+      iterationCount: 0,
+      maxIterations: 3,
+      todos: [],
+      metrics: {
+        tokensUsed: 0,
+        totalTokens: 0,
+        runtime: 0,
+        totalRuntimeMs: 0,
+        stagesCompleted: 0,
+        totalStages: 3,
+        errors: 0,
+        totalCost: 0,
+      },
+    };
+    await stateManager.save(workflowContext);
+
+    const runner = new LangGraphRunner({
+      adapter,
+      stateManager,
+      pipeline,
+      workflowContext,
+    });
+    const finalContext = await runner.execute();
+
+    const byStage = Object.fromEntries(
+      (finalContext.stageRecords ?? []).map((r) => [r.stage, r.costSummary])
+    );
+    expect(byStage.plan?.provenance).toBe('reported');
+    expect(byStage.implement?.provenance).toBe('estimated');
+    expect(byStage.judge?.provenance).toBe('reported');
+
+    const summary = finalContext.metrics.costSummary!;
+    expect(summary.provenance).toBe('estimated');
+    expect(summary.spawnCount).toBe(3);
+    expect(summary.estimatedSpawns).toBe(1);
+    // The fixture adapter has no auth mode → unknown basis, not billed
+    expect(summary.billedMicroUsd).toBe(0);
+    const priced =
+      summary.reportedMicroUsd +
+      summary.derivedMicroUsd +
+      summary.estimatedMicroUsd;
+    expect(summary.unknownBasisMicroUsd).toBe(priced);
+    const expectedEstimatedPct = Math.round(
+      (summary.estimatedMicroUsd / priced) * 100
+    );
+    expect(provenanceMix(summary).estimatedPct).toBe(expectedEstimatedPct);
+    expect(provenanceMix(summary).trustedPct).toBe(100 - expectedEstimatedPct);
+
+    // The aggregate survives a reload from disk
+    const reloaded = await stateManager.load('wf-mix-fixture');
+    expect(reloaded?.metrics.costSummary).toEqual(summary);
   });
 });

@@ -264,6 +264,32 @@ export class AuditLogger {
         salvaged: record.salvaged,
         error_category: record.errorCategory,
         provider_session_id: record.providerSessionId,
+        // U3: provenance, billing basis, normalized tokens
+        cost_provenance: record.costProvenance ?? 'missing',
+        billing_basis: record.billingBasis,
+        derived_cost_micro_usd: toMicroUsd(record.derivedCostUsd),
+        pricing_version: record.pricingVersion,
+        unmodeled_modifiers: record.unmodeledModifiers,
+        token_provenance: record.tokenProvenance,
+        estimation_methods: record.estimationMethods,
+        semconv_version: record.semconvVersion,
+        ...(record.tokens
+          ? {
+              usage: {
+                input_tokens: record.tokens.inputTokens,
+                output_tokens: record.tokens.outputTokens,
+                cache_read_input_tokens: record.tokens.cacheReadInputTokens,
+                cache_write_input_tokens: record.tokens.cacheWriteInputTokens,
+                cache_write_5m_input_tokens:
+                  record.tokens.cacheWrite5mInputTokens,
+                cache_write_1h_input_tokens:
+                  record.tokens.cacheWrite1hInputTokens,
+                reasoning_output_tokens: record.tokens.reasoningOutputTokens,
+              },
+            }
+          : {}),
+        provider_usage: record.providerUsage,
+        cost_basis: record.costBasis,
       },
     });
   }

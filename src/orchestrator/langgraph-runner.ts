@@ -16,6 +16,7 @@ import { join } from 'path';
 import { StateGraph, END, START } from '@langchain/langgraph';
 import type {
   Pipeline,
+  CostSummary,
   RunReport,
   StageRecord,
   TimelineEvent,
@@ -50,6 +51,10 @@ import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
 import { DEFAULT_MAX_ITERATIONS } from './iteration-manager.js';
+import {
+  formatCostSummaryLine,
+  mergeCostSummaries,
+} from '../core/cost-accounting.js';
 import { formatHandoffContext } from './handoff-context.js';
 
 /**
@@ -68,7 +73,12 @@ type StageOutput =
   | {
       success: boolean;
       outputs: Record<string, unknown>;
-      metrics: { tokensUsed: number; duration: number; cost?: number };
+      metrics: {
+        tokensUsed: number;
+        duration: number;
+        cost?: number;
+        costSummary?: CostSummary;
+      };
       errors?: Error[];
     };
 
@@ -740,6 +750,9 @@ export class LangGraphRunner {
       durationMs: stageDuration,
       tokensUsed: result.metrics.tokensUsed,
       costUsd: result.metrics.cost ?? 0,
+      ...(result.metrics.costSummary
+        ? { costSummary: result.metrics.costSummary }
+        : {}),
       promptSummary:
         task.length > 200
           ? task.slice(0, 200).replace(/\n/g, ' ') + '…'
@@ -762,6 +775,11 @@ export class LangGraphRunner {
           (context.metrics.totalTokens || 0) + result.metrics.tokensUsed;
         context.metrics.totalCost =
           (context.metrics.totalCost || 0) + (result.metrics.cost || 0);
+        // Provenance/billing-tagged totals (weakest provenance wins)
+        context.metrics.costSummary = mergeCostSummaries(
+          context.metrics.costSummary,
+          result.metrics.costSummary
+        );
         context.metrics.stagesCompleted =
           (context.metrics.stagesCompleted || 0) + 1;
 
@@ -1175,6 +1193,9 @@ export class LangGraphRunner {
         tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
         duration: judgeResult.metrics?.duration ?? 0,
         cost: judgeResult.metrics?.cost ?? 0,
+        ...(judgeResult.metrics?.costSummary
+          ? { costSummary: judgeResult.metrics.costSummary }
+          : {}),
       },
       errors:
         judgeResult.decision === 'FAIL'
@@ -1200,6 +1221,9 @@ export class LangGraphRunner {
       durationMs: stageDuration,
       tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
       costUsd: judgeResult.metrics?.cost ?? 0,
+      ...(judgeResult.metrics?.costSummary
+        ? { costSummary: judgeResult.metrics.costSummary }
+        : {}),
       timestamp: stageStartIso,
       status: judgeResult.decision === 'FAIL' ? 'error' : 'completed',
     };
@@ -1218,6 +1242,10 @@ export class LangGraphRunner {
         (judgeResult.metrics?.tokensUsed ?? 0);
       context.metrics.totalCost =
         (context.metrics.totalCost || 0) + (judgeResult.metrics?.cost ?? 0);
+      context.metrics.costSummary = mergeCostSummaries(
+        context.metrics.costSummary,
+        judgeResult.metrics?.costSummary
+      );
 
       // Record rich stage record for run reporting
       context.stageRecords = context.stageRecords || [];
@@ -1362,6 +1390,14 @@ export class LangGraphRunner {
         iterations: context.iterationHistory?.entries ?? [],
         stages: stageRecords,
         timeline,
+        ...(context.metrics.costSummary
+          ? {
+              costSummary: context.metrics.costSummary,
+              costSummaryLine: formatCostSummaryLine(
+                context.metrics.costSummary
+              ),
+            }
+          : {}),
       };
 
       const reportsDir = join('.airunx-state', 'reports');

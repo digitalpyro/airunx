@@ -2,7 +2,15 @@
  * Tests for Core Types and Schemas
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { StateManager } from '../../src/orchestrator/state-manager.js';
+import {
+  mergeCostSummaries,
+  spawnCostSummary,
+} from '../../src/core/cost-accounting.js';
 import {
   PIPELINE_TYPES,
   DELIVERABLE_TYPES,
@@ -13,6 +21,9 @@ import {
   PipelineSchema,
   AgentRoleSchema,
   ExecutionFidelityLevelSchema,
+  WorkflowContextSchema,
+  type WorkflowContext,
+  type StageRecord,
 } from '../../src/core/types.js';
 
 describe('Core Types', () => {
@@ -220,5 +231,109 @@ describe('Zod Schemas', () => {
 
       expect(() => PipelineSchema.parse(pipeline)).toThrow();
     });
+  });
+});
+
+describe('WorkflowContext cost provenance round-trip', () => {
+  let dir: string | undefined;
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  const summary = mergeCostSummaries(
+    spawnCostSummary({
+      costUsd: 1.5,
+      costProvenance: 'reported',
+      billingBasis: 'api_equivalent',
+      tokens: {
+        inputTokens: 18_000,
+        outputTokens: 2_000,
+        cacheReadInputTokens: 10_000,
+        cacheWriteInputTokens: 7_000,
+        cacheWrite5mInputTokens: 3_000,
+        cacheWrite1hInputTokens: 4_000,
+        reasoningOutputTokens: 500,
+      },
+      tokenProvenance: 'reported',
+    }),
+    spawnCostSummary({
+      costUsd: 0.2,
+      costProvenance: 'estimated',
+      billingBasis: 'billed',
+      pricingVersion: 'sha256:0123456789ab',
+      estimationMethods: ['chars_div_4'],
+      unmodeledModifiers: ['fast_mode'],
+    })
+  )!;
+
+  const stageRecord: StageRecord = {
+    stage: 'implement',
+    agent: 'developer',
+    backend: 'claude-code',
+    spawnCount: 2,
+    durationMs: 1000,
+    tokensUsed: 20_000,
+    costUsd: 1.7,
+    timestamp: '2026-10-16T10:00:00.000Z',
+    status: 'completed',
+    costSummary: summary,
+  };
+
+  const context: WorkflowContext = {
+    id: 'wf-roundtrip',
+    input: 'task',
+    inputType: 'prompt',
+    mode: 'pipeline',
+    createdAt: new Date('2026-10-16T10:00:00.000Z'),
+    status: 'completed',
+    metrics: {
+      tokensUsed: 20_000,
+      runtime: 1,
+      stagesCompleted: 1,
+      totalStages: 1,
+      errors: 0,
+      totalCost: 1.7,
+      costSummary: summary,
+    },
+    stageRecords: [stageRecord],
+    iterationHistory: {
+      entries: [
+        {
+          iteration: 1,
+          timestamp: new Date('2026-10-16T10:01:00.000Z'),
+          approach: 'first',
+          verdict: 'PROCEED',
+          gaps: [],
+          stageRecords: [stageRecord],
+        },
+      ],
+    },
+  };
+
+  it('keeps provenance, billing and cache fields through schema parse', () => {
+    const parsed = WorkflowContextSchema.parse(
+      JSON.parse(JSON.stringify(context))
+    );
+    expect(parsed.metrics.costSummary).toEqual(summary);
+    expect(parsed.stageRecords?.[0].costSummary).toEqual(summary);
+    expect(
+      parsed.iterationHistory?.entries[0].stageRecords?.[0].costSummary
+    ).toEqual(summary);
+  });
+
+  it('survives StateManager save + load intact', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'airunx-types-'));
+    const manager = new StateManager(dir);
+    await manager.save(context);
+    const loaded = await manager.load(context.id);
+    expect(loaded?.metrics.costSummary).toEqual(summary);
+    expect(loaded?.stageRecords?.[0].costSummary?.tokens).toEqual(
+      summary.tokens
+    );
+    expect(
+      loaded?.iterationHistory?.entries[0].stageRecords?.[0].costSummary
+    ).toEqual(summary);
   });
 });

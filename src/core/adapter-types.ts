@@ -4,7 +4,14 @@
  */
 
 import { z } from 'zod';
-import type { AgentRole, PromptSectionBytes } from './types.js';
+import type {
+  AgentRole,
+  BillingBasis,
+  CostProvenance,
+  CostSummary,
+  NormalizedTokenUsage,
+  PromptSectionBytes,
+} from './types.js';
 import { AgentRoleSchema, FidelityConfigSchema } from './types.js';
 
 /**
@@ -276,6 +283,27 @@ export interface SpawnRecord {
   errorCategory?: string;
   /** Provider session/thread ID when the CLI reports one */
   providerSessionId?: string;
+  /** How real `costUsd` is; undefined = cost missing (unknown, not $0) */
+  costProvenance?: CostProvenance;
+  /** billed (API key) / api_equivalent (subscription) / unknown */
+  billingBasis?: BillingBasis;
+  /** Token×pricing cross-check kept alongside a reported cost */
+  derivedCostUsd?: number;
+  /** Pricing table version used for any derived figure */
+  pricingVersion?: string;
+  /** Known pricing modifiers (batch, fast mode, …) the table does not model */
+  unmodeledModifiers?: string[];
+  /** Normalized, OTel-aligned token counts (inclusive input) */
+  tokens?: NormalizedTokenUsage;
+  tokenProvenance?: 'reported' | 'estimated';
+  /** Estimation methods used for this spawn (chars_div_4, split_50_50) */
+  estimationMethods?: string[];
+  /** Allowlisted numeric copy of the provider's raw usage fields */
+  providerUsage?: Record<string, number>;
+  /** Claude Code modelUsage[*].costBasis, keyed by model */
+  costBasis?: Record<string, string>;
+  /** OTel GenAI semconv version the token fields map to */
+  semconvVersion?: string;
 }
 
 /**
@@ -316,6 +344,8 @@ export interface ExecutionResult {
     promptBytes?: number;
     /** Per-section byte breakdown of the prompt (explains large prompts) */
     promptSections?: PromptSectionBytes;
+    /** Provenance/billing-tagged accounting of the spawn(s) behind `cost` */
+    costSummary?: CostSummary;
   };
   errors: Error[];
   /**

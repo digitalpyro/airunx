@@ -17,6 +17,8 @@ import type {
 } from '../core/adapter-types.js';
 import { SUB_AGENT_TYPES, type SubAgentType } from '../core/adapter-types.js';
 import { createLogger } from '../utils/logger.js';
+import type { CostSummary } from '../core/types.js';
+import { mergeCostSummaries } from '../core/cost-accounting.js';
 
 const logger = createLogger('compound-engineering-adapter');
 
@@ -50,6 +52,7 @@ export interface SubAgentResult {
     tokensUsed: number;
     duration: number;
     cost?: number;
+    costSummary?: CostSummary;
   };
 }
 
@@ -412,6 +415,7 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
           tokensUsed: result.metrics.tokensUsed,
           duration: result.metrics.duration,
           cost: result.metrics.cost ?? 0,
+          costSummary: result.metrics.costSummary,
         },
       };
     } catch (error) {
@@ -529,6 +533,7 @@ ${failedResults.length > 0 ? `\n## Sub-Agent Failures\n${failedResults.map((r) =
       cost: _mainCost,
       tokensUsed: _mainTokens,
       spawnCount: _mainSpawns,
+      costSummary: _mainCostSummary,
       ...restMetrics
     } = mainResult.metrics;
     /* eslint-enable @typescript-eslint/no-unused-vars */
@@ -545,6 +550,10 @@ ${failedResults.length > 0 ? `\n## Sub-Agent Failures\n${failedResults.map((r) =
         tokensUsed: totalTokens,
         spawnCount: totalSpawnCount,
         cost: totalCost,
+        costSummary: mergeCostSummaries(
+          mainResult.metrics.costSummary,
+          ...subAgentResults.map((r) => r.metrics?.costSummary)
+        ),
       },
       errors: [
         ...mainResult.errors,

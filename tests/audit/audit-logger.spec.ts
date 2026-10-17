@@ -143,6 +143,50 @@ describe('AuditLogger', () => {
       ).toMatchObject({ task: 600, total: 1200 });
     });
 
+    it('records provenance, billing basis, normalized and raw provider usage', () => {
+      logger.logLlmSpawn(
+        spawnRecord({
+          costProvenance: 'reported',
+          billingBasis: 'api_equivalent',
+          derivedCostUsd: 0.1,
+          pricingVersion: 'sha256:0123456789ab',
+          unmodeledModifiers: [],
+          tokens: {
+            inputTokens: 1300,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheWriteInputTokens: 100,
+          },
+          tokenProvenance: 'reported',
+          providerUsage: { 'usage.input_tokens': 1000 },
+          semconvVersion: '1.38.0',
+        })
+      );
+      const [event] = readLines(logger.getLogPath());
+      expect(event.details).toMatchObject({
+        cost_provenance: 'reported',
+        billing_basis: 'api_equivalent',
+        derived_cost_micro_usd: 100_000,
+        pricing_version: 'sha256:0123456789ab',
+        token_provenance: 'reported',
+        semconv_version: '1.38.0',
+        usage: {
+          input_tokens: 1300,
+          cache_read_input_tokens: 200,
+          cache_write_input_tokens: 100,
+        },
+        provider_usage: { 'usage.input_tokens': 1000 },
+      });
+    });
+
+    it('labels a spawn without cost provenance as missing', () => {
+      logger.logLlmSpawn(spawnRecord({ costUsd: undefined }));
+      const [event] = readLines(logger.getLogPath());
+      expect((event.details as Record<string, unknown>).cost_provenance).toBe(
+        'missing'
+      );
+    });
+
     it('converts USD to integer micro-USD', () => {
       expect(toMicroUsd(1.5)).toBe(1_500_000);
       expect(toMicroUsd(0)).toBe(0);

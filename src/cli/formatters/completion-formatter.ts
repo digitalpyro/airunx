@@ -11,6 +11,11 @@
 
 import chalk from 'chalk';
 import type { WorkflowContext, WorkflowStatus } from '../../core/types.js';
+import {
+  formatCostSummaryLine,
+  formatEstimationWarning,
+  provenanceMix,
+} from '../../core/cost-accounting.js';
 
 /**
  * Status configuration for all WorkflowStatus values
@@ -121,6 +126,7 @@ export function formatCompletionJson(context: WorkflowContext): object {
       cost: context.metrics.totalCost || 0,
       durationMs: context.metrics.totalRuntimeMs || 0,
       iterations: context.iterationCount || 0,
+      ...costSummaryJson(context),
     },
     startedAt: context.createdAt?.toISOString?.() ?? new Date().toISOString(),
     maxIterations: context.maxIterations ?? 1,
@@ -136,6 +142,25 @@ export function formatCompletionJson(context: WorkflowContext): object {
     prNumber: context.prNumber,
     commitSha: context.commitSha,
     failureReason: context.failureReason,
+  };
+}
+
+/**
+ * Provenance/billing fields for JSON output (empty when no summary exists)
+ */
+function costSummaryJson(context: WorkflowContext): Record<string, unknown> {
+  const summary = context.metrics.costSummary;
+  if (!summary) return {};
+  return {
+    costSummary: summary,
+    costSummaryLine: formatCostSummaryLine(summary),
+    billedMicroUsd: summary.billedMicroUsd,
+    apiEquivalentMicroUsd: summary.apiEquivalentMicroUsd,
+    unknownBasisMicroUsd: summary.unknownBasisMicroUsd,
+    provenanceMix: provenanceMix(summary),
+    ...(formatEstimationWarning(summary)
+      ? { estimationWarning: formatEstimationWarning(summary) }
+      : {}),
   };
 }
 
@@ -302,6 +327,16 @@ function buildMetrics(context: WorkflowContext): string[] {
     metrics.push(`Cost: $${context.metrics.totalCost.toFixed(4)}`);
   } else if (context.metrics.totalTokens && context.metrics.totalCost == null) {
     metrics.push('Cost: N/A');
+  }
+
+  // Provenance + billing basis (R9) and the once-per-run estimation note (R10)
+  const summary = context.metrics.costSummary;
+  if (summary) {
+    metrics.push(`Cost Basis: ${formatCostSummaryLine(summary)}`);
+    const warning = formatEstimationWarning(summary);
+    if (warning) {
+      metrics.push(`Warning: ${warning}`);
+    }
   }
 
   if (context.metrics.totalRuntimeMs) {
