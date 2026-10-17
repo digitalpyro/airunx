@@ -9,7 +9,7 @@
 
 import { spawnAsync } from '../utils/async-spawn.js';
 import { BaseCliAdapter, type CliAdapterConfig } from './base-cli-adapter.js';
-import type { ExecutionRequest } from '../core/adapter-types.js';
+import type { ExecutionRequest, SpawnAuthMode } from '../core/adapter-types.js';
 import { ANTHROPIC_PRICING } from './pricing.js';
 import { ConfigurationError } from '../utils/errors.js';
 import {
@@ -139,6 +139,10 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
     ];
 
     return args;
+  }
+
+  protected getAuthMode(): SpawnAuthMode {
+    return this.useSubscriptionAuth ? 'subscription' : 'api_key';
   }
 
   protected buildEnv(): Record<string, string | undefined> {

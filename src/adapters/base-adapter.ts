@@ -14,6 +14,7 @@ import type {
   AdapterType,
   BackendAvailability,
   BuiltPrompt,
+  SpawnObserver,
 } from '../core/adapter-types.js';
 import { PROMPT_SECTION_NAMES } from '../core/types.js';
 import type { PromptSectionBytes, PromptSectionName } from '../core/types.js';
@@ -59,6 +60,8 @@ export abstract class BaseAdapter implements ExecutionAdapter {
 
   protected config?: AdapterConfig;
   protected initialized = false;
+  /** Ledger observer notified after each CLI spawn (no-op when unset) */
+  protected spawnObserver?: SpawnObserver;
 
   // Simple in-memory cache shared across all adapter instances
   // Cache key: hash of (model + prompt), TTL: configurable (default 5 minutes)
@@ -76,6 +79,13 @@ export abstract class BaseAdapter implements ExecutionAdapter {
   async init(config: AdapterConfig): Promise<void> {
     this.config = config;
     this.initialized = true;
+  }
+
+  /**
+   * Attach (or detach with undefined) the spawn ledger observer
+   */
+  setSpawnObserver(observer: SpawnObserver | undefined): void {
+    this.spawnObserver = observer;
   }
 
   abstract execute(_request: ExecutionRequest): Promise<ExecutionResult>;

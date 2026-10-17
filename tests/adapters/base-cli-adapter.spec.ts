@@ -11,8 +11,12 @@ import type {
   ExecutionResult,
   BackendAvailability,
   AdapterConfig,
+  SpawnObserver,
+  SpawnRecord,
 } from '../../src/core/adapter-types.js';
 import type { ModelPricing } from '../../src/adapters/pricing.js';
+import { CompoundEngineeringAdapter } from '../../src/adapters/compound-engineering-adapter.js';
+import { TimeoutError } from '../../src/utils/errors.js';
 
 // Concrete test subclass to access protected methods
 class TestableCliAdapter extends BaseCliAdapter {
@@ -309,5 +313,245 @@ describe('BaseCliAdapter', () => {
       expect(result.tokensUsed).toBe(500);
       // Cost is calculated in execute(), not parseOutput
     });
+  });
+});
+
+// ============================================================
+// Spawn observer (llm_spawn ledger) tests
+// ============================================================
+
+/** CLI adapter whose spawn is stubbed, for observer tests */
+class StubSpawnAdapter extends BaseCliAdapter {
+  name = 'claude-code' as const;
+  public spawnResult: { stdout: string; stderr: string } | Error = {
+    stdout: JSON.stringify({
+      result: 'done',
+      input_tokens: 1000,
+      output_tokens: 200,
+      total_cost_usd: 0.0123,
+      session_id: 'sess-abc',
+    }),
+    stderr: '',
+  };
+
+  protected getCliConfig(): CliAdapterConfig {
+    return {
+      cliCommand: 'stub-cli',
+      installInstructions: 'n/a',
+      pricingMap: { 'stub-model': { input: 3, output: 15 } },
+      defaultModel: 'stub-model',
+    };
+  }
+
+  protected buildCliArgs(_request: ExecutionRequest, prompt: string): string[] {
+    return ['-p', prompt];
+  }
+
+  protected async executeWithSpawn(): Promise<{
+    stdout: string;
+    stderr: string;
+  }> {
+    if (this.spawnResult instanceof Error) throw this.spawnResult;
+    return this.spawnResult;
+  }
+
+  async init(config: AdapterConfig): Promise<void> {
+    this.config = config;
+    this.initialized = true;
+  }
+
+  async isAvailable(): Promise<BackendAvailability> {
+    return { available: true };
+  }
+}
+
+const makeRequest = (
+  overrides: Partial<ExecutionRequest> = {}
+): ExecutionRequest => ({
+  agent: {
+    role: 'developer',
+    capabilities: ['code'],
+    contextRequired: [],
+    systemPrompt: 'You are a developer.',
+  },
+  task: 'Implement the thing',
+  context: { workingDirectory: '/tmp' },
+  spawnContext: { workflowId: 'wf-1', stage: 'implement', iteration: 2 },
+  ...overrides,
+});
+
+describe('BaseCliAdapter spawn observer', () => {
+  let adapter: StubSpawnAdapter;
+  let records: SpawnRecord[];
+  let observer: SpawnObserver;
+
+  beforeEach(async () => {
+    adapter = new StubSpawnAdapter();
+    await adapter.init({ type: 'cli' });
+    records = [];
+    observer = { onSpawnComplete: (record) => records.push(record) };
+    adapter.setSpawnObserver(observer);
+  });
+
+  it('emits exactly one record with all R1 fields on success', async () => {
+    const result = await adapter.execute(makeRequest());
+
+    expect(records).toHaveLength(1);
+    const record = records[0];
+    expect(record).toMatchObject({
+      workflowId: 'wf-1',
+      stage: 'implement',
+      iteration: 2,
+      backend: 'claude-code',
+      model: 'stub-model',
+      agentRole: 'developer',
+      tokensUsed: 1200,
+      inputTokens: 1000,
+      outputTokens: 200,
+      costUsd: 0.0123,
+      exitReason: 'ok',
+      success: true,
+      salvaged: false,
+      providerSessionId: 'sess-abc',
+    });
+    expect(record.promptBytes).toBeGreaterThan(0);
+    expect(record.promptSections?.total).toBe(record.promptBytes);
+    expect(record.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+    expect(record.endedAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+    expect(Date.parse(record.endedAt)).toBeGreaterThanOrEqual(
+      Date.parse(record.startedAt)
+    );
+    expect(record.durationMs).toBeGreaterThanOrEqual(0);
+    expect(record.spawnId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(result.spawnId).toBe(record.spawnId);
+  });
+
+  it('gives each spawn a unique spawnId', async () => {
+    await adapter.execute(makeRequest());
+    await adapter.execute(makeRequest());
+    expect(records).toHaveLength(2);
+    expect(records[0].spawnId).not.toBe(records[1].spawnId);
+  });
+
+  it('emits one record with salvage status and exit reason for a salvaged timeout', async () => {
+    const timeout = new TimeoutError(1000, 'CLI execution');
+    Object.assign(timeout, {
+      stdout: JSON.stringify({ result: 'partial', tokens_used: 500 }),
+      stderr: '',
+    });
+    adapter.spawnResult = timeout;
+
+    const result = await adapter.execute(makeRequest());
+
+    expect(result.success).toBe(false);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      exitReason: 'timeout',
+      success: false,
+      salvaged: true,
+      tokensUsed: 500,
+      errorCategory: 'TimeoutError',
+    });
+    expect(records[0].costUsd).toBeGreaterThan(0);
+    expect(result.spawnId).toBe(records[0].spawnId);
+  });
+
+  it('classifies hang detection kills as hang', async () => {
+    adapter.spawnResult = new TimeoutError(300000, 'Process hang detected');
+    await adapter.execute(makeRequest());
+    expect(records[0]).toMatchObject({ exitReason: 'hang', salvaged: false });
+  });
+
+  it('classifies signal kills as signal', async () => {
+    adapter.spawnResult = Object.assign(new Error('killed'), {
+      signal: 'SIGKILL',
+    });
+    await adapter.execute(makeRequest());
+    expect(records[0]).toMatchObject({
+      exitReason: 'signal',
+      success: false,
+      tokensUsed: 0,
+    });
+  });
+
+  it('classifies non-zero exits as error', async () => {
+    adapter.spawnResult = Object.assign(new Error('exit 1'), {
+      code: 1,
+      stderr: 'boom',
+    });
+    await adapter.execute(makeRequest());
+    expect(records[0]).toMatchObject({ exitReason: 'error', success: false });
+    expect(records[0].errorCategory).toBe('RetryableError');
+  });
+
+  it('records spawns without spawnContext as unattributed', async () => {
+    await adapter.execute(makeRequest({ spawnContext: undefined }));
+    expect(records).toHaveLength(1);
+    expect(records[0].workflowId).toBeUndefined();
+    expect(records[0].stage).toBeUndefined();
+  });
+
+  it('does not throw when no observer is attached', async () => {
+    adapter.setSpawnObserver(undefined);
+    const result = await adapter.execute(makeRequest());
+    expect(result.success).toBe(true);
+    expect(result.spawnId).toBeDefined();
+  });
+
+  it('is unaffected by an observer that throws', async () => {
+    adapter.setSpawnObserver({
+      onSpawnComplete: () => {
+        throw new Error('ledger down');
+      },
+    });
+    const result = await adapter.execute(makeRequest());
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('CompoundEngineeringAdapter spawn attribution', () => {
+  it('sub-agent spawns carry the parent spawn_id as parentSpawnId', async () => {
+    const adapter = new CompoundEngineeringAdapter();
+    // Skip CLI checks: mark initialized directly
+    Object.assign(adapter, { config: { type: 'cli' }, initialized: true });
+    vi.spyOn(
+      adapter as unknown as { executeWithSpawn: () => Promise<unknown> },
+      'executeWithSpawn'
+    ).mockResolvedValue({
+      stdout: JSON.stringify({
+        result: 'analysis',
+        input_tokens: 10,
+        output_tokens: 5,
+        total_cost_usd: 0.01,
+      }),
+      stderr: '',
+    });
+
+    const records: SpawnRecord[] = [];
+    adapter.setSpawnObserver({
+      onSpawnComplete: (record) => records.push(record),
+    });
+
+    const result = await adapter.execute(
+      makeRequest({ task: 'Do a system design review of the module' })
+    );
+
+    // main spawn + 3 default sub-agents
+    expect(records.length).toBe(4);
+    const [main, ...subs] = records;
+    expect(main.parentSpawnId).toBeUndefined();
+    expect(result.spawnId).toBe(main.spawnId);
+    for (const sub of subs) {
+      expect(sub.parentSpawnId).toBe(main.spawnId);
+      expect(sub).toMatchObject({
+        workflowId: 'wf-1',
+        stage: 'implement',
+        iteration: 2,
+      });
+      expect(sub.spawnId).not.toBe(main.spawnId);
+    }
+    // Per-spawn costs sum to the merged result's cost
+    const sum = records.reduce((acc, r) => acc + (r.costUsd ?? 0), 0);
+    expect(sum).toBeCloseTo(result.metrics.cost ?? 0, 10);
   });
 });

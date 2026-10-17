@@ -634,10 +634,22 @@ export async function runOrchestrator(
         }
 
         // Create AdapterFactory for lazy adapter initialization
+        // One audit logger + spawn observer for the whole run: every CLI
+        // spawn (including CE sub-agents and adapter-internal retries) lands
+        // in the llm_spawn ledger, attributed via request.spawnContext
         const { createAdapterFactory } = await import(
           '../../adapters/adapter-factory.js'
         );
-        const adapterFactory = createAdapterFactory(config);
+        const { AuditLogger, createAuditSpawnObserver, getDefaultAuditDir } =
+          await import('../../audit/audit-logger.js');
+        const spawnObserver = createAuditSpawnObserver(
+          new AuditLogger(getDefaultAuditDir()),
+          (error) =>
+            logger.warn(
+              `Failed to record llm_spawn event: ${error instanceof Error ? error.message : String(error)}`
+            )
+        );
+        const adapterFactory = createAdapterFactory(config, { spawnObserver });
 
         // Load agent definitions from AGENTS.md for provider routing
         const { loadAgentsDefs } = await import('../../utils/agents-schema.js');

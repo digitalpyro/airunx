@@ -207,6 +207,84 @@ export interface ExecutionRequest {
     /** Per-agent timeout override derived from fidelity level (milliseconds) */
     timeoutMs?: number;
   };
+  /**
+   * Attribution for the spawn(s) this request produces. Routed by the
+   * SpawnObserver into the ledger; absent → spawn is recorded unattributed.
+   */
+  spawnContext?: SpawnContext;
+}
+
+/**
+ * Attribution carried on an ExecutionRequest so every CLI spawn can be tied
+ * back to its workflow, stage and iteration.
+ */
+export interface SpawnContext {
+  workflowId: string;
+  stage: string;
+  /** 1-indexed iteration of the workflow (matches iteration history) */
+  iteration: number;
+  /** spawn_id of the spawn that delegated this one (CE sub-agents) */
+  parentSpawnId?: string;
+}
+
+/** Why a spawn ended */
+export const SPAWN_EXIT_REASONS = [
+  'ok',
+  'timeout',
+  'hang',
+  'signal',
+  'error',
+] as const;
+export type SpawnExitReason = (typeof SPAWN_EXIT_REASONS)[number];
+
+/** How the backend CLI authenticated (subscription login vs API key) */
+export type SpawnAuthMode = 'subscription' | 'api_key';
+
+/**
+ * Structured record of one completed CLI spawn, handed to the SpawnObserver.
+ * Later units extend this additively (provenance, billing basis,
+ * normalized tokens, pricing version, estimation labels).
+ */
+export interface SpawnRecord {
+  spawnId: string;
+  parentSpawnId?: string;
+  workflowId?: string;
+  stage?: string;
+  iteration?: number;
+  backend: BackendType;
+  /** Model the spawn was priced against (undefined when the CLI chose) */
+  model?: string;
+  authMode?: SpawnAuthMode;
+  agentRole: AgentRole;
+  promptBytes?: number;
+  promptSections?: PromptSectionBytes;
+  /** Raw (provider-reported or estimated) token figures, pre-normalization */
+  tokensUsed: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  /** UTC RFC 3339 */
+  startedAt: string;
+  /** UTC RFC 3339 */
+  endedAt: string;
+  durationMs: number;
+  exitReason: SpawnExitReason;
+  success: boolean;
+  /** True when metrics were recovered from a failed spawn's partial output */
+  salvaged: boolean;
+  /** Error class name on failure (an enum-like category, never the message) */
+  errorCategory?: string;
+  /** Provider session/thread ID when the CLI reports one */
+  providerSessionId?: string;
+}
+
+/**
+ * Receives one SpawnRecord per completed CLI spawn. Implementations must not
+ * throw; adapters additionally guard calls so a failing observer never
+ * affects execution.
+ */
+export interface SpawnObserver {
+  onSpawnComplete(record: SpawnRecord, request: ExecutionRequest): void;
 }
 
 /**
@@ -240,6 +318,11 @@ export interface ExecutionResult {
     promptSections?: PromptSectionBytes;
   };
   errors: Error[];
+  /**
+   * ID of the CLI spawn that produced this result (the main spawn when an
+   * adapter performs several, e.g. CE delegation)
+   */
+  spawnId?: string;
 }
 
 /**
@@ -286,6 +369,12 @@ export interface ExecutionAdapter {
    * Clean up resources
    */
   cleanup(): Promise<void>;
+
+  /**
+   * Attach the observer notified after every CLI spawn (optional; adapters
+   * that never spawn may omit it)
+   */
+  setSpawnObserver?(observer: SpawnObserver | undefined): void;
 }
 
 /**

@@ -17,6 +17,9 @@ import type {
   ExecutionResult,
   BackendAvailability,
   AdapterConfig,
+  SpawnAuthMode,
+  SpawnExitReason,
+  SpawnRecord,
 } from '../core/adapter-types.js';
 import { calculateCost, getModelPricing } from './pricing.js';
 import type { ModelPricing } from './pricing.js';
@@ -29,6 +32,7 @@ import {
 } from './constants.js';
 import { loadSettings } from '../utils/settings.js';
 import { createLogger } from '../utils/logger.js';
+import { ulid } from '../utils/ulid.js';
 import {
   BackendNotFoundError,
   ConfigurationError,
@@ -47,6 +51,35 @@ const execFileAsync = promisify(execFile);
  * a 50/50 split for cost calculation purposes
  */
 const ESTIMATED_CLI_INPUT_TOKEN_RATIO = 0.5;
+
+/** TimeoutError operation label used for hang detection kills */
+const HANG_OPERATION = 'Process hang detected';
+
+/**
+ * Per-spawn facts gathered during execution and reported to the SpawnObserver
+ */
+interface SpawnOutcome {
+  exitReason: SpawnExitReason;
+  salvaged: boolean;
+  errorCategory?: string;
+  providerSessionId?: string;
+  /** CLI-reported token counts (undefined when not reported) */
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * Parsed CLI output shape returned by parseOutput()
+ */
+export interface ParsedCliOutput {
+  outputs: ExecutionResult['outputs'];
+  tokensUsed: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCostUsd?: number;
+  /** Provider session/thread ID when the CLI reports one */
+  sessionId?: string;
+}
 
 /**
  * Configuration for CLI-specific behavior
@@ -314,7 +347,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           // Attach stdout/stderr for debugging what happened before hang
           const hangError = new TimeoutError(
             timeSinceLastOutput,
-            'Process hang detected'
+            HANG_OPERATION
           );
           Object.assign(hangError, { stdout, stderr });
           reject(hangError);
@@ -356,10 +389,109 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     });
   }
 
+  /**
+   * Execute one CLI spawn and report it to the SpawnObserver (if any).
+   * Every call emits exactly one SpawnRecord — success, failure or salvage —
+   * and the returned result carries the record's spawnId.
+   */
   async execute(request: ExecutionRequest): Promise<ExecutionResult> {
     this.ensureInitialized();
 
+    const spawnId = ulid();
     const startTime = Date.now();
+    const outcome: SpawnOutcome = { exitReason: 'error', salvaged: false };
+    const result = await this.runSpawn(request, outcome, startTime);
+    result.spawnId = spawnId;
+    this.notifySpawnObserver(request, result, outcome, spawnId, startTime);
+    return result;
+  }
+
+  /**
+   * Model to attribute a spawn to. Subclasses override when the CLI may pick
+   * its own model (return undefined).
+   */
+  protected getSpawnModel(request: ExecutionRequest): string | undefined {
+    return (
+      this.config?.model ||
+      request.agent.preferredModel ||
+      this.getCliConfig().defaultModel
+    );
+  }
+
+  /**
+   * Authentication mode used by spawned CLIs, when known
+   */
+  protected getAuthMode(): SpawnAuthMode | undefined {
+    return undefined;
+  }
+
+  /**
+   * Build the SpawnRecord and hand it to the observer. Never throws.
+   */
+  private notifySpawnObserver(
+    request: ExecutionRequest,
+    result: ExecutionResult,
+    outcome: SpawnOutcome,
+    spawnId: string,
+    startTime: number
+  ): void {
+    const observer = this.spawnObserver;
+    if (!observer) return;
+
+    try {
+      const endTime = Date.now();
+      const ctx = request.spawnContext;
+      const record: SpawnRecord = {
+        spawnId,
+        parentSpawnId: ctx?.parentSpawnId,
+        workflowId: ctx?.workflowId,
+        stage: ctx?.stage,
+        iteration: ctx?.iteration,
+        backend: this.name,
+        model: this.getSpawnModel(request),
+        authMode: this.getAuthMode(),
+        agentRole: request.agent.role,
+        promptBytes: result.metrics.promptBytes,
+        promptSections: result.metrics.promptSections,
+        tokensUsed: result.metrics.tokensUsed,
+        inputTokens: outcome.inputTokens,
+        outputTokens: outcome.outputTokens,
+        costUsd: result.metrics.cost,
+        startedAt: new Date(startTime).toISOString(),
+        endedAt: new Date(endTime).toISOString(),
+        durationMs: endTime - startTime,
+        exitReason: outcome.exitReason,
+        success: result.success,
+        salvaged: outcome.salvaged,
+        errorCategory: outcome.errorCategory,
+        providerSessionId: outcome.providerSessionId,
+      };
+      observer.onSpawnComplete(record, request);
+    } catch (error) {
+      this.logger.warn(
+        `Spawn observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Classify why a failed spawn ended
+   */
+  private classifyExit(error: unknown): SpawnExitReason {
+    if (error instanceof TimeoutError) {
+      return error.operation === HANG_OPERATION ? 'hang' : 'timeout';
+    }
+    if ((error as ProcessError | undefined)?.signal) {
+      return 'signal';
+    }
+    return 'error';
+  }
+
+  private async runSpawn(
+    request: ExecutionRequest,
+    outcome: SpawnOutcome,
+    startTime: number
+  ): Promise<ExecutionResult> {
     const { agent, task, context } = request;
     const cliConfig = this.getCliConfig();
     // Prompt size metrics, attached to every result (success or failure)
@@ -403,6 +535,10 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
       // Parse output
       const result = this.parseOutput(stdout, stderr);
+      outcome.exitReason = 'ok';
+      outcome.providerSessionId = result.sessionId;
+      outcome.inputTokens = result.inputTokens;
+      outcome.outputTokens = result.outputTokens;
 
       // Calculate cost using centralized pricing
       // Use actual input/output tokens when available from CLI response,
@@ -460,6 +596,9 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       });
     } catch (error) {
       const duration = Date.now() - startTime;
+      outcome.exitReason = this.classifyExit(error);
+      outcome.errorCategory =
+        error instanceof Error ? error.constructor.name : 'unknown';
 
       // Handle already-categorized errors from pre-flight checks or setup
       // These may have stdout/stderr attached for debugging (e.g., TimeoutError)
@@ -486,7 +625,11 @@ export abstract class BaseCliAdapter extends BaseAdapter {
               processError.stdout,
               processError.stderr ?? ''
             );
+            outcome.providerSessionId = partial.sessionId;
+            outcome.inputTokens = partial.inputTokens;
+            outcome.outputTokens = partial.outputTokens;
             if (partial.tokensUsed > 0 || partial.totalCostUsd) {
+              outcome.salvaged = true;
               // Calculate cost from tokens if totalCostUsd not available
               let salvagedCost = partial.totalCostUsd;
               if (salvagedCost === undefined && partial.tokensUsed > 0) {
@@ -560,6 +703,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
       // Categorize error for smart retry logic
       const categorizedError = this.categorizeError(execError);
+      outcome.errorCategory = categorizedError.constructor.name;
 
       return {
         success: false,
@@ -761,16 +905,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
    * Returns inputTokens/outputTokens when available from CLI JSON output
    * for accurate cost calculation. Falls back to tokensUsed with 50/50 estimation.
    */
-  protected parseOutput(
-    stdout: string,
-    stderr: string
-  ): {
-    outputs: ExecutionResult['outputs'];
-    tokensUsed: number;
-    inputTokens?: number;
-    outputTokens?: number;
-    totalCostUsd?: number;
-  } {
+  protected parseOutput(stdout: string, stderr: string): ParsedCliOutput {
     try {
       // Handle empty stdout before attempting to parse
       if (!stdout.trim()) {
@@ -824,6 +959,11 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         // Claude Code: total_cost_usd
         const totalCostUsd = getNumeric(parsed.total_cost_usd);
 
+        // Provider session ID (Claude Code: session_id)
+        const rawSessionId = parsed.session_id ?? parsed.sessionId;
+        const sessionId =
+          typeof rawSessionId === 'string' ? rawSessionId : undefined;
+
         const tokensUsed =
           getNumeric(parsed.tokens_used) ??
           getNumeric(parsed.tokensUsed) ??
@@ -849,6 +989,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           inputTokens,
           outputTokens,
           totalCostUsd,
+          sessionId,
         };
       }
     } catch (parseError) {

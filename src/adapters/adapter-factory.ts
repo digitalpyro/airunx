@@ -11,6 +11,7 @@ import {
   type ExecutionAdapter,
   type AdapterConfig,
   type SystemConfig,
+  type SpawnObserver,
 } from '../core/adapter-types.js';
 import type { AgentRole } from '../core/types.js';
 import { createAdapter } from './index.js';
@@ -18,6 +19,17 @@ import { createLogger } from '../utils/logger.js';
 import { ConfigurationError, BackendNotFoundError } from '../utils/errors.js';
 
 const logger = createLogger('adapter-factory');
+
+/**
+ * Options for AdapterFactory
+ */
+export interface AdapterFactoryOptions {
+  /**
+   * Observer injected into every adapter the factory creates; notified after
+   * each CLI spawn (routes on request.spawnContext)
+   */
+  spawnObserver?: SpawnObserver;
+}
 
 /**
  * Adapter Factory class
@@ -29,9 +41,11 @@ export class AdapterFactory {
   private adapters: Map<BackendType, ExecutionAdapter> = new Map();
   private initializing: Map<BackendType, Promise<ExecutionAdapter>> = new Map();
   private systemConfig: SystemConfig;
+  private spawnObserver?: SpawnObserver;
 
-  constructor(systemConfig: SystemConfig) {
+  constructor(systemConfig: SystemConfig, options: AdapterFactoryOptions = {}) {
     this.systemConfig = systemConfig;
+    this.spawnObserver = options.spawnObserver;
   }
 
   /**
@@ -75,6 +89,9 @@ export class AdapterFactory {
     backend: BackendType
   ): Promise<ExecutionAdapter> {
     const adapter = createAdapter(backend);
+    if (this.spawnObserver) {
+      adapter.setSpawnObserver?.(this.spawnObserver);
+    }
 
     // Get backend configuration from system config
     const backendConfig = this.systemConfig.backends[backend];
@@ -145,9 +162,10 @@ export class AdapterFactory {
  * Create an AdapterFactory instance
  */
 export function createAdapterFactory(
-  systemConfig: SystemConfig
+  systemConfig: SystemConfig,
+  options: AdapterFactoryOptions = {}
 ): AdapterFactory {
-  return new AdapterFactory(systemConfig);
+  return new AdapterFactory(systemConfig, options);
 }
 
 /**

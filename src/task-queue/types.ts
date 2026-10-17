@@ -103,13 +103,39 @@ export type AuditEventType =
   | 'stage_handoff'
   | 'stage_error'
   | 'agent_completion_signal'
-  | 'circuit_open';
+  | 'circuit_open'
+  // Cost ledger events (envelope v1)
+  | 'llm_spawn' // One per CLI spawn
+  | 'attempt' // Retry / provider-fallback attempt
+  | 'iteration_decision' // Judge verdict with iteration cost
+  | 'delegation'; // CE sub-agent delegation decision
+
+/**
+ * Cost-ledger event types. Excluded from the query_audit agent tool by default.
+ */
+export const LEDGER_EVENT_TYPES = [
+  'llm_spawn',
+  'attempt',
+  'iteration_decision',
+  'delegation',
+] as const satisfies readonly AuditEventType[];
+
+/** Current audit envelope schema version */
+export const AUDIT_SCHEMA_VERSION = 1;
 
 export interface AuditEvent {
   timestamp: string;
   workflowId?: string;
   event: AuditEventType;
   details?: Record<string, unknown>;
+  // Envelope (R13) — present on every event written since schema v1
+  schema_version?: number;
+  /** Unique, time-sortable event ID (ULID) */
+  event_id?: string;
+  /** Run correlation ID (the workflow ID) */
+  run_id?: string;
+  spawn_id?: string;
+  parent_spawn_id?: string;
 }
 
 // ============================================================

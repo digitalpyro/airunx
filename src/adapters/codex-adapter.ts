@@ -13,10 +13,15 @@ import * as path from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { spawnAsync } from '../utils/async-spawn.js';
 import { homedir, platform } from 'os';
-import { BaseCliAdapter, type CliAdapterConfig } from './base-cli-adapter.js';
+import {
+  BaseCliAdapter,
+  type CliAdapterConfig,
+  type ParsedCliOutput,
+} from './base-cli-adapter.js';
 import type {
   ExecutionRequest,
   ExecutionResult,
+  SpawnAuthMode,
 } from '../core/adapter-types.js';
 import { OPENAI_PRICING } from './pricing.js';
 import {
@@ -123,21 +128,13 @@ export class CodexAdapter extends BaseCliAdapter {
    * - item.completed: contains agent text output in item.text
    * Multiple turn.completed events occur per session (one per tool-use round).
    */
-  protected parseOutput(
-    stdout: string,
-    stderr: string
-  ): {
-    outputs: ExecutionResult['outputs'];
-    tokensUsed: number;
-    inputTokens?: number;
-    outputTokens?: number;
-    totalCostUsd?: number;
-  } {
+  protected parseOutput(stdout: string, stderr: string): ParsedCliOutput {
     const lines = stdout.trim().split('\n');
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let agentText = '';
     let parsedAnyEvent = false;
+    let threadId: string | undefined;
 
     for (const line of lines) {
       try {
@@ -149,6 +146,12 @@ export class CodexAdapter extends BaseCliAdapter {
           // Do NOT sum the breakdowns — that would double-count.
           totalInputTokens += event.usage.input_tokens ?? 0;
           totalOutputTokens += event.usage.output_tokens ?? 0;
+        }
+        if (
+          event.type === 'thread.started' &&
+          typeof event.thread_id === 'string'
+        ) {
+          threadId = event.thread_id;
         }
         if (event.type === 'item.completed' && event.item?.text) {
           agentText += event.item.text + '\n';
@@ -176,7 +179,21 @@ export class CodexAdapter extends BaseCliAdapter {
       tokensUsed,
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
+      sessionId: threadId,
     };
+  }
+
+  /**
+   * Codex only receives --model when one is explicitly configured; otherwise
+   * the CLI picks its own default, which we cannot name here.
+   */
+  protected getSpawnModel(request: ExecutionRequest): string | undefined {
+    if (modelOverrideDisabled.has(request)) return undefined;
+    return this.config?.model || request.agent.preferredModel || undefined;
+  }
+
+  protected getAuthMode(): SpawnAuthMode {
+    return this.useSubscriptionAuth ? 'subscription' : 'api_key';
   }
 
   /**

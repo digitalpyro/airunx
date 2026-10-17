@@ -1,20 +1,43 @@
 /**
  * Audit Logger
- * Simple append-only JSON Lines logger for heartbeat events.
+ * Append-only JSON Lines logger for heartbeat, pipeline and cost-ledger events.
  * Provides runtime audit trail for agent actions.
+ *
+ * Every record carries a versioned envelope (schema_version, event_id, run_id,
+ * spawn correlation), is written with one synchronous append to a 0600 file
+ * named for the current UTC day, has secrets redacted from `details`, and is
+ * capped at MAX_AUDIT_RECORD_BYTES.
  */
 
 import {
-  appendFileSync,
-  mkdirSync,
+  closeSync,
   existsSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  writeSync,
 } from 'fs';
-import { dirname, join } from 'path';
-import type { AuditEvent } from '../task-queue/types.js';
+import { join } from 'path';
+import { AUDIT_SCHEMA_VERSION, type AuditEvent } from '../task-queue/types.js';
+import type {
+  ExecutionRequest,
+  SpawnObserver,
+  SpawnRecord,
+} from '../core/adapter-types.js';
+import { isSensitiveKey, redactSecrets } from '../utils/redaction.js';
+import { ulid } from '../utils/ulid.js';
 
 export type { AuditEvent };
+
+/** Hard cap on one serialized record, including the trailing newline */
+export const MAX_AUDIT_RECORD_BYTES = 4096;
+
+/** Longest string value kept intact in details before truncation kicks in */
+const MAX_DETAIL_STRING_CHARS = 256;
+
+const TRUNCATION_SUFFIX = '…[truncated]';
 
 /**
  * Query options for filtering audit events
@@ -22,36 +45,227 @@ export type { AuditEvent };
 export interface AuditQueryOptions {
   workflowId?: string;
   eventTypes?: string[];
+  /** Event types to leave out (applied before the limit) */
+  excludeEventTypes?: readonly string[];
   since?: Date;
   limit?: number;
 }
 
+/**
+ * Query result with integrity stats
+ */
+export interface AuditQueryResult {
+  events: AuditEvent[];
+  /** Lines skipped because they were torn or not valid audit records */
+  skipped: number;
+}
+
+/**
+ * Event fields a caller may set; timestamp and envelope IDs are filled in
+ */
+export type AuditEventInput = Omit<
+  AuditEvent,
+  'timestamp' | 'schema_version' | 'event_id'
+> & { event_id?: string };
+
+/**
+ * Recursively redact sensitive keys and secret-shaped strings
+ */
+function redactValue(value: unknown): unknown {
+  if (typeof value === 'string') return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        isSensitiveKey(k) ? '[redacted]' : redactValue(v),
+      ])
+    );
+  }
+  return value;
+}
+
+/**
+ * Shorten long strings anywhere in a value
+ */
+function shortenStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length > MAX_DETAIL_STRING_CHARS
+      ? value.slice(0, MAX_DETAIL_STRING_CHARS) + TRUNCATION_SUFFIX
+      : value;
+  }
+  if (Array.isArray(value)) return value.map(shortenStrings);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        shortenStrings(v),
+      ])
+    );
+  }
+  return value;
+}
+
+function serializedBytes(entry: AuditEvent): number {
+  return Buffer.byteLength(JSON.stringify(entry) + '\n', 'utf8');
+}
+
+/**
+ * Keep a record under MAX_AUDIT_RECORD_BYTES by truncating `details`.
+ * Step 1 shortens long strings; step 2 replaces details with a bounded
+ * preview. Truncated details carry `_truncated: true` and the original size.
+ */
+function capRecordSize(entry: AuditEvent): AuditEvent {
+  if (serializedBytes(entry) <= MAX_AUDIT_RECORD_BYTES || !entry.details) {
+    return entry;
+  }
+
+  const originalBytes = Buffer.byteLength(
+    JSON.stringify(entry.details),
+    'utf8'
+  );
+  const marker = { _truncated: true, _original_bytes: originalBytes };
+
+  const shortened: AuditEvent = {
+    ...entry,
+    details: {
+      ...(shortenStrings(entry.details) as Record<string, unknown>),
+      ...marker,
+    },
+  };
+  if (serializedBytes(shortened) <= MAX_AUDIT_RECORD_BYTES) {
+    return shortened;
+  }
+
+  // Still too large (many keys / deep nesting): keep a preview of the JSON
+  const fullJson = JSON.stringify(entry.details);
+  let previewChars = Math.min(fullJson.length, MAX_AUDIT_RECORD_BYTES);
+  while (previewChars > 0) {
+    const candidate: AuditEvent = {
+      ...entry,
+      details: {
+        ...marker,
+        preview: fullJson.slice(0, previewChars) + TRUNCATION_SUFFIX,
+      },
+    };
+    if (serializedBytes(candidate) <= MAX_AUDIT_RECORD_BYTES) {
+      return candidate;
+    }
+    previewChars = Math.floor(previewChars * 0.75);
+  }
+  return { ...entry, details: marker };
+}
+
+/**
+ * Convert USD to integer micro-USD (undefined stays undefined)
+ */
+export function toMicroUsd(usd: number | undefined): number | undefined {
+  return usd === undefined || !Number.isFinite(usd)
+    ? undefined
+    : Math.round(usd * 1_000_000);
+}
+
 export class AuditLogger {
   private logDir: string;
-  private logPath: string;
+  /** Paths whose permissions were already tightened in this process */
+  private securedPaths = new Set<string>();
 
   constructor(logDir: string = '.airunx-state/audit') {
     this.logDir = logDir;
-    const date = new Date().toISOString().slice(0, 10);
-    this.logPath = join(logDir, `audit-${date}.jsonl`);
 
-    // Ensure directory exists
-    if (!existsSync(dirname(this.logPath))) {
-      mkdirSync(dirname(this.logPath), { recursive: true });
+    // Ensure directory exists (owner-only when we create it)
+    if (!existsSync(logDir)) {
+      mkdirSync(logDir, { recursive: true, mode: 0o700 });
     }
   }
 
   /**
    * Log an audit event.
-   * Events are appended as JSON Lines for efficient streaming and parsing.
+   * Events are appended as JSON Lines for efficient streaming and parsing:
+   * one synchronous write per record on an append-mode descriptor, to the
+   * file for the current UTC day.
    */
-  log(event: Omit<AuditEvent, 'timestamp'>): void {
-    const entry: AuditEvent = {
+  log(event: AuditEventInput): void {
+    const { event_id, details, ...rest } = event;
+    const entry: AuditEvent = capRecordSize({
       timestamp: new Date().toISOString(),
-      ...event,
-    };
+      schema_version: AUDIT_SCHEMA_VERSION,
+      event_id: event_id ?? ulid(),
+      ...(rest.workflowId && !rest.run_id ? { run_id: rest.workflowId } : {}),
+      ...rest,
+      ...(details !== undefined
+        ? { details: redactValue(details) as Record<string, unknown> }
+        : {}),
+    });
 
-    appendFileSync(this.logPath, JSON.stringify(entry) + '\n');
+    this.appendLine(this.getLogPath(), JSON.stringify(entry) + '\n');
+  }
+
+  /**
+   * Append one line with a single write(2) on an O_APPEND descriptor
+   */
+  private appendLine(path: string, line: string): void {
+    if (!existsSync(this.logDir)) {
+      mkdirSync(this.logDir, { recursive: true, mode: 0o700 });
+    }
+    const buffer = Buffer.from(line, 'utf8');
+    const fd = openSync(path, 'a', 0o600);
+    try {
+      if (!this.securedPaths.has(path)) {
+        // Tighten files created before permissions were enforced
+        try {
+          fchmodSync(fd, 0o600);
+        } catch {
+          // Not our file / unsupported FS — keep writing
+        }
+        this.securedPaths.add(path);
+      }
+      const written = writeSync(fd, buffer, 0, buffer.length);
+      if (written !== buffer.length) {
+        throw new Error(
+          `Short audit write to ${path}: ${written}/${buffer.length} bytes`
+        );
+      }
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /**
+   * Log one CLI spawn into the cost ledger (llm_spawn event)
+   */
+  logLlmSpawn(record: SpawnRecord): void {
+    this.log({
+      event: 'llm_spawn',
+      workflowId: record.workflowId,
+      spawn_id: record.spawnId,
+      ...(record.parentSpawnId
+        ? { parent_spawn_id: record.parentSpawnId }
+        : {}),
+      details: {
+        backend: record.backend,
+        model: record.model,
+        auth_mode: record.authMode,
+        agent_role: record.agentRole,
+        stage: record.stage,
+        iteration: record.iteration,
+        prompt_bytes: record.promptBytes,
+        prompt_sections: record.promptSections,
+        tokens_used: record.tokensUsed,
+        input_tokens: record.inputTokens,
+        output_tokens: record.outputTokens,
+        cost_usd: record.costUsd,
+        cost_micro_usd: toMicroUsd(record.costUsd),
+        started_at: record.startedAt,
+        ended_at: record.endedAt,
+        duration_ms: record.durationMs,
+        exit_reason: record.exitReason,
+        success: record.success,
+        salvaged: record.salvaged,
+        error_category: record.errorCategory,
+        provider_session_id: record.providerSessionId,
+      },
+    });
   }
 
   /**
@@ -229,10 +443,11 @@ export class AuditLogger {
   }
 
   /**
-   * Get the path to the current log file
+   * Get the path to the log file for the current UTC day
    */
   getLogPath(): string {
-    return this.logPath;
+    const date = new Date().toISOString().slice(0, 10);
+    return join(this.logDir, `audit-${date}.jsonl`);
   }
 
   /**
@@ -240,17 +455,20 @@ export class AuditLogger {
    * @param limit Maximum number of events to return
    */
   readRecentEvents(limit: number = 100): AuditEvent[] {
-    if (!existsSync(this.logPath)) {
+    const logPath = this.getLogPath();
+    if (!existsSync(logPath)) {
       return [];
     }
 
-    const content = readFileSync(this.logPath, 'utf-8');
-    const lines = content.trim().split('\n').filter(Boolean);
+    const content = readFileSync(logPath, 'utf-8');
+    const events = content
+      .split('\n')
+      .filter(Boolean)
+      .map(parseAuditLine)
+      .filter((event): event is AuditEvent => event !== null);
 
-    // Get last N lines
-    const recentLines = lines.slice(-limit);
-
-    return recentLines.map((line) => JSON.parse(line) as AuditEvent);
+    // Get last N events
+    return events.slice(-limit);
   }
 
   /**
@@ -273,7 +491,17 @@ export class AuditLogger {
    * Searches across all log files (newest first) to handle queries spanning multiple days.
    */
   async query(options: AuditQueryOptions): Promise<AuditEvent[]> {
+    return (await this.queryWithStats(options)).events;
+  }
+
+  /**
+   * Query audit events and report how many lines were skipped as torn or
+   * malformed. Events with a repeated event_id are returned once.
+   */
+  async queryWithStats(options: AuditQueryOptions): Promise<AuditQueryResult> {
     const results: AuditEvent[] = [];
+    const seenEventIds = new Set<string>();
+    let skipped = 0;
     const logFiles = this.listLogFiles(); // Already sorted newest to oldest
 
     fileLoop: for (const logFile of logFiles) {
@@ -292,36 +520,88 @@ export class AuditLogger {
           break fileLoop;
         }
 
-        try {
-          const event = JSON.parse(line) as AuditEvent;
-
-          // Filter by workflowId if specified
-          if (options.workflowId && event.workflowId !== options.workflowId) {
-            continue;
-          }
-
-          // Filter by since timestamp - if we've gone past the cutoff, stop searching
-          if (options.since && new Date(event.timestamp) < options.since) {
-            break fileLoop;
-          }
-
-          // Filter by eventTypes if specified
-          if (
-            options.eventTypes?.length &&
-            !options.eventTypes.includes(event.event)
-          ) {
-            continue;
-          }
-
-          results.push(event);
-        } catch {
-          // Skip malformed lines
+        const event = parseAuditLine(line);
+        if (!event) {
+          skipped++;
+          continue;
         }
+
+        // Filter by workflowId if specified
+        if (options.workflowId && event.workflowId !== options.workflowId) {
+          continue;
+        }
+
+        // Filter by since timestamp - if we've gone past the cutoff, stop searching
+        if (options.since && new Date(event.timestamp) < options.since) {
+          break fileLoop;
+        }
+
+        // Filter by eventTypes if specified
+        if (
+          options.eventTypes?.length &&
+          !options.eventTypes.includes(event.event)
+        ) {
+          continue;
+        }
+
+        if (options.excludeEventTypes?.includes(event.event)) {
+          continue;
+        }
+
+        // Dedupe by event_id (legacy events without one are kept)
+        if (event.event_id) {
+          if (seenEventIds.has(event.event_id)) continue;
+          seenEventIds.add(event.event_id);
+        }
+
+        results.push(event);
       }
     }
 
-    return results;
+    return { events: results, skipped };
   }
+}
+
+/**
+ * Parse one JSONL line; null for torn, malformed or non-event lines
+ */
+function parseAuditLine(line: string): AuditEvent | null {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as AuditEvent).event === 'string' &&
+      typeof (parsed as AuditEvent).timestamp === 'string'
+    ) {
+      return parsed as AuditEvent;
+    }
+  } catch {
+    // Torn or malformed line
+  }
+  return null;
+}
+
+/**
+ * SpawnObserver that writes each spawn to the audit ledger as `llm_spawn`.
+ * Routing is purely on the request's spawnContext (carried in the record),
+ * so one observer serves every runner sharing an adapter factory.
+ * Write failures are swallowed — the ledger must never break a run.
+ */
+export function createAuditSpawnObserver(
+  auditLogger: AuditLogger,
+  onError?: (error: unknown) => void
+): SpawnObserver {
+  return {
+    onSpawnComplete(record: SpawnRecord, _request: ExecutionRequest): void {
+      try {
+        auditLogger.logLlmSpawn(record);
+      } catch (error) {
+        onError?.(error);
+      }
+    },
+  };
 }
 
 /**

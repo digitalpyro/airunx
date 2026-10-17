@@ -3,7 +3,7 @@
  * Decides whether to iterate or proceed based on quality checks
  */
 
-import type { ExecutionAdapter } from '../core/adapter-types.js';
+import type { ExecutionAdapter, SpawnContext } from '../core/adapter-types.js';
 import type {
   FidelityParameters,
   ExecutionFidelityLevel,
@@ -65,6 +65,8 @@ export interface JudgeContext {
   issueCheckboxes?: string[];
   /** Pre-judge test output — if tests failed in the worktree, this contains the failure output */
   preJudgeTestOutput?: string;
+  /** Ledger attribution for the judge spawn (forwarded to the invoker) */
+  spawnContext?: SpawnContext;
 }
 
 /**
@@ -197,6 +199,7 @@ export class JudgeAgent {
         projectContext: {
           workingDirectory: context.workingDirectory,
         },
+        ...(context.spawnContext ? { spawnContext: context.spawnContext } : {}),
       });
 
       // Create parser with context-aware options

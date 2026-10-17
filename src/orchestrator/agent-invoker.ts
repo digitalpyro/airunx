@@ -13,6 +13,7 @@ import {
   type AgentDef,
   type ProjectContext,
   type BackendType,
+  type SpawnContext,
 } from '../core/adapter-types.js';
 import type {
   AgentRole,
@@ -52,6 +53,8 @@ export interface AgentExecutionContext {
   projectContext: ProjectContext;
   previousOutputs?: Record<string, unknown>;
   systemPrompt?: string;
+  /** Ledger attribution forwarded onto every spawn of this execution */
+  spawnContext?: SpawnContext;
 }
 
 /**
@@ -299,6 +302,7 @@ export class AgentInvoker {
           ? FIDELITY_CLI_TIMEOUT[this.fidelityLevel]
           : undefined,
       },
+      ...(context.spawnContext ? { spawnContext: context.spawnContext } : {}),
     };
 
     // Execute with retry logic

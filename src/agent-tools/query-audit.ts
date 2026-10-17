@@ -5,7 +5,7 @@
  */
 
 import { z } from 'zod';
-import type { AgentContext } from '../task-queue/types.js';
+import { LEDGER_EVENT_TYPES, type AgentContext } from '../task-queue/types.js';
 import type { AuditEvent } from '../audit/audit-logger.js';
 import { isSensitiveKey } from '../utils/redaction.js';
 
@@ -56,10 +56,17 @@ export const queryAuditTool = {
   ): Promise<AuditEvent[]> => {
     const params = QueryAuditParamsSchema.parse(rawParams);
 
+    // Cost-ledger events are excluded unless explicitly requested by type
+    const requested = new Set(params.eventTypes ?? []);
+    const excludeEventTypes = LEDGER_EVENT_TYPES.filter(
+      (type) => !requested.has(type)
+    );
+
     // Security: Force current workflow only - agents cannot query other workflows
     const events = await context.auditLogger.query({
       workflowId: context.workflowId,
       eventTypes: params.eventTypes,
+      excludeEventTypes,
       since: params.since ? new Date(params.since) : undefined,
       limit: params.limit,
     });

@@ -191,7 +191,8 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
 
       const subAgentResults = await this.executeSubAgents(
         request,
-        mainResult.outputs.analysis || ''
+        mainResult.outputs.analysis || '',
+        mainResult.spawnId
       );
 
       // Synthesize results
@@ -273,7 +274,8 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
    */
   private async executeSubAgents(
     parentRequest: ExecutionRequest,
-    parentAnalysis: string
+    parentAnalysis: string,
+    parentSpawnId?: string
   ): Promise<SubAgentResult[]> {
     const results: SubAgentResult[] = [];
 
@@ -328,7 +330,12 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
 
     // Execute sub-agents in parallel for efficiency
     const promises = agentsToRun.map((agentType) =>
-      this.executeSubAgent(agentType, parentRequest, parentAnalysis)
+      this.executeSubAgent(
+        agentType,
+        parentRequest,
+        parentAnalysis,
+        parentSpawnId
+      )
     );
 
     const settled = await Promise.allSettled(promises);
@@ -359,7 +366,8 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
   private async executeSubAgent(
     agentType: SubAgentType,
     parentRequest: ExecutionRequest,
-    parentAnalysis: string
+    parentAnalysis: string,
+    parentSpawnId?: string
   ): Promise<SubAgentResult> {
     const subAgentTask = this.buildSubAgentTask(
       agentType,
@@ -380,6 +388,15 @@ export class CompoundEngineeringAdapter extends ClaudeCodeAdapter {
       task: subAgentTask,
       context: parentRequest.context,
       fidelityParams: parentRequest.fidelityParams,
+      // Inherit the parent's attribution; link back to the delegating spawn
+      ...(parentRequest.spawnContext
+        ? {
+            spawnContext: {
+              ...parentRequest.spawnContext,
+              ...(parentSpawnId ? { parentSpawnId } : {}),
+            },
+          }
+        : {}),
     };
 
     try {
@@ -533,6 +550,7 @@ ${failedResults.length > 0 ? `\n## Sub-Agent Failures\n${failedResults.map((r) =
         ...mainResult.errors,
         ...failedResults.map((r) => new Error(`${r.agent}: ${r.error}`)),
       ],
+      spawnId: mainResult.spawnId,
     };
   }
 

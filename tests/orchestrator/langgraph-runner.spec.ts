@@ -961,4 +961,115 @@ describe('LangGraph Runner', () => {
       // the skipCondition pattern matching works correctly.
     });
   });
+
+  describe('Stage audit events', () => {
+    const mockState = (): void => {
+      vi.spyOn(stateManager, 'update').mockResolvedValue(testContext);
+      vi.spyOn(stateManager, 'updateStatus').mockResolvedValue();
+      vi.spyOn(stateManager, 'updateCurrentStage').mockResolvedValue();
+      vi.spyOn(stateManager, 'updateMetrics').mockResolvedValue();
+      vi.spyOn(stateManager, 'save').mockResolvedValue();
+      vi.spyOn(stateManager, 'load').mockResolvedValue(testContext);
+    };
+
+    const recordAuditCalls = (runner: LangGraphRunner): string[] => {
+      const calls: string[] = [];
+      const audit = (runner as unknown as {
+        auditLogger: Record<string, ReturnType<typeof vi.fn>>;
+      }).auditLogger;
+      audit.logStageStart.mockImplementation((_id: string, stage: string) =>
+        calls.push(`start:${stage}`)
+      );
+      audit.logStageComplete.mockImplementation((_id: string, stage: string) =>
+        calls.push(`complete:${stage}`)
+      );
+      audit.logStageError.mockImplementation((_id: string, stage: string) =>
+        calls.push(`error:${stage}`)
+      );
+      return calls;
+    };
+
+    it('emits stage_start before stage_complete for each stage', async () => {
+      mockState();
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        testPipeline,
+        testContext
+      );
+      const calls = recordAuditCalls(runner);
+
+      await runner.execute();
+
+      expect(calls).toEqual([
+        'start:orchestrator',
+        'complete:orchestrator',
+        'start:developer',
+        'complete:developer',
+      ]);
+    });
+
+    it('passes stage and iteration as spawnContext to the adapter', async () => {
+      mockState();
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        testPipeline,
+        testContext
+      );
+
+      await runner.execute();
+
+      const requests = vi.mocked(mockAdapter.execute).mock.calls.map(
+        (call) => call[0]
+      );
+      expect(requests.map((r) => r.spawnContext)).toEqual([
+        { workflowId: 'test-workflow-123', stage: 'orchestrator', iteration: 1 },
+        { workflowId: 'test-workflow-123', stage: 'developer', iteration: 1 },
+      ]);
+    });
+
+    it('emits stage_error when a stage fails', async () => {
+      mockState();
+      vi.mocked(mockAdapter.execute).mockResolvedValue({
+        success: false,
+        outputs: {},
+        metrics: { tokensUsed: 0, duration: 10 },
+        errors: [new Error('backend exploded')],
+      } as ExecutionResult);
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        { ...testPipeline, stages: [testPipeline.stages[0]] },
+        testContext
+      );
+      const calls = recordAuditCalls(runner);
+
+      await runner.execute();
+
+      expect(calls).toEqual([
+        'start:orchestrator',
+        'error:orchestrator',
+        'complete:orchestrator',
+      ]);
+    });
+
+    it('emits stage_error when a stage throws', async () => {
+      mockState();
+      vi.spyOn(stateManager, 'updateCurrentStage').mockRejectedValue(
+        new Error('state store unavailable')
+      );
+      const runner = new LangGraphRunner(
+        mockAdapter,
+        stateManager,
+        { ...testPipeline, stages: [testPipeline.stages[0]] },
+        testContext
+      );
+      const calls = recordAuditCalls(runner);
+
+      await expect(runner.execute()).rejects.toThrow('state store unavailable');
+
+      expect(calls).toEqual(['error:orchestrator']);
+    });
+  });
 });

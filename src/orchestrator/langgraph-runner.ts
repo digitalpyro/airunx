@@ -27,6 +27,7 @@ import {
   type ExecutionAdapter,
   type ExecutionResult,
   type ProjectContext,
+  type SpawnContext,
 } from '../core/adapter-types.js';
 import {
   selectAdapterForRole,
@@ -135,6 +136,8 @@ export class LangGraphRunner {
   private auditLogger?: AuditLogger;
   /** Workflow start time for incremental report writing */
   private workflowStartTime = 0;
+  /** 0-indexed iteration count, kept in step with the judge's iterations */
+  private currentIteration = 0;
 
   constructor(
     adapter: ExecutionAdapter,
@@ -196,6 +199,35 @@ export class LangGraphRunner {
     }
 
     this.iterationManager = new IterationManager(this.stateManager);
+    this.currentIteration = this.workflowContext.iterationCount ?? 0;
+  }
+
+  /**
+   * Ledger attribution for spawns made by a stage (iteration is 1-indexed,
+   * matching iteration history)
+   */
+  private buildSpawnContext(workflowId: string, stage: string): SpawnContext {
+    return { workflowId, stage, iteration: this.currentIteration + 1 };
+  }
+
+  /**
+   * Run a stage node, emitting stage_error if it throws
+   */
+  private async runStageNode(
+    workflowId: string,
+    stageName: string,
+    node: () => Promise<Partial<GraphState>>
+  ): Promise<Partial<GraphState>> {
+    try {
+      return await node();
+    } catch (error) {
+      this.auditLogger?.logStageError(
+        workflowId,
+        stageName,
+        toError(error).name
+      );
+      throw error;
+    }
   }
 
   /**
@@ -246,12 +278,16 @@ export class LangGraphRunner {
       if (stage.name === 'judge') {
         // Judge node has special handling
         graph.addNode(stage.name, async (state: GraphState) => {
-          return await this.executeJudgeNode(state, stage.name);
+          return await this.runStageNode(state.workflowId, stage.name, () =>
+            this.executeJudgeNode(state, stage.name)
+          );
         });
       } else {
         // Regular agent node
         graph.addNode(stage.name, async (state: GraphState) => {
-          return await this.executeAgentNode(state, stage.name);
+          return await this.runStageNode(state.workflowId, stage.name, () =>
+            this.executeAgentNode(state, stage.name)
+          );
         });
       }
     }
@@ -629,6 +665,7 @@ export class LangGraphRunner {
     // Capture timing for performance visibility
     const stageStart = performance.now();
     const stageStartIso = new Date().toISOString();
+    this.auditLogger?.logStageStart(state.workflowId, stageName);
 
     // Verbose: Log stage start
     if (this.verbose) {
@@ -663,7 +700,16 @@ export class LangGraphRunner {
       task,
       projectContext,
       previousOutputs: state.stageOutputs,
+      spawnContext: this.buildSpawnContext(state.workflowId, stageName),
     });
+
+    if (!result.success) {
+      this.auditLogger?.logStageError(
+        state.workflowId,
+        stageName,
+        result.errors[0]?.name ?? 'StageFailed'
+      );
+    }
 
     const stageDuration = performance.now() - stageStart;
     const stageSpawnCount = result.metrics.spawnCount ?? 1;
@@ -843,6 +889,7 @@ export class LangGraphRunner {
     // Capture timing for performance visibility
     const stageStart = performance.now();
     const stageStartIso = new Date().toISOString();
+    this.auditLogger?.logStageStart(state.workflowId, stageName);
 
     // Find stage configuration
     const stage = this.pipeline.stages.find((s) => s.name === stageName);
@@ -960,6 +1007,7 @@ export class LangGraphRunner {
     }
     const currentIteration = context.iterationCount ?? 0;
     const maxIterations = context.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.currentIteration = currentIteration;
 
     // Extract checkbox items from the task description (issue body) for the judge to evaluate
     // context.input is the short parsed title; context.taskDescription has the full issue body
@@ -1019,6 +1067,7 @@ export class LangGraphRunner {
       workingDirectory: this.workflowContext.worktreePath || process.cwd(),
       fidelityLevel: fidelityResolution.level,
       preJudgeTestOutput,
+      spawnContext: this.buildSpawnContext(state.workflowId, stageName),
       issueCheckboxes:
         issueCheckboxes && issueCheckboxes.length > 0
           ? issueCheckboxes
@@ -1096,10 +1145,13 @@ export class LangGraphRunner {
       }
 
       // Start iteration - use evaluatesStage validated at function start
-      await this.iterationManager.startIteration(
+      const nextIteration = await this.iterationManager.startIteration(
         state.workflowId,
         evaluatesStage
       );
+      if (typeof nextIteration === 'number') {
+        this.currentIteration = nextIteration;
+      }
       shouldIterate = true;
       iterationTarget = evaluatesStage;
     } else {
@@ -1210,6 +1262,18 @@ export class LangGraphRunner {
 
       return context;
     });
+
+    this.auditLogger?.logStageComplete(
+      state.workflowId,
+      stageName,
+      stageDuration,
+      {
+        tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
+        costUsd: judgeResult.metrics?.cost ?? 0,
+        agent: 'code-judge',
+        spawnCount: judgeStageRecord.spawnCount,
+      }
+    );
 
     return {
       currentStage: stageName,
