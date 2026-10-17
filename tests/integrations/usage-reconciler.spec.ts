@@ -18,6 +18,7 @@ import {
   type FetchLike,
   type ReconcileReport,
   type ReconcileRow,
+  ANTHROPIC_DEFAULT_WORKSPACE,
 } from '../../src/integrations/usage-reconciler.js';
 import { reconcileCommand } from '../../src/cli/commands/costs.js';
 import type { AuditEvent } from '../../src/task-queue/types.js';
@@ -393,9 +394,7 @@ describe('reconcileUsage', () => {
         expect(url.searchParams.get('start_time')).toBe(
           String(Date.parse(`${DAY}T00:00:00Z`) / 1000)
         );
-        expect(url.searchParams.getAll('project_ids[]')).toEqual([
-          'proj_airunx',
-        ]);
+        expect(url.searchParams.getAll('project_ids')).toEqual(['proj_airunx']);
         return json(openaiPage([{ day: DAY, values: [1.5] }]));
       },
     });
@@ -464,6 +463,55 @@ describe('reconcileUsage', () => {
     expect(a.driftPct).toBe(100);
     expect(a.band.totalMicroUsd).toBe(1_000_000);
     expect(a.status).toBe('ok');
+  });
+
+  it('scopes to the default workspace (null workspace_id) via "default"', async () => {
+    writeAudit([spawn({ micro: 1_000_000, start: `${DAY}T10:00:00Z` })]);
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: () =>
+          json(
+            anthropicPage([
+              {
+                day: DAY,
+                amounts: [
+                  ['100', null],
+                  ['999', 'wrkspc_other'],
+                ],
+              },
+            ])
+          ),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: ANTHROPIC_DEFAULT_WORKSPACE,
+    });
+    const a = row(report, 'anthropic', DAY);
+    expect(a.providerMicroUsd).toBe(1_000_000);
+    expect(a.status).toBe('ok');
+  });
+
+  it('flags a day the provider returned no bucket for', async () => {
+    writeAudit([spawn({ micro: 1_000_000, start: `${DAY}T10:00:00Z` })]);
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { OPENAI_ADMIN_KEY: OPENAI_KEY },
+      fetchImpl: mockFetch({
+        openai: (url) => {
+          expect(url.searchParams.getAll('group_by')).toEqual(['project_id']);
+          expect(url.searchParams.has('group_by[]')).toBe(false);
+          return json(openaiPage([]));
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+      openaiProject: 'proj_airunx',
+    });
+    const o = row(report, 'openai', DAY);
+    expect(o.providerMicroUsd).toBe(0);
+    expect(o.notes.join(' ')).toContain('no bucket');
   });
 
   it('sums every page and enforces the page cap', async () => {
@@ -672,7 +720,7 @@ describe('reconcileUsage', () => {
   it('reads scopes from the environment and validates them', async () => {
     const fetchImpl = mockFetch({
       openai: (url) => {
-        expect(url.searchParams.getAll('project_ids[]')).toEqual(['proj_env']);
+        expect(url.searchParams.getAll('project_ids')).toEqual(['proj_env']);
         return json(openaiPage([]));
       },
     });

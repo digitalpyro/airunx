@@ -233,7 +233,7 @@ export function registerCostsCommands(program: Command): Command {
     .option('--days <n>', 'Number of days ending at --date (1-31)', parseDays)
     .option(
       '--anthropic-workspace <id>',
-      'Restrict Anthropic totals to this workspace (env AIRUNX_ANTHROPIC_WORKSPACE_ID)'
+      'Restrict Anthropic totals to this workspace; "default" selects the default workspace (env AIRUNX_ANTHROPIC_WORKSPACE_ID)'
     )
     .option(
       '--openai-project <id>',

@@ -86,6 +86,9 @@ export const SCOPE_ENV: Record<ReconcileProvider, string> = {
 };
 
 const SCOPE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** Scope value that selects Anthropic's default workspace (`workspace_id: null`). */
+export const ANTHROPIC_DEFAULT_WORKSPACE = 'default';
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 // ─── Money ──────────────────────────────────────────────────────────────
@@ -555,10 +558,9 @@ export function fetchAnthropicCosts(
       return ms === undefined ? undefined : utcDay(ms);
     },
     (result) => {
-      if (
-        options.scopeId !== undefined &&
-        result.workspace_id !== options.scopeId
-      ) {
+      // The default workspace reports `workspace_id: null`.
+      const workspaceId = result.workspace_id ?? ANTHROPIC_DEFAULT_WORKSPACE;
+      if (options.scopeId !== undefined && workspaceId !== options.scopeId) {
         return 0;
       }
       if (
@@ -577,7 +579,7 @@ export function fetchAnthropicCosts(
 /**
  * OpenAI `organization/costs`: `data[].start_time` (unix seconds) buckets
  * with `results[].amount.value` in dollars and `amount.currency` "usd";
- * filtered server-side by `project_ids[]` and re-checked per result.
+ * filtered server-side by `project_ids` and re-checked per result.
  */
 export function fetchOpenAiCosts(
   options: ProviderFetchOptions
@@ -589,9 +591,10 @@ export function fetchOpenAiCosts(
     url.searchParams.set('end_time', String(Math.floor(endMs / 1000)));
     url.searchParams.set('bucket_width', '1d');
     url.searchParams.set('limit', String(options.windowDays.length));
-    url.searchParams.append('group_by[]', 'project_id');
+    // OpenAPI form-explode arrays: repeated keys without brackets.
+    url.searchParams.append('group_by', 'project_id');
     if (options.scopeId !== undefined) {
-      url.searchParams.append('project_ids[]', options.scopeId);
+      url.searchParams.append('project_ids', options.scopeId);
     }
     if (page) url.searchParams.set('page', page);
     return url;
@@ -825,6 +828,9 @@ export async function reconcileUsage(
         notes.push('org-wide provider total');
       } else {
         status = comparison.withinTolerance ? 'ok' : 'drift';
+      }
+      if (providerMicro !== null && !costs?.byDay.has(date)) {
+        notes.push('provider returned no bucket for this day (counted as $0)');
       }
       if (day.missingCostSpawns > 0) {
         notes.push(
