@@ -410,6 +410,11 @@ describe.skipIf(process.platform === 'win32')(
       expect(Date.now() - started).toBeLessThan(5_000);
       expect(await waitFor(() => !isAlive(pid))).toBe(true);
       expect(logLines().filter((l) => l === 'run SIGTERM')).toHaveLength(1);
+      // Live QA: the interrupted task was both failed and released (ending up
+      // pending + failed) and the release crashed on a cleared currentTask
+      expect(queue.failTask).not.toHaveBeenCalled();
+      expect(queue.releaseTask).toHaveBeenCalledTimes(1);
+      expect(queue.releaseTask).toHaveBeenCalledWith(task.id);
     });
 
     it('stop() twice: run receives exactly one SIGTERM', async () => {

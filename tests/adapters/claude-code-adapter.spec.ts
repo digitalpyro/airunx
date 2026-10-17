@@ -243,6 +243,11 @@ describe('ClaudeCodeAdapter cost provenance and normalized tokens', () => {
     expect(record.derivedCostUsd).toBeGreaterThan(0);
     expect(record.pricingVersion).toBe(PRICING_VERSION);
     expect(record.costBasis).toEqual({ 'claude-sonnet-5-5': 'api' });
+    // Served models come from modelUsage, not the configured model
+    expect(record.responseModels).toEqual([
+      'claude-haiku-5-5',
+      'claude-sonnet-5-5',
+    ]);
     expect(record.providerUsage).toMatchObject({
       total_cost_usd: 0.4321,
       'usage.input_tokens': 100,

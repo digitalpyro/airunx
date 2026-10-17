@@ -164,6 +164,10 @@ export class HeartbeatRunner {
     logger.info('Stopping heartbeat...');
     this.isRunning = false;
 
+    // Capture before awaiting: the cycle clears these when the child exits
+    const task = this.currentTask;
+    const workflowId = this.currentWorkflowId;
+
     // Terminate the running child (SIGTERM → grace → group SIGKILL) and
     // wait for it, so its final run report is on disk before we release
     if (this.currentChild) {
@@ -172,16 +176,18 @@ export class HeartbeatRunner {
       this.currentChild = null;
     }
 
-    // Release current task if any
-    if (this.currentTask && this.taskQueue) {
+    // Release the interrupted task back to pending, unless the cycle already
+    // reported it (a run that finished just as the stop arrived)
+    if (task && this.taskQueue && this.currentTask === task) {
+      this.currentTask = null;
+      this.currentWorkflowId = null;
       try {
-        await this.taskQueue.releaseTask(this.currentTask.id);
+        await this.taskQueue.releaseTask(task.id);
         this.auditLogger.logTaskReleased(
-          this.currentWorkflowId ?? 'shutdown',
-          this.currentTask.id,
+          workflowId ?? 'shutdown',
+          task.id,
           'graceful_shutdown'
         );
-        this.currentWorkflowId = null;
       } catch (error) {
         logger.warn('Failed to release task during shutdown:', error);
       }
@@ -261,6 +267,15 @@ export class HeartbeatRunner {
 
       // Stop heartbeat updates
       this.stopHeartbeatUpdates();
+
+      // A stop interrupted this run: stop() releases the task back to
+      // pending, so don't also mark it failed
+      if (this.stopPromise && result.status !== 'completed') {
+        logger.info(
+          `Task #${task.id} interrupted by heartbeat stop; leaving release to shutdown`
+        );
+        return { action: 'wait' };
+      }
 
       // Report result
       if (result.status === 'completed') {

@@ -350,7 +350,7 @@ describe('Agent Invoker', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.outputs.analysis).toContain('failed after 1 attempts');
+      expect(result.outputs.analysis).toContain('failed after 1 attempt(s)');
       expect(result.errors?.[0].message).toBe('Complete failure');
     });
   });

@@ -159,6 +159,8 @@ interface SpawnCostAccounting {
   unmodeledModifiers: string[];
   providerUsage?: Record<string, number>;
   costBasis?: Record<string, string>;
+  /** Models the CLI reported serving, most output first */
+  responseModels?: string[];
 }
 
 /**
@@ -212,6 +214,20 @@ export interface ProcessError extends Error, SpawnTiming {
   signal?: string | null;
   stdout?: string;
   stderr?: string;
+}
+
+/**
+ * Models the CLI reported serving, most output tokens first; undefined when
+ * it reported no per-model usage
+ */
+function servedModels(
+  usageByModel: Record<string, NormalizedTokenUsage> | undefined
+): string[] | undefined {
+  const entries = Object.entries(usageByModel ?? {});
+  if (entries.length === 0) return undefined;
+  return entries
+    .sort(([, a], [, b]) => b.outputTokens - a.outputTokens)
+    .map(([model]) => model);
 }
 
 export abstract class BaseCliAdapter extends BaseAdapter {
@@ -670,6 +686,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         estimationMethods: outcome.cost?.estimationMethods ?? [],
         providerUsage: outcome.cost?.providerUsage,
         costBasis: outcome.cost?.costBasis,
+        responseModels: outcome.cost?.responseModels,
         semconvVersion: GENAI_SEMCONV_VERSION,
         spendLostUsd: outcome.spendLostUsd,
         spendSalvagedUsd: outcome.spendSalvagedUsd,
@@ -1130,6 +1147,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       unmodeledModifiers: parsed.unmodeledModifiers ?? [],
       providerUsage: parsed.providerUsage,
       costBasis: parsed.costBasis,
+      responseModels: servedModels(parsed.usageByModel),
     };
   }
 

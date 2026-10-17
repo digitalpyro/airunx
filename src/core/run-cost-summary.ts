@@ -302,6 +302,9 @@ function computeDrivers(
     if (e.event !== 'attempt') continue;
     const d = e.details ?? {};
     if (d.outcome !== 'failure') continue;
+    // A spawn interrupted by run shutdown is never retried: its spend is a
+    // killed-spawn loss, not retry waste
+    if (d.error_category === 'SpawnInterruptedError') continue;
     if (e.spawn_id) {
       failedSpawnIds.add(e.spawn_id);
       continue;
@@ -325,11 +328,17 @@ function computeDrivers(
     count: retryCount,
   });
 
-  // Killed-spawn losses: kill-time estimates + report-only killed stages
+  // Killed-spawn losses: kill-time estimates, signal-killed spawns whose CLI
+  // still reported its spend, and report-only killed stages
   let lostMicro = reportOnlyKilled.microUsd;
   let lostCount = reportOnlyKilled.count;
   for (const e of spawns) {
-    const lost = microFrom(e.details ?? {}, 'spend_lost_micro_usd');
+    const d = e.details ?? {};
+    const lost =
+      microFrom(d, 'spend_lost_micro_usd') ??
+      (d.exit_reason === 'signal'
+        ? microFrom(d, 'cost_micro_usd', 'cost_usd')
+        : undefined);
     if (lost === undefined) continue;
     lostMicro += lost;
     lostCount++;

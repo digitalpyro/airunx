@@ -302,6 +302,11 @@ export interface SpawnRecord {
   providerUsage?: Record<string, number>;
   /** Claude Code modelUsage[*].costBasis, keyed by model */
   costBasis?: Record<string, string>;
+  /**
+   * Models the provider reported serving (sub-agents included), most output
+   * first; can differ from `model`, the requested model or alias
+   */
+  responseModels?: string[];
   /** OTel GenAI semconv version the token fields map to */
   semconvVersion?: string;
   /** Kill-time estimate (USD) for a spawn that ended without cost JSON */

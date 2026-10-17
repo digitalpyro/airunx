@@ -89,3 +89,56 @@ describe('retry_waste driver', () => {
     expect(retryWaste(events)).toMatchObject({ microUsd: 25_000, count: 1 });
   });
 });
+
+describe('killed_spawn_losses driver', () => {
+  const drivers = (events: AuditEvent[]) =>
+    summarizeRunCosts({ workflowId: WF, events }).drivers;
+
+  // Live QA: a heartbeat stop interrupted Claude, which still reported its
+  // spend; it was listed as retry waste although no retry ran
+  it('counts a shutdown-interrupted spawn with reported spend as a kill loss, not retry waste', () => {
+    const events = [
+      event('llm_spawn', 'spawn-killed', {
+        stage: 'strategize',
+        cost_micro_usd: 300_409,
+        cost_provenance: 'reported',
+        billing_basis: 'api_equivalent',
+        exit_reason: 'signal',
+        success: false,
+      }),
+      event('attempt', 'spawn-killed', {
+        outcome: 'failure',
+        error_category: 'SpawnInterruptedError',
+        cost_micro_usd: 300_409,
+      }),
+    ];
+    const result = drivers(events);
+    expect(result.find((d) => d.kind === 'retry_waste')).toBeUndefined();
+    expect(result.find((d) => d.kind === 'killed_spawn_losses')).toMatchObject({
+      microUsd: 300_409,
+      count: 1,
+    });
+  });
+
+  it('counts a kill-time estimate once, under kill losses only', () => {
+    const events = [
+      event('llm_spawn', 'spawn-est', {
+        stage: 'review',
+        cost_micro_usd: 120_931,
+        spend_lost_micro_usd: 120_931,
+        cost_provenance: 'estimated',
+        billing_basis: 'api_equivalent',
+        exit_reason: 'signal',
+        success: false,
+      }),
+      event('attempt', 'spawn-est', {
+        outcome: 'failure',
+        error_category: 'SpawnInterruptedError',
+        cost_micro_usd: 120_931,
+      }),
+    ];
+    const result = drivers(events);
+    expect(result.map((d) => d.kind)).toEqual(['killed_spawn_losses']);
+    expect(result[0]).toMatchObject({ microUsd: 120_931, count: 1 });
+  });
+});
