@@ -99,14 +99,15 @@ describe('CodexAdapter', () => {
 
       const args = adapter.testBuildCliArgs(request, 'test prompt');
 
-      // Default approval_mode is 'auto', which adds '--approve-for-me'
+      // Default approval_mode is 'auto', which adds '--sandbox workspace-write'
       // No --model flag when no explicit model override — let CLI use its own default
       expect(args).toEqual([
         'exec',
         '-C',
         '/test/path',
         '--json',
-        '--approve-for-me',
+        '--sandbox',
+        'workspace-write',
         '--',
         'test prompt',
       ]);
@@ -118,7 +119,7 @@ describe('CodexAdapter', () => {
       expect(args).not.toContain('--full-auto');
     });
 
-    it('should not combine --approve-for-me with --sandbox in pipeline mode', () => {
+    it('should pass --sandbox only once in pipeline mode', () => {
       const request = createMockRequest({
         context: {
           workingDirectory: '/test/path',
@@ -128,8 +129,8 @@ describe('CodexAdapter', () => {
 
       const args = adapter.testBuildCliArgs(request, 'test prompt');
 
-      expect(args).toContain('--approve-for-me');
-      expect(args).not.toContain('--sandbox');
+      expect(args.filter((arg) => arg === '--sandbox')).toHaveLength(1);
+      expect(args[args.indexOf('--sandbox') + 1]).toBe('workspace-write');
     });
 
     it('should handle relative paths by normalizing to absolute', () => {
