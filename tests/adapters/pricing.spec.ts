@@ -6,8 +6,17 @@ import {
   OPENAI_PRICING,
   ANTHROPIC_PRICING,
   MODEL_ALIASES,
+  ANTHROPIC_CACHE_PRICING,
+  OPENAI_CACHE_PRICING,
+  PRICING_VERSION,
+  bucketsFromUsage,
+  calculateCacheAwareCost,
+  computePricingVersion,
+  getCacheRates,
+  resetPricingWarnings,
 } from '../../src/adapters/pricing.js';
 import type { ModelPricing } from '../../src/adapters/pricing.js';
+import { Logger } from '../../src/utils/logger.js';
 
 describe('Pricing', () => {
   describe('resolveModelAlias', () => {
@@ -262,5 +271,164 @@ describe('Pricing', () => {
         expect(pricing.output, `${model} output`).toBeGreaterThan(0);
       }
     });
+  });
+});
+
+describe('cache-aware pricing', () => {
+  it('sets per-model Anthropic cache rates (reads vary, writes 1.25x/2x)', () => {
+    expect(ANTHROPIC_CACHE_PRICING['claude-sonnet-5-5']).toEqual({
+      cacheRead: 0.2,
+      cacheWrite5m: 2.5,
+      cacheWrite1h: 4,
+    });
+    // Newer models discount reads more deeply
+    expect(ANTHROPIC_CACHE_PRICING['claude-opus-5-5'].cacheRead).toBe(0.2);
+    expect(ANTHROPIC_CACHE_PRICING['claude-fable-5-1'].cacheRead).toBe(0.25);
+    expect(ANTHROPIC_CACHE_PRICING['claude-fable-5'].cacheRead).toBe(1);
+  });
+
+  it('sets per-model OpenAI cached-input rates without a write surcharge', () => {
+    expect(OPENAI_CACHE_PRICING['gpt-5.6-terra']).toEqual({
+      cacheRead: 0.2,
+      cacheWrite5m: 2,
+      cacheWrite1h: 2,
+    });
+    expect(OPENAI_CACHE_PRICING['gpt-4o'].cacheRead).toBe(2.5);
+  });
+
+  it('has cache rates only for priced models', () => {
+    for (const model of Object.keys(ANTHROPIC_CACHE_PRICING)) {
+      expect(ANTHROPIC_PRICING[model]).toBeDefined();
+    }
+    for (const model of Object.keys(OPENAI_CACHE_PRICING)) {
+      expect(OPENAI_PRICING[model]).toBeDefined();
+    }
+  });
+
+  it('resolves cache rates via aliases and the default model', () => {
+    expect(getCacheRates('sonnet', ANTHROPIC_CACHE_PRICING, 'opus')).toBe(
+      ANTHROPIC_CACHE_PRICING['claude-sonnet-5-5']
+    );
+    expect(getCacheRates('unknown', ANTHROPIC_CACHE_PRICING, 'opus')).toBe(
+      ANTHROPIC_CACHE_PRICING['claude-opus-5-5']
+    );
+    expect(getCacheRates('x', undefined, 'opus')).toBeUndefined();
+  });
+
+  it('splits inclusive usage into disjoint buckets', () => {
+    const buckets = bucketsFromUsage({
+      inputTokens: 1_000 + 20_000 + 3_000 + 4_000,
+      outputTokens: 500,
+      cacheReadInputTokens: 20_000,
+      cacheWriteInputTokens: 7_000,
+      cacheWrite5mInputTokens: 3_000,
+      cacheWrite1hInputTokens: 4_000,
+    });
+    expect(buckets).toEqual({
+      uncachedInput: 1_000,
+      cacheRead: 20_000,
+      cacheWrite5m: 3_000,
+      cacheWrite1h: 4_000,
+      output: 500,
+    });
+  });
+
+  it('prices unsplit cache writes at the 5-minute tier', () => {
+    const buckets = bucketsFromUsage({
+      inputTokens: 100,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 60,
+    });
+    expect(buckets.cacheWrite5m).toBe(60);
+    expect(buckets.cacheWrite1h).toBe(0);
+    expect(buckets.uncachedInput).toBe(40);
+  });
+
+  it('prices each bucket at its own Anthropic rate', () => {
+    const pricing = ANTHROPIC_PRICING['claude-sonnet-5-5']; // $2 / $10
+    const rates = ANTHROPIC_CACHE_PRICING['claude-sonnet-5-5'];
+    const cost = calculateCacheAwareCost(
+      {
+        uncachedInput: 1_000_000,
+        cacheRead: 1_000_000,
+        cacheWrite5m: 1_000_000,
+        cacheWrite1h: 1_000_000,
+        output: 1_000_000,
+      },
+      pricing,
+      rates,
+      'claude-sonnet-5-5'
+    );
+    // 2 + 0.2 + 2.5 + 4 + 10
+    expect(cost).toBeCloseTo(18.7, 10);
+  });
+
+  it('falls back to the input rate with one warning per model when cache rates are missing', () => {
+    resetPricingWarnings();
+    const warn = vi.spyOn(Logger.prototype, 'warn');
+    const buckets = {
+      uncachedInput: 0,
+      cacheRead: 1_000_000,
+      cacheWrite5m: 0,
+      cacheWrite1h: 0,
+      output: 0,
+    };
+    const pricing = { input: 3, output: 15 };
+    expect(calculateCacheAwareCost(buckets, pricing, undefined, 'm-x')).toBe(3);
+    calculateCacheAwareCost(buckets, pricing, undefined, 'm-x');
+    const cacheWarnings = warn.mock.calls.filter((c) =>
+      String(c[0]).includes('No published cache rates')
+    );
+    expect(cacheWarnings).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('is unchanged from calculateCost when there are no cache tokens', () => {
+    const pricing = { input: 3, output: 15 };
+    expect(
+      calculateCacheAwareCost(
+        {
+          uncachedInput: 1000,
+          cacheRead: 0,
+          cacheWrite5m: 0,
+          cacheWrite1h: 0,
+          output: 500,
+        },
+        pricing,
+        undefined
+      )
+    ).toBeCloseTo(calculateCost(1000, 500, pricing), 12);
+  });
+});
+
+describe('pricing_version', () => {
+  it('is a stable content hash', () => {
+    expect(PRICING_VERSION).toMatch(/^sha256:[0-9a-f]{12}$/);
+    const table = { a: { input: 1, output: 2 }, b: { input: 3, output: 4 } };
+    const reordered = {
+      b: { output: 4, input: 3 },
+      a: { output: 2, input: 1 },
+    };
+    expect(computePricingVersion(table)).toBe(computePricingVersion(reordered));
+  });
+
+  it('changes when the pricing table changes', () => {
+    const base = {
+      anthropic: ANTHROPIC_PRICING,
+      anthropicCache: ANTHROPIC_CACHE_PRICING,
+      openai: OPENAI_PRICING,
+      openaiCache: OPENAI_CACHE_PRICING,
+      aliases: MODEL_ALIASES,
+    };
+    expect(computePricingVersion(base)).toBe(PRICING_VERSION);
+    const changed = {
+      ...base,
+      anthropic: {
+        ...ANTHROPIC_PRICING,
+        'claude-sonnet-5-5': { input: 2.5, output: 10 },
+      },
+    };
+    expect(computePricingVersion(changed)).not.toBe(PRICING_VERSION);
   });
 });

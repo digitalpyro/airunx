@@ -8,6 +8,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { rmSync } from 'fs';
+import { EventEmitter } from 'events';
 
 // Suppress console output
 vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -138,6 +139,10 @@ vi.mock('../../../src/orchestrator/verbose-reporter.js', () => ({
 }));
 
 import { runOrchestrator } from '../../../src/cli/commands/run.js';
+import {
+  ShutdownCoordinator,
+  installShutdownSignalHandlers,
+} from '../../../src/utils/shutdown-coordinator.js';
 
 let tmpDir: string;
 let origCwd: string;
@@ -170,14 +175,9 @@ describe('runOrchestrator', () => {
 
       // Should have gotten past input validation
       // (may exit for other reasons like missing config, but not for missing input)
-      const exitCalls = exitSpy.mock.calls.filter(
-        ([code]) => code === 1
-      );
+      const exitCalls = exitSpy.mock.calls.filter(([code]) => code === 1);
       // Check that the error is NOT about missing input
-      const logCalls = vi
-        .mocked(console.log)
-        .mock.calls.flat()
-        .join(' ');
+      const logCalls = vi.mocked(console.log).mock.calls.flat().join(' ');
       expect(logCalls).not.toContain('Input or --prd required');
     });
 
@@ -194,11 +194,44 @@ describe('runOrchestrator', () => {
       await runOrchestrator(undefined, { prd: prdPath });
 
       // Should not have the "Input or --prd required" error
-      const logCalls = vi
-        .mocked(console.error)
-        .mock.calls.flat()
-        .join(' ');
+      const logCalls = vi.mocked(console.error).mock.calls.flat().join(' ');
       expect(logCalls).not.toContain('Input or --prd required');
+    });
+  });
+
+  describe('--workflow-id validation', () => {
+    it('rejects a path-traversal ID before any file access', async () => {
+      const { loadSettings } = await import('../../../src/utils/settings.js');
+      const { resolvePRD } = await import(
+        '../../../src/parsers/prd-resolver.js'
+      );
+      const envPath = join(tmpDir, 'never-read.env');
+
+      await runOrchestrator('implement auth', {
+        workflowId: '../../x',
+        dotenv: envPath,
+        prd: join(tmpDir, 'never-read.md'),
+      });
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      const errors = vi.mocked(console.error).mock.calls.flat().join(' ');
+      expect(errors).toContain('Invalid --workflow-id');
+      // Nothing downstream ran: no dotenv check, settings load, or PRD read
+      expect(errors).not.toContain('Env file not found');
+      expect(loadSettings).not.toHaveBeenCalled();
+      expect(resolvePRD).not.toHaveBeenCalled();
+    });
+
+    it('accepts a valid ID', async () => {
+      process.chdir(tmpDir);
+
+      await runOrchestrator('implement auth', {
+        workflowId: 'workflow-123-abcdef01',
+      });
+
+      const errors = vi.mocked(console.error).mock.calls.flat().join(' ');
+      expect(errors).not.toContain('Invalid --workflow-id');
     });
   });
 
@@ -228,10 +261,7 @@ describe('runOrchestrator', () => {
       await runOrchestrator('test', { fidelity: 'fast' });
 
       // Check that the fidelity error was NOT logged
-      const errorCalls = vi
-        .mocked(console.log)
-        .mock.calls.flat()
-        .join(' ');
+      const errorCalls = vi.mocked(console.log).mock.calls.flat().join(' ');
       expect(errorCalls).not.toContain('Invalid fidelity level');
     });
   });
@@ -268,5 +298,99 @@ describe('runOrchestrator', () => {
       // We just verify the function doesn't crash with json format
       expect(exitSpy).toHaveBeenCalled();
     });
+  });
+});
+
+// ─── SIGINT/SIGTERM graceful shutdown (U9) ───────────────────────────────────
+
+describe('shutdown signal handlers', () => {
+  const setup = (
+    terminal: boolean
+  ): {
+    signals: EventEmitter;
+    coordinator: ShutdownCoordinator;
+    interrupts: Array<{ alreadySignaled: boolean }>;
+    order: string[];
+    exits: number[];
+    uninstall: () => void;
+  } => {
+    const signals = new EventEmitter();
+    const coordinator = new ShutdownCoordinator();
+    const interrupts: Array<{ alreadySignaled: boolean }> = [];
+    const order: string[] = [];
+    const exits: number[] = [];
+    // One in-flight spawn that settles 50ms after its interrupt
+    let settle: () => void = () => {};
+    coordinator.trackSpawn(
+      new Promise<void>((resolve) => {
+        settle = resolve;
+      }).then(() => {
+        order.push('event');
+      })
+    );
+    coordinator.registerSpawn({
+      interrupt: (opts) => {
+        interrupts.push(opts);
+        setTimeout(settle, 50);
+      },
+    });
+    coordinator.onFlush(() => {
+      order.push('flush');
+    });
+    const uninstall = installShutdownSignalHandlers({
+      exit: (code) => {
+        order.push('exit');
+        exits.push(code);
+      },
+      coordinator,
+      target: signals,
+      attachedToTerminal: () => terminal,
+    });
+    return { signals, coordinator, interrupts, order, exits, uninstall };
+  };
+  const until = async (condition: () => boolean): Promise<void> => {
+    const deadline = Date.now() + 2_000;
+    while (!condition() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+
+  it('SIGTERM: interrupts each spawn once, writes events, flushes, then exits 143', async () => {
+    const t = setup(false);
+    t.signals.emit('SIGTERM');
+    await until(() => t.exits.length > 0);
+
+    expect(t.interrupts).toEqual([{ alreadySignaled: false }]);
+    expect(t.order).toEqual(['event', 'flush', 'exit']);
+    expect(t.exits).toEqual([143]);
+    t.uninstall();
+  });
+
+  it('SIGINT from a terminal: CLIs already got SIGINT, so none is re-sent; exits 130', async () => {
+    const t = setup(true);
+    t.signals.emit('SIGINT');
+    await until(() => t.exits.length > 0);
+
+    expect(t.interrupts).toEqual([{ alreadySignaled: true }]);
+    expect(t.exits).toEqual([130]);
+    t.uninstall();
+  });
+
+  it('a second signal during shutdown exits immediately without re-signalling CLIs', async () => {
+    const t = setup(false);
+    t.signals.emit('SIGTERM');
+    t.signals.emit('SIGTERM');
+    expect(t.exits).toEqual([143]);
+    expect(t.order).toEqual(['exit']);
+    await until(() => t.exits.length > 1);
+    expect(t.interrupts).toHaveLength(1);
+    t.uninstall();
+  });
+
+  it('uninstall removes the listeners', () => {
+    const t = setup(false);
+    t.uninstall();
+    expect(t.signals.listenerCount('SIGTERM')).toBe(0);
+    expect(t.signals.listenerCount('SIGINT')).toBe(0);
   });
 });

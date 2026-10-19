@@ -13,18 +13,24 @@ import * as path from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { spawnAsync } from '../utils/async-spawn.js';
 import { homedir, platform } from 'os';
-import { BaseCliAdapter, type CliAdapterConfig } from './base-cli-adapter.js';
+import {
+  BaseCliAdapter,
+  type CliAdapterConfig,
+  type ParsedCliOutput,
+} from './base-cli-adapter.js';
 import type {
   ExecutionRequest,
   ExecutionResult,
+  SpawnAuthMode,
 } from '../core/adapter-types.js';
-import { OPENAI_PRICING } from './pricing.js';
+import { OPENAI_CACHE_PRICING, OPENAI_PRICING } from './pricing.js';
 import {
   DEFAULT_API_KEY_ENV,
   DEFAULT_CLI_EXECUTABLES,
   DEFAULT_MODELS,
 } from './constants.js';
 import { ConfigurationError } from '../utils/errors.js';
+import { mergeCostSummaries } from '../core/cost-accounting.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('codex-adapter');
@@ -63,6 +69,7 @@ export class CodexAdapter extends BaseCliAdapter {
       cliCommand: DEFAULT_CLI_EXECUTABLES.CODEX,
       installInstructions: 'npm install -g @openai/codex',
       pricingMap: OPENAI_PRICING,
+      cachePricingMap: OPENAI_CACHE_PRICING,
       defaultModel: DEFAULT_MODELS.OPENAI,
     };
   }
@@ -123,21 +130,20 @@ export class CodexAdapter extends BaseCliAdapter {
    * - item.completed: contains agent text output in item.text
    * Multiple turn.completed events occur per session (one per tool-use round).
    */
-  protected parseOutput(
-    stdout: string,
-    stderr: string
-  ): {
-    outputs: ExecutionResult['outputs'];
-    tokensUsed: number;
-    inputTokens?: number;
-    outputTokens?: number;
-    totalCostUsd?: number;
-  } {
+  protected parseOutput(stdout: string, stderr: string): ParsedCliOutput {
     const lines = stdout.trim().split('\n');
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCachedInputTokens = 0;
+    let totalCacheWriteInputTokens = 0;
+    let totalReasoningOutputTokens = 0;
+    let sawUsage = false;
+    let sawReasoning = false;
+    const num = (v: unknown): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : 0;
     let agentText = '';
     let parsedAnyEvent = false;
+    let threadId: string | undefined;
 
     for (const line of lines) {
       try {
@@ -147,8 +153,25 @@ export class CodexAdapter extends BaseCliAdapter {
           // OpenAI convention: input_tokens already includes cached_input_tokens,
           // and output_tokens already includes reasoning_output_tokens.
           // Do NOT sum the breakdowns — that would double-count.
-          totalInputTokens += event.usage.input_tokens ?? 0;
-          totalOutputTokens += event.usage.output_tokens ?? 0;
+          sawUsage = true;
+          totalInputTokens += num(event.usage.input_tokens);
+          totalOutputTokens += num(event.usage.output_tokens);
+          totalCachedInputTokens += num(event.usage.cached_input_tokens);
+          totalCacheWriteInputTokens += num(
+            event.usage.cache_write_input_tokens
+          );
+          if (typeof event.usage.reasoning_output_tokens === 'number') {
+            sawReasoning = true;
+            totalReasoningOutputTokens += num(
+              event.usage.reasoning_output_tokens
+            );
+          }
+        }
+        if (
+          event.type === 'thread.started' &&
+          typeof event.thread_id === 'string'
+        ) {
+          threadId = event.thread_id;
         }
         if (event.type === 'item.completed' && event.item?.text) {
           agentText += event.item.text + '\n';
@@ -165,6 +188,39 @@ export class CodexAdapter extends BaseCliAdapter {
 
     const tokensUsed = totalInputTokens + totalOutputTokens;
 
+    // Normalized usage: codex input_tokens is already inclusive of cached
+    // (and cache-write) tokens, so it is used as-is; pricing subtracts the
+    // cache buckets to get uncached input (see bucketsFromUsage).
+    const cacheRead = Math.min(totalCachedInputTokens, totalInputTokens);
+    const cacheWrite = Math.min(
+      totalCacheWriteInputTokens,
+      totalInputTokens - cacheRead
+    );
+    const usageFields: Partial<ParsedCliOutput> = sawUsage
+      ? {
+          usage: {
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            cacheReadInputTokens: cacheRead,
+            cacheWriteInputTokens: cacheWrite,
+            ...(sawReasoning
+              ? { reasoningOutputTokens: totalReasoningOutputTokens }
+              : {}),
+          },
+          providerUsage: {
+            input_tokens: totalInputTokens,
+            cached_input_tokens: totalCachedInputTokens,
+            output_tokens: totalOutputTokens,
+            ...(totalCacheWriteInputTokens > 0
+              ? { cache_write_input_tokens: totalCacheWriteInputTokens }
+              : {}),
+            ...(sawReasoning
+              ? { reasoning_output_tokens: totalReasoningOutputTokens }
+              : {}),
+          },
+        }
+      : {};
+
     return {
       outputs: {
         analysis:
@@ -176,7 +232,22 @@ export class CodexAdapter extends BaseCliAdapter {
       tokensUsed,
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
+      sessionId: threadId,
+      ...usageFields,
     };
+  }
+
+  /**
+   * Codex only receives --model when one is explicitly configured; otherwise
+   * the CLI picks its own default, which we cannot name here.
+   */
+  protected getSpawnModel(request: ExecutionRequest): string | undefined {
+    if (modelOverrideDisabled.has(request)) return undefined;
+    return this.config?.model || request.agent.preferredModel || undefined;
+  }
+
+  protected getAuthMode(): SpawnAuthMode {
+    return this.useSubscriptionAuth ? 'subscription' : 'api_key';
   }
 
   /**
@@ -317,10 +388,75 @@ export class CodexAdapter extends BaseCliAdapter {
         agent: { ...request.agent, preferredModel: undefined },
       };
       modelOverrideDisabled.add(retryRequest);
-      return super.execute(retryRequest);
+      this.emitModelRejectedAttempt(request, result);
+      const retryResult = await super.execute(retryRequest);
+      return this.withRejectedSpawnSpend(retryResult, result);
     }
 
     return result;
+  }
+
+  /**
+   * Record the rejected first spawn as an `attempt` event (model_rejected)
+   */
+  private emitModelRejectedAttempt(
+    request: ExecutionRequest,
+    rejected: ExecutionResult
+  ): void {
+    const observer = this.spawnObserver;
+    if (!observer?.onAttempt) return;
+    const ctx = request.spawnContext;
+    try {
+      observer.onAttempt(
+        {
+          workflowId: ctx?.workflowId,
+          stage: ctx?.stage,
+          iteration: ctx?.iteration,
+          spawnId: rejected.spawnId,
+          parentSpawnId: ctx?.parentSpawnId,
+          attempt: 1,
+          backendAttempt: 1,
+          backend: this.name,
+          agentRole: request.agent.role,
+          outcome: 'failure',
+          errorCategory: 'model_rejected',
+          fallback: false,
+          costUsd: rejected.metrics.cost,
+          costSummary: rejected.metrics.costSummary,
+        },
+        request
+      );
+    } catch (error) {
+      logger.warn(
+        `Attempt observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Add the rejected spawn's spend to the retry's result so the stage
+   * aggregate equals the sum of both llm_spawn events
+   */
+  private withRejectedSpawnSpend(
+    retry: ExecutionResult,
+    rejected: ExecutionResult
+  ): ExecutionResult {
+    const costSummary = mergeCostSummaries(
+      retry.metrics.costSummary,
+      rejected.metrics.costSummary
+    );
+    return {
+      ...retry,
+      metrics: {
+        ...retry.metrics,
+        tokensUsed:
+          (retry.metrics.tokensUsed ?? 0) + (rejected.metrics.tokensUsed ?? 0),
+        cost: (retry.metrics.cost ?? 0) + (rejected.metrics.cost ?? 0),
+        spawnCount:
+          (retry.metrics.spawnCount ?? 1) + (rejected.metrics.spawnCount ?? 1),
+        ...(costSummary ? { costSummary } : {}),
+      },
+    };
   }
 
   protected buildEnv(): Record<string, string | undefined> {

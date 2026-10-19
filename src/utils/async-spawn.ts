@@ -6,6 +6,7 @@
  */
 
 import { spawn } from 'child_process';
+import { withoutProviderAdminKeys } from './env-filter.js';
 
 export interface SpawnResult {
   status: number | null;
@@ -17,6 +18,10 @@ export interface SpawnResult {
 export interface SpawnOptions {
   cwd?: string;
   timeout?: number;
+  /**
+   * Child environment (default: process.env). Provider admin keys are
+   * always stripped, whether the env is defaulted or passed explicitly.
+   */
   env?: Record<string, string | undefined>;
 }
 
@@ -32,7 +37,7 @@ export function spawnAsync(
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       cwd: options.cwd,
-      env: options.env,
+      env: withoutProviderAdminKeys(options.env ?? process.env),
       stdio: 'pipe',
     });
 

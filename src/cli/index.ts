@@ -35,6 +35,7 @@ import {
   circuitResetCommand,
 } from './commands/circuit.js';
 import { registerHeartbeatCommands } from './commands/heartbeat.js';
+import { registerCostsCommands } from './commands/costs.js';
 import { CONFIG_FILE_TYPES } from '../utils/file-validator.js';
 
 /**
@@ -239,6 +240,10 @@ program
     '--ci-verification-gate',
     'After PR creation, poll GitHub Actions and iterate on CI failures (up to 3 attempts). Overrides ci_verification_gate setting.'
   )
+  .option(
+    '--workflow-id <id>',
+    'Use this workflow ID instead of minting one (A-Z, a-z, 0-9, _ or -; max 64 chars). Set by the heartbeat to locate the run report.'
+  )
   .action(runOrchestrator);
 
 program
@@ -299,6 +304,10 @@ cleanupCmd
   .option(
     '--debug-files [days]',
     'Clean up debug files older than N days (default: 7)'
+  )
+  .option(
+    '--audit-logs [days]',
+    'Clean up audit logs older than N days (default: 30; current UTC day always kept)'
   )
   .option('--workflow-state', 'Clean up workflow state files')
   .option('--todos', 'Clean up todo files')
@@ -366,5 +375,8 @@ program
 
 // Heartbeat execution mode commands
 registerHeartbeatCommands(program);
+
+// Cost ledger reading surface
+registerCostsCommands(program);
 
 program.parse();

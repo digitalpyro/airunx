@@ -6,6 +6,7 @@
  * - Debug files (with configurable retention)
  * - Workflow state files
  * - Todo files
+ * - Audit logs (dated JSONL files, with configurable retention)
  *
  * Designed to run at the end of every execution (success or failure)
  * and can also be invoked manually via CLI.
@@ -23,6 +24,7 @@ import {
   DEFAULT_TODO_DIR,
 } from '../orchestrator/constants.js';
 import { createLogger } from './logger.js';
+import { getDefaultAuditDir } from '../audit/audit-logger.js';
 import { WorkflowContextSchema } from '../core/types.js';
 
 const execFileAsync = promisify(execFile);
@@ -54,8 +56,56 @@ export interface CleanupOptions {
   workflowId?: string;
   /** Base path for git operations (default: cwd) */
   basePath?: string;
+  /**
+   * Clean up audit logs dated more than this many days before the current UTC
+   * day. Undefined skips audit cleanup; 0 removes every closed day. The current
+   * UTC day's file is never removed.
+   */
+  auditLogsMaxAgeDays?: number;
   /** Dry run - only report what would be cleaned up */
   dryRun?: boolean;
+}
+
+/** Matches the filenames written by AuditLogger: `audit-YYYY-MM-DD.jsonl` (UTC). */
+const AUDIT_LOG_FILE_PATTERN = /^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Select audit log filenames whose UTC date is older than `maxAgeDays` days
+ * before the current UTC day.
+ *
+ * Dating is by filename only, never mtime: the filename is the UTC day the
+ * events were written, while mtime moves on copy/restore/touch and would make
+ * retention unpredictable for a cost ledger. Files that do not match the
+ * AuditLogger pattern exactly (or carry an invalid date) are never selected.
+ * The current UTC day, and any future-dated file, is always kept.
+ */
+export function selectExpiredAuditLogs(
+  files: string[],
+  maxAgeDays: number,
+  now: Date = new Date()
+): string[] {
+  const todayMs = Date.parse(`${now.toISOString().slice(0, 10)}T00:00:00Z`);
+  const cutoffMs = todayMs - Math.max(0, Math.floor(maxAgeDays)) * MS_PER_DAY;
+
+  return files
+    .filter((file) => {
+      const match = AUDIT_LOG_FILE_PATTERN.exec(file);
+      if (!match) {
+        return false;
+      }
+      const dateMs = Date.parse(`${match[1]}T00:00:00Z`);
+      // Reject impossible dates (e.g. 2026-02-31 normalizes to March)
+      if (
+        Number.isNaN(dateMs) ||
+        new Date(dateMs).toISOString().slice(0, 10) !== match[1]
+      ) {
+        return false;
+      }
+      return dateMs < todayMs && dateMs < cutoffMs;
+    })
+    .sort();
 }
 
 /**
@@ -66,6 +116,9 @@ export interface CleanupResult {
   debugFilesRemoved: number;
   workflowStatesRemoved: number;
   todosRemoved: number;
+  auditLogsRemoved: number;
+  /** Audit log filenames removed (or that would be removed on dry run) */
+  auditLogFiles: string[];
   errors: string[];
   skipped: string[];
 }
@@ -97,6 +150,7 @@ export class ScriptCleanup {
       todos = false,
       force = false,
       workflowId,
+      auditLogsMaxAgeDays,
       dryRun = false,
     } = options;
 
@@ -105,6 +159,8 @@ export class ScriptCleanup {
       debugFilesRemoved: 0,
       workflowStatesRemoved: 0,
       todosRemoved: 0,
+      auditLogsRemoved: 0,
+      auditLogFiles: [],
       errors: [],
       skipped: [],
     };
@@ -151,6 +207,17 @@ export class ScriptCleanup {
       result.errors.push(...todoResult.errors);
     }
 
+    // Clean up audit logs
+    if (auditLogsMaxAgeDays !== undefined) {
+      const auditResult = await this.cleanupAuditLogs({
+        maxAgeDays: auditLogsMaxAgeDays,
+        dryRun,
+      });
+      result.auditLogsRemoved = auditResult.files.length;
+      result.auditLogFiles = auditResult.files;
+      result.errors.push(...auditResult.errors);
+    }
+
     this.logResult(result, dryRun);
     return result;
   }
@@ -176,6 +243,8 @@ export class ScriptCleanup {
       debugFilesRemoved: 0,
       workflowStatesRemoved: 0,
       todosRemoved: 0,
+      auditLogsRemoved: 0,
+      auditLogFiles: [],
       errors: [],
       skipped: [],
     };
@@ -526,6 +595,48 @@ export class ScriptCleanup {
   }
 
   /**
+   * Clean up audit logs older than the retention window
+   */
+  private async cleanupAuditLogs(options: {
+    maxAgeDays: number;
+    dryRun?: boolean;
+  }): Promise<{ files: string[]; errors: string[] }> {
+    const { maxAgeDays, dryRun = false } = options;
+    const result = { files: [] as string[], errors: [] as string[] };
+
+    const auditDir = path.join(this.basePath, getDefaultAuditDir());
+
+    if (!existsSync(auditDir)) {
+      return result;
+    }
+
+    try {
+      const expired = selectExpiredAuditLogs(
+        await readdir(auditDir),
+        maxAgeDays
+      );
+      for (const file of expired) {
+        try {
+          if (!dryRun) {
+            await rm(path.join(auditDir, file));
+          }
+          result.files.push(file);
+        } catch (error) {
+          result.errors.push(
+            `Failed to remove audit log ${file}: ${getErrorMessage(error)}`
+          );
+        }
+      }
+    } catch (error) {
+      result.errors.push(
+        `Failed to clean up audit logs: ${getErrorMessage(error)}`
+      );
+    }
+
+    return result;
+  }
+
+  /**
    * Log cleanup result summary
    */
   private logResult(result: CleanupResult, dryRun: boolean): void {
@@ -543,6 +654,9 @@ export class ScriptCleanup {
     }
     if (result.todosRemoved > 0) {
       items.push(`${result.todosRemoved} todo(s)`);
+    }
+    if (result.auditLogsRemoved > 0) {
+      items.push(`${result.auditLogsRemoved} audit log(s)`);
     }
 
     if (items.length === 0) {

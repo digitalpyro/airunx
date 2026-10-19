@@ -4,27 +4,62 @@
  * Provides common CLI execution logic to reduce duplication
  */
 
-import { exec, execFile, spawn, type ChildProcess } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { stat } from 'fs/promises';
-import { BaseAdapter } from './base-adapter.js';
+import {
+  BaseAdapter,
+  dominantPromptSection,
+  formatPromptSections,
+} from './base-adapter.js';
 import type {
   ExecutionRequest,
   ExecutionResult,
   BackendAvailability,
   AdapterConfig,
+  SpawnAuthMode,
+  SpawnExitReason,
+  SpawnRecord,
 } from '../core/adapter-types.js';
-import { calculateCost, getModelPricing } from './pricing.js';
-import type { ModelPricing } from './pricing.js';
+import {
+  PRICING_VERSION,
+  bucketsFromUsage,
+  calculateCacheAwareCost,
+  getCacheRates,
+  getModelPricing,
+} from './pricing.js';
+import type { CacheRates, ModelPricing } from './pricing.js';
+import type { CostProvenance, NormalizedTokenUsage } from '../core/types.js';
+import { GENAI_SEMCONV_VERSION } from '../core/types.js';
+import {
+  billingBasisForAuth,
+  spawnCostSummary,
+} from '../core/cost-accounting.js';
 import {
   DEFAULT_CLI_TIMEOUT,
   HANG_CHECK_INTERVAL_MS,
   HANG_DETECTION_POLL_INTERVAL_MS,
+  SIGINT_GRACE_PERIOD_MS,
   SIGTERM_GRACE_PERIOD_MS,
+  POST_KILL_SETTLE_MS,
   APPROVAL_MODE_FLAGS,
 } from './constants.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+} from '../utils/shutdown-coordinator.js';
+import {
+  KILL_TIME_ESTIMATION_METHOD,
+  runSpendTracker,
+} from './spend-estimator.js';
+import { createKillLadder, type SignalLadder } from './kill-ladder.js';
+import {
+  PROVIDER_ADMIN_KEY_DENYLIST,
+  withoutProviderAdminKeys,
+} from '../utils/env-filter.js';
 import { loadSettings } from '../utils/settings.js';
 import { createLogger } from '../utils/logger.js';
+import { ulid } from '../utils/ulid.js';
 import {
   BackendNotFoundError,
   ConfigurationError,
@@ -44,6 +79,113 @@ const execFileAsync = promisify(execFile);
  */
 const ESTIMATED_CLI_INPUT_TOKEN_RATIO = 0.5;
 
+/** TimeoutError operation label used for hang detection kills */
+const HANG_OPERATION = 'Process hang detected';
+
+/**
+ * Per-spawn facts gathered during execution and reported to the SpawnObserver
+ */
+interface SpawnOutcome {
+  exitReason: SpawnExitReason;
+  salvaged: boolean;
+  errorCategory?: string;
+  providerSessionId?: string;
+  /** CLI-reported token counts (undefined when not reported) */
+  inputTokens?: number;
+  outputTokens?: number;
+  /** Provenance-tagged cost facts (undefined when nothing was parsed) */
+  cost?: SpawnCostAccounting;
+  /** Kill-time estimate for a spawn that ended without cost JSON */
+  spendLostUsd?: number;
+  /** Partial cost recovered from a failed spawn's output */
+  spendSalvagedUsd?: number;
+  /** Stopped by run shutdown (feeds the final report) */
+  interrupted?: boolean;
+  /** Refused because the run was already shutting down (no process ran) */
+  notSpawned?: boolean;
+}
+
+/**
+ * Spawn timing attached to executeWithSpawn rejections, so the kill-time
+ * estimate measures active time (start → last output), not kill time
+ */
+interface SpawnTiming {
+  spawnStartedAt?: number;
+  /** Epoch ms of the last stdout/stderr chunk; undefined = no output */
+  lastOutputAt?: number;
+}
+
+/**
+ * Minimum active time before a non-zero exit without cost JSON is estimated
+ * (shorter exits are treated as rejections — auth, bad model — before work)
+ */
+const MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS = 5_000;
+
+export type { SignalLadder } from './kill-ladder.js';
+
+/**
+ * A spawn stopped by run shutdown (SIGINT/SIGTERM to `run`). Non-retryable:
+ * the run is exiting. Its stdout (possibly result JSON printed after SIGINT)
+ * is salvaged like any categorized failure.
+ */
+export class SpawnInterruptedError extends NonRetryableError {
+  signal: string | null = 'SIGINT';
+  constructor(cause: string) {
+    super(`CLI interrupted by run shutdown (${cause})`);
+    this.name = 'SpawnInterruptedError';
+  }
+}
+
+/** Exit reasons that mean the CLI was cut off before it could report cost */
+const KILLED_EXIT_REASONS: ReadonlySet<SpawnExitReason> = new Set([
+  'timeout',
+  'hang',
+  'signal',
+]);
+
+/**
+ * Provenance-tagged cost facts for one spawn
+ */
+interface SpawnCostAccounting {
+  /** Headline cost; undefined = missing */
+  costUsd?: number;
+  costProvenance?: CostProvenance;
+  /** Token×pricing figure, also kept when a reported cost exists */
+  derivedCostUsd?: number;
+  pricingVersion?: string;
+  tokens?: NormalizedTokenUsage;
+  tokenProvenance?: 'reported' | 'estimated';
+  estimationMethods: string[];
+  unmodeledModifiers: string[];
+  providerUsage?: Record<string, number>;
+  costBasis?: Record<string, string>;
+}
+
+/**
+ * Parsed CLI output shape returned by parseOutput()
+ */
+export interface ParsedCliOutput {
+  outputs: ExecutionResult['outputs'];
+  tokensUsed: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCostUsd?: number;
+  /** Provider session/thread ID when the CLI reports one */
+  sessionId?: string;
+  /** Normalized (inclusive) token usage, when the provider reports it */
+  usage?: NormalizedTokenUsage;
+  /** Normalized usage per model (priced per model when present) */
+  usageByModel?: Record<string, NormalizedTokenUsage>;
+  /** Allowlisted numeric copy of the provider's raw usage fields */
+  providerUsage?: Record<string, number>;
+  /** True when tokensUsed came from the chars÷4 estimate */
+  tokensEstimated?: boolean;
+  /** Claude Code modelUsage[*].costBasis, keyed by model */
+  costBasis?: Record<string, string>;
+  /** Known pricing modifiers the table does not model */
+  unmodeledModifiers?: string[];
+}
+
 /**
  * Configuration for CLI-specific behavior
  */
@@ -54,6 +196,8 @@ export interface CliAdapterConfig {
   installInstructions: string;
   /** Pricing model to use for cost calculation */
   pricingMap: Record<string, ModelPricing>;
+  /** Per-model prompt-cache rates (missing → input rate, one-time warning) */
+  cachePricingMap?: Record<string, CacheRates>;
   /** Default model if not specified */
   defaultModel: string;
 }
@@ -63,7 +207,7 @@ export interface CliAdapterConfig {
  * Used by executeWithSpawn rejections and categorizeError
  * Includes stdout as some tools output error info to stdout
  */
-export interface ProcessError extends Error {
+export interface ProcessError extends Error, SpawnTiming {
   code?: number | string;
   signal?: string | null;
   stdout?: string;
@@ -207,28 +351,29 @@ export abstract class BaseCliAdapter extends BaseAdapter {
   }
 
   /**
-   * Kill process with escalation: SIGTERM → wait → SIGKILL
+   * Signal ladder timings. Overridable by subclasses (tests use short ones).
    */
-  private killProcess(child: ChildProcess, reason: string): void {
-    this.logger.debug(`Killing process (reason: ${reason}), sending SIGTERM`);
-    child.kill('SIGTERM');
-
-    globalThis.setTimeout(() => {
-      if (!child.killed) {
-        this.logger.debug('Process still alive after SIGTERM, sending SIGKILL');
-        child.kill('SIGKILL');
-      }
-    }, SIGTERM_GRACE_PERIOD_MS);
+  protected getSignalLadder(): SignalLadder {
+    return {
+      interruptGraceMs: SIGINT_GRACE_PERIOD_MS,
+      terminateGraceMs: SIGTERM_GRACE_PERIOD_MS,
+      postKillSettleMs: POST_KILL_SETTLE_MS,
+    };
   }
 
   /**
    * Execute CLI command with proper stdin handling, timeout, and hang detection.
    * Uses spawn instead of execFile to prevent hanging on interactive prompts.
    *
-   * Key improvements over execFileAsync:
    * - Closes stdin immediately to prevent interactive prompt waits
-   * - Implements hang detection (kills if no output for HANG_CHECK_INTERVAL_MS)
-   * - Proper process cleanup with SIGTERM → SIGKILL escalation
+   * - Hang detection (no output for HANG_CHECK_INTERVAL_MS after some output)
+   * - On timeout, hang, or run shutdown the signal ladder runs: SIGINT →
+   *   SIGTERM → SIGKILL, escalating only while the process has not actually
+   *   exited. The promise stays open until the process closes (or the ladder
+   *   gives up), so result JSON a CLI prints after SIGINT is captured and
+   *   parsed into reported figures.
+   * - The CLI is NOT detached: it stays in run's process group so the
+   *   heartbeat's final group SIGKILL reaches it.
    */
   protected async executeWithSpawn(
     cliConfig: CliAdapterConfig,
@@ -239,13 +384,23 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     // Pre-flight validation
     await this.validatePreFlight(workingDirectory);
 
+    // No new spawns once the run is shutting down
+    if (shutdownCoordinator.isShuttingDown) {
+      throw new ShutdownInProgressError();
+    }
+
     return new Promise((resolve, reject) => {
       const timeoutMs = timeoutOverrideMs ?? this.getTimeoutMs();
+      const ladder = this.getSignalLadder();
       let stdout = '';
       let stderr = '';
       let lastOutputTime = Date.now();
       let hasOutput = false;
       let isSettled = false;
+      // Kill-time estimation measures active time to the last real output
+      const spawnStartedAt = Date.now();
+      let lastOutputAt: number | undefined;
+      const timing = (): SpawnTiming => ({ spawnStartedAt, lastOutputAt });
 
       this.logger.debug(`Executing: ${cliConfig.cliCommand} ${args.join(' ')}`);
       this.logger.debug(`Working directory: ${workingDirectory}`);
@@ -260,114 +415,317 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       // CRITICAL: Close stdin immediately to prevent interactive prompts
       child.stdin.end();
 
-      // Collect output
+      // Collect output (including anything written after a ladder signal)
       child.stdout.on('data', (data: Buffer) => {
         stdout += data.toString();
         lastOutputTime = Date.now();
+        lastOutputAt = lastOutputTime;
         hasOutput = true;
       });
 
       child.stderr.on('data', (data: Buffer) => {
         stderr += data.toString();
         lastOutputTime = Date.now();
+        lastOutputAt = lastOutputTime;
         hasOutput = true;
       });
 
-      // Timer IDs for cleanup
-      let timeoutId: ReturnType<typeof globalThis.setTimeout>;
-      let hangCheckerId: ReturnType<typeof globalThis.setInterval>;
+      // Why the ladder started (undefined = not interrupted)
+      let interruptError: (() => Error) | undefined;
+      let timeoutId: ReturnType<typeof globalThis.setTimeout> | undefined;
+      let hangCheckerId: ReturnType<typeof globalThis.setInterval> | undefined;
+      let unregister: () => void = () => {};
 
-      // Cleanup function - must be defined before timers so handlers can call it
       const cleanup = (): void => {
         globalThis.clearTimeout(timeoutId);
         globalThis.clearInterval(hangCheckerId);
+        killLadder.dispose();
+        unregister();
+      };
+
+      const settle = (error?: Error): void => {
+        if (isSettled) return;
+        isSettled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve({ stdout, stderr });
+      };
+
+      /** Rejection for an interrupted spawn, built at settle time */
+      const settleInterrupted = (): void => {
+        const error = interruptError!();
+        Object.assign(error, {
+          stdout,
+          stderr,
+          signal: child.signalCode ?? (error as ProcessError).signal,
+          ...timing(),
+        });
+        settle(error);
+      };
+
+      const killLadder = createKillLadder({
+        child,
+        timings: ladder,
+        onGiveUp: settleInterrupted,
+        logger: this.logger,
+      });
+
+      /** Interrupt the CLI through the kill ladder (once) */
+      const startLadder = (
+        makeError: () => Error,
+        alreadySignaled = false
+      ): void => {
+        if (interruptError || isSettled) return;
+        interruptError = makeError;
+        globalThis.clearTimeout(timeoutId);
+        globalThis.clearInterval(hangCheckerId);
+        killLadder.start(alreadySignaled);
       };
 
       // Timeout handler
       timeoutId = globalThis.setTimeout(() => {
         if (isSettled) return;
-        isSettled = true;
-        cleanup(); // Prevent resource leak
         this.logger.warn(`CLI execution timeout after ${timeoutMs}ms`);
-        this.killProcess(child, 'timeout');
-        // Attach stdout/stderr for debugging what happened before timeout
-        const timeoutError = new TimeoutError(timeoutMs, 'CLI execution');
-        Object.assign(timeoutError, { stdout, stderr });
-        reject(timeoutError);
+        startLadder(() => new TimeoutError(timeoutMs, 'CLI execution'));
       }, timeoutMs);
 
       // Hang detection - only kill if we HAD output and then stopped
       hangCheckerId = globalThis.setInterval(() => {
-        if (isSettled) return;
+        if (isSettled || interruptError) return;
         const timeSinceLastOutput = Date.now() - lastOutputTime;
         if (hasOutput && timeSinceLastOutput > HANG_CHECK_INTERVAL_MS) {
-          isSettled = true;
-          cleanup(); // Prevent resource leak
           this.logger.warn(
             `Process hang detected (no output for ${timeSinceLastOutput}ms)`
           );
-          this.killProcess(child, 'hang');
-          // Attach stdout/stderr for debugging what happened before hang
-          const hangError = new TimeoutError(
-            timeSinceLastOutput,
-            'Process hang detected'
+          startLadder(
+            () => new TimeoutError(timeSinceLastOutput, HANG_OPERATION)
           );
-          Object.assign(hangError, { stdout, stderr });
-          reject(hangError);
         }
       }, HANG_DETECTION_POLL_INTERVAL_MS);
 
+      // Run shutdown interrupts this spawn (once) through the same ladder
+      if (child.pid !== undefined) {
+        unregister = shutdownCoordinator.registerSpawn({
+          interrupt: ({ alreadySignaled }) =>
+            startLadder(
+              () =>
+                new SpawnInterruptedError(
+                  alreadySignaled ? 'SIGINT' : 'shutdown'
+                ),
+              alreadySignaled
+            ),
+        });
+      }
+
       child.on('close', (code, signal) => {
-        cleanup();
+        if (isSettled) return;
 
-        if (isSettled) {
-          return; // Already rejected
-        }
-        isSettled = true;
-
-        if (signal) {
-          const error = Object.assign(
-            new Error(`Process killed by signal: ${signal}`),
-            { signal }
+        if (interruptError) {
+          settleInterrupted();
+        } else if (signal) {
+          settle(
+            Object.assign(new Error(`Process killed by signal: ${signal}`), {
+              signal,
+              stdout,
+              stderr,
+              ...timing(),
+            })
           );
-          reject(error);
         } else if (code !== 0) {
           // Create error object with additional properties for categorization
-          const error = Object.assign(
-            new Error(`CLI execution failed with exit code ${code}`),
-            { code, stderr, stdout }
+          settle(
+            Object.assign(
+              new Error(`CLI execution failed with exit code ${code}`),
+              { code, stderr, stdout, ...timing() }
+            )
           );
-          reject(error);
         } else {
-          resolve({ stdout, stderr });
+          settle();
         }
       });
 
       child.on('error', (error) => {
-        cleanup();
-        if (isSettled) return;
-        isSettled = true;
-        reject(error);
+        settle(error);
       });
     });
   }
 
+  /**
+   * Execute one CLI spawn and report it to the SpawnObserver (if any).
+   * Every call emits exactly one SpawnRecord — success, failure or salvage —
+   * and the returned result carries the record's spawnId.
+   */
   async execute(request: ExecutionRequest): Promise<ExecutionResult> {
     this.ensureInitialized();
 
+    const spawnId = ulid();
     const startTime = Date.now();
-    const { agent, task, context } = request;
-    const cliConfig = this.getCliConfig();
+    const outcome: SpawnOutcome = { exitReason: 'error', salvaged: false };
+    // Tracked so run shutdown waits for this spawn's ledger event
+    return shutdownCoordinator.trackSpawn(
+      (async (): Promise<ExecutionResult> => {
+        const result = await this.runSpawn(request, outcome, startTime);
+        result.spawnId = spawnId;
+        // A spawn refused because the run is shutting down never ran
+        if (outcome.notSpawned) return result;
+        this.notifySpawnObserver(request, result, outcome, spawnId, startTime);
+        if (outcome.interrupted) {
+          this.recordInterruptedSpawn(request, result, startTime);
+        }
+        return result;
+      })()
+    );
+  }
+
+  /**
+   * Hand a shutdown-interrupted spawn's spend to the shutdown coordinator,
+   * so the runner's final report includes the in-flight stage
+   */
+  private recordInterruptedSpawn(
+    request: ExecutionRequest,
+    result: ExecutionResult,
+    startTime: number
+  ): void {
+    const ctx = request.spawnContext;
+    shutdownCoordinator.recordInterruptedSpawn({
+      workflowId: ctx?.workflowId,
+      stage: ctx?.stage,
+      iteration: ctx?.iteration,
+      backend: this.name,
+      agentRole: request.agent.role,
+      startedAt: new Date(startTime).toISOString(),
+      durationMs: Date.now() - startTime,
+      tokensUsed: result.metrics.tokensUsed,
+      costUsd: result.metrics.cost,
+      costSummary: result.metrics.costSummary,
+    });
+  }
+
+  /**
+   * Model to attribute a spawn to. Subclasses override when the CLI may pick
+   * its own model (return undefined).
+   */
+  protected getSpawnModel(request: ExecutionRequest): string | undefined {
+    return (
+      this.config?.model ||
+      request.agent.preferredModel ||
+      this.getCliConfig().defaultModel
+    );
+  }
+
+  /**
+   * Authentication mode used by spawned CLIs, when known
+   */
+  protected getAuthMode(): SpawnAuthMode | undefined {
+    return undefined;
+  }
+
+  /**
+   * Build the SpawnRecord and hand it to the observer. Never throws.
+   */
+  private notifySpawnObserver(
+    request: ExecutionRequest,
+    result: ExecutionResult,
+    outcome: SpawnOutcome,
+    spawnId: string,
+    startTime: number
+  ): void {
+    const observer = this.spawnObserver;
+    if (!observer) return;
 
     try {
-      // Build the prompt
-      const prompt = this.buildPrompt(agent, task, context);
+      const endTime = Date.now();
+      const ctx = request.spawnContext;
+      const record: SpawnRecord = {
+        spawnId,
+        parentSpawnId: ctx?.parentSpawnId,
+        workflowId: ctx?.workflowId,
+        stage: ctx?.stage,
+        iteration: ctx?.iteration,
+        backend: this.name,
+        model: this.getSpawnModel(request),
+        authMode: this.getAuthMode(),
+        agentRole: request.agent.role,
+        promptBytes: result.metrics.promptBytes,
+        promptSections: result.metrics.promptSections,
+        tokensUsed: result.metrics.tokensUsed,
+        inputTokens: outcome.inputTokens,
+        outputTokens: outcome.outputTokens,
+        costUsd: result.metrics.cost,
+        startedAt: new Date(startTime).toISOString(),
+        endedAt: new Date(endTime).toISOString(),
+        durationMs: endTime - startTime,
+        exitReason: outcome.exitReason,
+        success: result.success,
+        salvaged: outcome.salvaged,
+        errorCategory: outcome.errorCategory,
+        providerSessionId: outcome.providerSessionId,
+        costProvenance: outcome.cost?.costProvenance,
+        billingBasis: billingBasisForAuth(this.getAuthMode()),
+        derivedCostUsd: outcome.cost?.derivedCostUsd,
+        pricingVersion: outcome.cost?.pricingVersion,
+        unmodeledModifiers: outcome.cost?.unmodeledModifiers ?? [],
+        tokens: outcome.cost?.tokens,
+        tokenProvenance: outcome.cost?.tokenProvenance,
+        estimationMethods: outcome.cost?.estimationMethods ?? [],
+        providerUsage: outcome.cost?.providerUsage,
+        costBasis: outcome.cost?.costBasis,
+        semconvVersion: GENAI_SEMCONV_VERSION,
+        spendLostUsd: outcome.spendLostUsd,
+        spendSalvagedUsd: outcome.spendSalvagedUsd,
+      };
+      observer.onSpawnComplete(record, request);
+    } catch (error) {
+      this.logger.warn(
+        `Spawn observer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Classify why a failed spawn ended
+   */
+  private classifyExit(error: unknown): SpawnExitReason {
+    if (error instanceof TimeoutError) {
+      return error.operation === HANG_OPERATION ? 'hang' : 'timeout';
+    }
+    if ((error as ProcessError | undefined)?.signal) {
+      return 'signal';
+    }
+    return 'error';
+  }
+
+  private async runSpawn(
+    request: ExecutionRequest,
+    outcome: SpawnOutcome,
+    startTime: number
+  ): Promise<ExecutionResult> {
+    const { agent, task, context } = request;
+    const cliConfig = this.getCliConfig();
+    // Prompt size metrics, attached to every result (success or failure)
+    let promptMetrics: Pick<
+      ExecutionResult['metrics'],
+      'promptBytes' | 'promptSections'
+    > = {};
+
+    try {
+      // Build the prompt and record its per-section byte breakdown
+      const { prompt, sections } = this.buildPromptWithSections(
+        agent,
+        task,
+        context
+      );
+      promptMetrics = { promptBytes: sections.total, promptSections: sections };
+      this.logger.debug(
+        `Prompt sections (bytes): ${formatPromptSections(sections)}`
+      );
 
       // Warn on large prompts — each spawn with a 100KB+ prompt is expensive
       const PROMPT_SIZE_WARNING_THRESHOLD = 100_000; // ~25K tokens
-      if (prompt.length > PROMPT_SIZE_WARNING_THRESHOLD) {
+      if (sections.total > PROMPT_SIZE_WARNING_THRESHOLD) {
+        const dominant = dominantPromptSection(sections);
         this.logger.warn(
-          `Large prompt: ${(prompt.length / 1024).toFixed(0)}KB (~${Math.ceil(prompt.length / 4).toLocaleString()} tokens est., actual may vary)`
+          `Large prompt: ${(sections.total / 1024).toFixed(0)}KB (~${Math.ceil(sections.total / 4).toLocaleString()} tokens est., actual may vary); largest section: ${dominant} ${(sections[dominant] / 1024).toFixed(0)}KB`
         );
       }
 
@@ -385,62 +743,42 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
       // Parse output
       const result = this.parseOutput(stdout, stderr);
+      outcome.exitReason = 'ok';
+      outcome.providerSessionId = result.sessionId;
+      outcome.inputTokens = result.inputTokens;
+      outcome.outputTokens = result.outputTokens;
 
-      // Calculate cost using centralized pricing
-      // Use actual input/output tokens when available from CLI response,
-      // otherwise fall back to 50/50 estimation
-      const model =
-        this.config?.model || agent.preferredModel || cliConfig.defaultModel;
-      const pricing = getModelPricing(
-        model,
-        cliConfig.pricingMap,
-        cliConfig.defaultModel
-      );
-
-      // Determine input/output tokens for accurate cost calculation
-      let inputTokens: number;
-      let outputTokens: number;
-
-      if (
-        result.inputTokens !== undefined &&
-        result.outputTokens !== undefined
-      ) {
-        // Best case: we have both from the CLI response
-        inputTokens = result.inputTokens;
-        outputTokens = result.outputTokens;
-      } else if (result.inputTokens !== undefined) {
-        // We have input tokens, derive output from total
-        inputTokens = result.inputTokens;
-        outputTokens = Math.max(0, result.tokensUsed - inputTokens);
-      } else if (result.outputTokens !== undefined) {
-        // We have output tokens, derive input from total
-        outputTokens = result.outputTokens;
-        inputTokens = Math.max(0, result.tokensUsed - outputTokens);
-      } else {
-        // No breakdown available, estimate 50/50 split
-        inputTokens = result.tokensUsed * ESTIMATED_CLI_INPUT_TOKEN_RATIO;
-        outputTokens =
-          result.tokensUsed * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO);
-      }
-
-      // Prefer CLI-reported cost when available (e.g., Claude Code's total_cost_usd)
-      // This accounts for cache tokens, thinking tokens, and exact model pricing
-      // Fall back to local calculation, or undefined when tokens are 0
-      const cost =
-        result.totalCostUsd ??
-        (result.tokensUsed > 0
-          ? calculateCost(inputTokens, outputTokens, pricing)
-          : undefined);
+      // Provenance-tagged cost: CLI-reported cost wins; otherwise token
+      // counts × versioned pricing (derived), or the 50/50 / chars÷4
+      // fallback (estimated). Undefined when nothing was spent or parsed.
+      const accounting = this.accountSpawnCost(result, request);
+      outcome.cost = accounting;
 
       const duration = Date.now() - startTime;
+      this.observeSpend(accounting, duration);
       return this.createSuccessResult(result.outputs, {
         tokensUsed: result.tokensUsed,
         duration,
-        cost,
+        cost: accounting.costUsd,
         spawnCount: 1, // Single CLI spawn for base adapter
+        costSummary: this.toCostSummary(accounting),
+        ...promptMetrics,
       });
     } catch (error) {
       const duration = Date.now() - startTime;
+      if (error instanceof ShutdownInProgressError) {
+        outcome.notSpawned = true;
+        return {
+          success: false,
+          outputs: { error: error.message },
+          metrics: { tokensUsed: 0, duration, ...promptMetrics },
+          errors: [error],
+        };
+      }
+      outcome.interrupted = error instanceof SpawnInterruptedError;
+      outcome.exitReason = this.classifyExit(error);
+      outcome.errorCategory =
+        error instanceof Error ? error.constructor.name : 'unknown';
 
       // Handle already-categorized errors from pre-flight checks or setup
       // These may have stdout/stderr attached for debugging (e.g., TimeoutError)
@@ -452,13 +790,16 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         this.logger.error(`Execution failed: ${error.message}`);
 
         // Attempt to salvage cost data from partial output (e.g., timeout after real API work).
-        // NOTE: Claude Code with --output-format json writes the full JSON (including
-        // total_cost_usd and token counts) only on clean exit. On SIGTERM kill, stdout
-        // is typically empty — salvage will not recover cost data in that case.
-        // The primary defense against wasted spend is the per-run cost cap, not timeouts.
-        let metrics: { tokensUsed: number; duration: number; cost?: number } = {
+        // The signal ladder starts with SIGINT and keeps collecting stdout until the
+        // CLI exits, so a CLI that finishes its turn and prints result JSON on SIGINT
+        // yields reported figures here. One killed without output gets the kill-time
+        // estimate below. The primary defense against wasted spend is the per-run cost cap.
+        outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
+        let metrics: ExecutionResult['metrics'] = {
           tokensUsed: 0,
           duration,
+          costSummary: this.toCostSummary(outcome.cost),
+          ...promptMetrics,
         };
         if (processError.stdout?.trim()) {
           try {
@@ -466,31 +807,20 @@ export abstract class BaseCliAdapter extends BaseAdapter {
               processError.stdout,
               processError.stderr ?? ''
             );
+            outcome.providerSessionId = partial.sessionId;
+            outcome.inputTokens = partial.inputTokens;
+            outcome.outputTokens = partial.outputTokens;
             if (partial.tokensUsed > 0 || partial.totalCostUsd) {
-              // Calculate cost from tokens if totalCostUsd not available
-              let salvagedCost = partial.totalCostUsd;
-              if (salvagedCost === undefined && partial.tokensUsed > 0) {
-                const model =
-                  this.config?.model ||
-                  agent.preferredModel ||
-                  cliConfig.defaultModel;
-                const pricing = getModelPricing(
-                  model,
-                  cliConfig.pricingMap,
-                  cliConfig.defaultModel
-                );
-                const inTokens =
-                  partial.inputTokens ??
-                  partial.tokensUsed * ESTIMATED_CLI_INPUT_TOKEN_RATIO;
-                const outTokens =
-                  partial.outputTokens ??
-                  partial.tokensUsed * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO);
-                salvagedCost = calculateCost(inTokens, outTokens, pricing);
-              }
+              outcome.salvaged = true;
+              const accounting = this.accountSpawnCost(partial, request);
+              outcome.cost = accounting;
+              const salvagedCost = accounting.costUsd;
               metrics = {
                 tokensUsed: partial.tokensUsed,
                 duration,
                 cost: salvagedCost,
+                costSummary: this.toCostSummary(accounting),
+                ...promptMetrics,
               };
               this.logger.warn(
                 `Salvaged partial metrics from failed execution: ${partial.tokensUsed} tokens, $${salvagedCost?.toFixed(4) ?? '?'}`
@@ -499,6 +829,21 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           } catch {
             // Parsing failed, keep tokensUsed: 0
           }
+        }
+
+        const lost = this.applyKillTimeAccounting(
+          request,
+          processError,
+          outcome,
+          startTime,
+          promptMetrics.promptBytes
+        );
+        if (lost) {
+          metrics = {
+            ...metrics,
+            cost: lost.costUsd,
+            costSummary: this.toCostSummary(lost),
+          };
         }
 
         return {
@@ -539,6 +884,17 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
       // Categorize error for smart retry logic
       const categorizedError = this.categorizeError(execError);
+      outcome.errorCategory = categorizedError.constructor.name;
+      // No output was parsed: the cost is unknown (the legacy float stays 0)
+      // unless the CLI was cut off mid-work, which gets a bounded estimate
+      outcome.cost = { estimationMethods: [], unmodeledModifiers: [] };
+      const lost = this.applyKillTimeAccounting(
+        request,
+        execError,
+        outcome,
+        startTime,
+        promptMetrics.promptBytes
+      );
 
       return {
         success: false,
@@ -552,11 +908,281 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         metrics: {
           tokensUsed: 0,
           duration,
-          cost: 0,
+          cost: lost?.costUsd ?? 0,
+          costSummary: this.toCostSummary(outcome.cost),
+          ...promptMetrics,
         },
         errors: [categorizedError],
       };
     }
+  }
+
+  /**
+   * Feed a completed spawn's trusted (reported/derived) cost into the run's
+   * burn-rate tracker
+   */
+  private observeSpend(
+    accounting: SpawnCostAccounting,
+    activeMs: number
+  ): void {
+    if (
+      accounting.costUsd === undefined ||
+      (accounting.costProvenance !== 'reported' &&
+        accounting.costProvenance !== 'derived')
+    ) {
+      return;
+    }
+    runSpendTracker.record({
+      backend: this.name,
+      costUsd: accounting.costUsd,
+      activeMs,
+    });
+  }
+
+  /**
+   * Failed-spawn spend accounting. A salvaged cost is recorded as
+   * `spend_salvaged`. A spawn cut off (timeout/hang/signal, or a non-zero
+   * exit after ≥5s of real output) with no cost gets a bounded kill-time estimate,
+   * recorded as `spend_lost` and returned (outcome.cost is replaced).
+   * Pre-spawn failures (no process ran, no output) stay unknown.
+   */
+  private applyKillTimeAccounting(
+    request: ExecutionRequest,
+    error: ProcessError,
+    outcome: SpawnOutcome,
+    startTime: number,
+    promptBytes: number | undefined
+  ): SpawnCostAccounting | undefined {
+    const spawnStart = error.spawnStartedAt ?? startTime;
+    const activeMs =
+      error.lastOutputAt !== undefined
+        ? Math.max(0, error.lastOutputAt - spawnStart)
+        : 0;
+
+    if (outcome.cost?.costUsd !== undefined) {
+      outcome.spendSalvagedUsd = outcome.cost.costUsd;
+      this.observeSpend(outcome.cost, activeMs);
+      return undefined;
+    }
+
+    const cutOff = KILLED_EXIT_REASONS.has(outcome.exitReason);
+    // A non-zero exit is estimated only when the CLI clearly did work:
+    // it spawned, wrote stdout, and stayed active past a quick rejection
+    const exitedAfterWork =
+      outcome.exitReason === 'error' &&
+      error.spawnStartedAt !== undefined &&
+      !!error.stdout?.trim() &&
+      activeMs >= MIN_ERROR_EXIT_ESTIMATE_ACTIVE_MS;
+    if (!cutOff && !exitedAfterWork) return undefined;
+
+    try {
+      const cliConfig = this.getCliConfig();
+      const model = this.getSpawnModel(request) ?? cliConfig.defaultModel;
+      const pricing = getModelPricing(
+        model,
+        cliConfig.pricingMap,
+        cliConfig.defaultModel
+      );
+      const estimate = runSpendTracker.estimateKillTimeSpend({
+        backend: this.name,
+        activeMs,
+        promptBytes: promptBytes ?? 0,
+        inputPricePer1M: pricing.input,
+      });
+      if (!(estimate.costUsd > 0)) return undefined;
+
+      const accounting: SpawnCostAccounting = {
+        ...outcome.cost,
+        costUsd: estimate.costUsd,
+        costProvenance: 'estimated',
+        pricingVersion: PRICING_VERSION,
+        estimationMethods: [
+          ...new Set([
+            ...(outcome.cost?.estimationMethods ?? []),
+            KILL_TIME_ESTIMATION_METHOD,
+          ]),
+        ],
+        unmodeledModifiers: outcome.cost?.unmodeledModifiers ?? [],
+      };
+      outcome.cost = accounting;
+      outcome.spendLostUsd = estimate.costUsd;
+      this.logger.warn(
+        `Spawn ended (${outcome.exitReason}) without cost data; estimated lost spend $${estimate.costUsd.toFixed(4)} ` +
+          `(active ${(activeMs / 1000).toFixed(1)}s, rate source ${estimate.rateSource}, bound ${estimate.bound})`
+      );
+      return accounting;
+    } catch (estimateError) {
+      this.logger.warn(
+        `Kill-time estimate failed: ${estimateError instanceof Error ? estimateError.message : String(estimateError)}`
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Assign provenance to a parsed spawn's cost and tokens.
+   * - CLI-reported cost → `reported` (the token-derived figure is kept too)
+   * - real token counts × pricing → `derived` (stamped with PRICING_VERSION)
+   * - 50/50 split or chars÷4 tokens → `estimated`
+   * Cost is computed over disjoint buckets only (uncached input, cache read,
+   * each cache-write tier, output), so cache tokens are never double-priced.
+   */
+  protected accountSpawnCost(
+    parsed: ParsedCliOutput,
+    request: ExecutionRequest
+  ): SpawnCostAccounting {
+    const cliConfig = this.getCliConfig();
+    const estimationMethods: string[] = [];
+    let tokenProvenance: 'reported' | 'estimated' = 'reported';
+    let tokens = parsed.usage;
+
+    if (!tokens) {
+      const total = parsed.tokensUsed;
+      const zeroCache = { cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
+      if (
+        parsed.inputTokens !== undefined &&
+        parsed.outputTokens !== undefined
+      ) {
+        tokens = {
+          inputTokens: parsed.inputTokens,
+          outputTokens: parsed.outputTokens,
+          ...zeroCache,
+        };
+      } else if (parsed.inputTokens !== undefined) {
+        tokens = {
+          inputTokens: parsed.inputTokens,
+          outputTokens: Math.max(0, total - parsed.inputTokens),
+          ...zeroCache,
+        };
+      } else if (parsed.outputTokens !== undefined) {
+        tokens = {
+          inputTokens: Math.max(0, total - parsed.outputTokens),
+          outputTokens: parsed.outputTokens,
+          ...zeroCache,
+        };
+      } else if (total > 0) {
+        // No breakdown available, estimate 50/50 split
+        tokens = {
+          inputTokens: total * ESTIMATED_CLI_INPUT_TOKEN_RATIO,
+          outputTokens: total * (1 - ESTIMATED_CLI_INPUT_TOKEN_RATIO),
+          ...zeroCache,
+        };
+        estimationMethods.push('split_50_50');
+        tokenProvenance = 'estimated';
+      }
+    }
+    if (parsed.tokensEstimated) {
+      estimationMethods.unshift('chars_div_4');
+      tokenProvenance = 'estimated';
+    }
+
+    // Token-derived figure (per model when the CLI breaks usage down)
+    let derivedCostUsd: number | undefined;
+    const priceUsage = (model: string, usage: NormalizedTokenUsage): number =>
+      calculateCacheAwareCost(
+        bucketsFromUsage(usage),
+        getModelPricing(model, cliConfig.pricingMap, cliConfig.defaultModel),
+        getCacheRates(model, cliConfig.cachePricingMap, cliConfig.defaultModel),
+        model
+      );
+    if (tokens && tokens.inputTokens + tokens.outputTokens > 0) {
+      const byModel = parsed.usageByModel;
+      derivedCostUsd =
+        byModel && Object.keys(byModel).length > 0
+          ? Object.entries(byModel).reduce(
+              (sum, [model, usage]) => sum + priceUsage(model, usage),
+              0
+            )
+          : priceUsage(
+              this.config?.model ||
+                request.agent.preferredModel ||
+                cliConfig.defaultModel,
+              tokens
+            );
+    }
+
+    let costUsd: number | undefined;
+    let costProvenance: CostProvenance | undefined;
+    if (parsed.totalCostUsd !== undefined) {
+      costUsd = parsed.totalCostUsd;
+      costProvenance = 'reported';
+    } else if (derivedCostUsd !== undefined) {
+      costUsd = derivedCostUsd;
+      costProvenance =
+        tokenProvenance === 'estimated' ? 'estimated' : 'derived';
+    }
+
+    if (tokenProvenance === 'estimated') {
+      this.logger.warn(
+        `Spawn tokens estimated (${estimationMethods.join(', ')}); cost is approximate`
+      );
+    }
+
+    return {
+      costUsd,
+      costProvenance,
+      derivedCostUsd,
+      pricingVersion:
+        derivedCostUsd !== undefined ? PRICING_VERSION : undefined,
+      tokens,
+      tokenProvenance: tokens ? tokenProvenance : undefined,
+      estimationMethods,
+      unmodeledModifiers: parsed.unmodeledModifiers ?? [],
+      providerUsage: parsed.providerUsage,
+      costBasis: parsed.costBasis,
+    };
+  }
+
+  /**
+   * One-spawn CostSummary for ExecutionResult metrics
+   */
+  private toCostSummary(
+    accounting: SpawnCostAccounting
+  ): ExecutionResult['metrics']['costSummary'] {
+    return spawnCostSummary({
+      costUsd: accounting.costUsd,
+      costProvenance: accounting.costProvenance,
+      billingBasis: billingBasisForAuth(this.getAuthMode()),
+      tokens: accounting.tokens,
+      tokenProvenance: accounting.tokenProvenance,
+      pricingVersion:
+        accounting.costProvenance === 'reported'
+          ? undefined
+          : accounting.pricingVersion,
+      estimationMethods: accounting.estimationMethods,
+      unmodeledModifiers: accounting.unmodeledModifiers,
+    });
+  }
+
+  /**
+   * Generic usage normalization for JSON CLI output (OpenAI-style inclusive
+   * input; cached tokens from `cached_input_tokens` or
+   * `prompt_tokens_details.cached_tokens`). Subclasses override for
+   * provider-specific shapes.
+   */
+  protected extractUsage(
+    parsed: Record<string, unknown>,
+    inputTokens: number | undefined,
+    outputTokens: number | undefined
+  ): Partial<ParsedCliOutput> {
+    if (inputTokens === undefined || outputTokens === undefined) return {};
+    const usage = (parsed.usage ?? {}) as Record<string, unknown>;
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const details = (usage.prompt_tokens_details ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const cacheRead =
+      num(usage.cached_input_tokens) ?? num(details.cached_tokens) ?? 0;
+    return {
+      usage: {
+        inputTokens,
+        outputTokens,
+        cacheReadInputTokens: Math.min(cacheRead, inputTokens),
+        cacheWriteInputTokens: 0,
+      },
+    };
   }
 
   /**
@@ -616,7 +1242,12 @@ export abstract class BaseCliAdapter extends BaseAdapter {
       await execAsync(`which ${cliConfig.cliCommand}`);
 
       try {
-        const { stdout } = await execAsync(`${cliConfig.cliCommand} --version`);
+        const { stdout } = await execAsync(
+          `${cliConfig.cliCommand} --version`,
+          {
+            env: withoutProviderAdminKeys(),
+          }
+        );
         return {
           available: true,
           version: stdout.trim(),
@@ -674,7 +1305,11 @@ export abstract class BaseCliAdapter extends BaseAdapter {
     'TZ',
   ];
 
+  /** Never passed to CLI children, whatever the allowlists say */
+  private static readonly ENV_DENYLIST = PROVIDER_ADMIN_KEY_DENYLIST;
+
   /** CI-standard vars auto-included when CI=true is detected */
+
   private static readonly CI_VARS = [
     'CI',
     'GITHUB_TOKEN',
@@ -717,7 +1352,14 @@ export abstract class BaseCliAdapter extends BaseAdapter {
 
     // Merge backend-specific vars (API keys, etc.)
     const backendEnv = this.buildEnv();
-    return { ...filtered, ...backendEnv };
+    const env = { ...filtered, ...backendEnv };
+
+    // Provider admin keys are for `costs reconcile` only — never visible to
+    // agent CLIs, even via AIRUNX_EXTRA_ENV_VARS
+    for (const key of BaseCliAdapter.ENV_DENYLIST) {
+      delete env[key];
+    }
+    return env;
   }
 
   /**
@@ -739,16 +1381,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
    * Returns inputTokens/outputTokens when available from CLI JSON output
    * for accurate cost calculation. Falls back to tokensUsed with 50/50 estimation.
    */
-  protected parseOutput(
-    stdout: string,
-    stderr: string
-  ): {
-    outputs: ExecutionResult['outputs'];
-    tokensUsed: number;
-    inputTokens?: number;
-    outputTokens?: number;
-    totalCostUsd?: number;
-  } {
+  protected parseOutput(stdout: string, stderr: string): ParsedCliOutput {
     try {
       // Handle empty stdout before attempting to parse
       if (!stdout.trim()) {
@@ -802,13 +1435,25 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         // Claude Code: total_cost_usd
         const totalCostUsd = getNumeric(parsed.total_cost_usd);
 
-        const tokensUsed =
+        // Provider session ID (Claude Code: session_id)
+        const rawSessionId = parsed.session_id ?? parsed.sessionId;
+        const sessionId =
+          typeof rawSessionId === 'string' ? rawSessionId : undefined;
+
+        const reportedTotal =
           getNumeric(parsed.tokens_used) ??
           getNumeric(parsed.tokensUsed) ??
           getNumeric(parsed.usage?.total_tokens) ??
           (inputTokens !== undefined && outputTokens !== undefined
             ? inputTokens + outputTokens
-            : this.estimateTokens(stdout));
+            : undefined);
+        const tokensEstimated = reportedTotal === undefined;
+        const tokensUsed = reportedTotal ?? this.estimateTokens(stdout);
+        const usageFields = this.extractUsage(
+          parsed,
+          inputTokens,
+          outputTokens
+        );
 
         return {
           outputs: {
@@ -827,6 +1472,9 @@ export abstract class BaseCliAdapter extends BaseAdapter {
           inputTokens,
           outputTokens,
           totalCostUsd,
+          sessionId,
+          ...(tokensEstimated ? { tokensEstimated } : {}),
+          ...usageFields,
         };
       }
     } catch (parseError) {
@@ -851,6 +1499,7 @@ export abstract class BaseCliAdapter extends BaseAdapter {
         recommendations: [],
       },
       tokensUsed: this.estimateTokens(stdout),
+      tokensEstimated: true,
     };
   }
 }

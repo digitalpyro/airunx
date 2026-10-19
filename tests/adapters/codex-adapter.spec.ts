@@ -7,9 +7,18 @@ import * as path from 'path';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex-adapter.js';
 import type {
+  AdapterConfig,
+  AttemptRecord,
   ExecutionRequest,
   ExecutionResult,
+  SpawnRecord,
 } from '../../src/core/adapter-types.js';
+import {
+  OPENAI_CACHE_PRICING,
+  OPENAI_PRICING,
+  calculateCost,
+} from '../../src/adapters/pricing.js';
+import { RetryableError } from '../../src/utils/errors.js';
 
 // Create a test subclass to access protected methods
 class TestableCodexAdapter extends CodexAdapter {
@@ -160,7 +169,8 @@ describe('CodexAdapter', () => {
       const request = createMockRequest({
         context: { workingDirectory: '/test/path' },
       });
-      const specialPrompt = 'test with "quotes" and \'single quotes\' and $vars';
+      const specialPrompt =
+        'test with "quotes" and \'single quotes\' and $vars';
 
       const args = adapter.testBuildCliArgs(request, specialPrompt);
 
@@ -253,5 +263,246 @@ describe('CodexAdapter', () => {
     it('should have type set to cli', () => {
       expect(adapter.type).toBe('cli');
     });
+  });
+});
+
+/** CodexAdapter with the CLI spawn stubbed and auth mode settable */
+class StubbedCodexAdapter extends CodexAdapter {
+  public stdout = '';
+  public records: SpawnRecord[] = [];
+
+  setSubscription(subscription: boolean): void {
+    (this as unknown as { useSubscriptionAuth: boolean }).useSubscriptionAuth =
+      subscription;
+  }
+
+  async init(config: AdapterConfig): Promise<void> {
+    this.config = config;
+    this.initialized = true;
+    this.setSpawnObserver({
+      onSpawnComplete: (record) => this.records.push(record),
+    });
+  }
+
+  protected async executeWithSpawn(): Promise<{
+    stdout: string;
+    stderr: string;
+  }> {
+    return { stdout: this.stdout, stderr: '' };
+  }
+}
+
+const jsonl = (...events: object[]): string =>
+  events.map((e) => JSON.stringify(e)).join('\n');
+
+describe('CodexAdapter normalized tokens and cache-aware cost', () => {
+  let adapter: StubbedCodexAdapter;
+
+  beforeEach(async () => {
+    adapter = new StubbedCodexAdapter();
+    await adapter.init({ type: 'cli', model: 'gpt-5.6-terra' });
+  });
+
+  it('subtracts cached tokens from input before pricing (no double count)', async () => {
+    adapter.stdout = jsonl(
+      { type: 'thread.started', thread_id: 'th-1' },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 60_000,
+          cached_input_tokens: 50_000,
+          output_tokens: 4_000,
+          reasoning_output_tokens: 1_500,
+        },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 40_000,
+          cached_input_tokens: 30_000,
+          output_tokens: 1_000,
+          reasoning_output_tokens: 500,
+        },
+      },
+      { type: 'item.completed', item: { text: 'done' } }
+    );
+    const result = await adapter.execute(createMockRequest());
+    const [record] = adapter.records;
+
+    // input_tokens is already inclusive of cached tokens
+    expect(record.tokens).toEqual({
+      inputTokens: 100_000,
+      outputTokens: 5_000,
+      cacheReadInputTokens: 80_000,
+      cacheWriteInputTokens: 0,
+      reasoningOutputTokens: 2_000,
+    });
+    const p = OPENAI_PRICING['gpt-5.6-terra'];
+    const c = OPENAI_CACHE_PRICING['gpt-5.6-terra'];
+    const expected =
+      (20_000 * p.input + 80_000 * c.cacheRead + 5_000 * p.output) / 1e6;
+    expect(result.metrics.cost).toBeCloseTo(expected, 12);
+    // Cheaper than pricing every input token at the full rate
+    expect(result.metrics.cost!).toBeLessThan(calculateCost(100_000, 5_000, p));
+    expect(record.costProvenance).toBe('derived');
+    expect(record.providerUsage).toEqual({
+      input_tokens: 100_000,
+      cached_input_tokens: 80_000,
+      output_tokens: 5_000,
+      reasoning_output_tokens: 2_000,
+    });
+    // Legacy totals unchanged (no breakdown summing)
+    expect(result.metrics.tokensUsed).toBe(105_000);
+  });
+
+  it('records cache_write_input_tokens when present', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: {
+        input_tokens: 1_000,
+        cached_input_tokens: 200,
+        cache_write_input_tokens: 300,
+        output_tokens: 10,
+      },
+    });
+    await adapter.execute(createMockRequest());
+    expect(adapter.records[0].tokens).toMatchObject({
+      inputTokens: 1_000,
+      cacheReadInputTokens: 200,
+      cacheWriteInputTokens: 300,
+    });
+  });
+
+  it('handles absent cache fields as zero cache tokens', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: { input_tokens: 1_000, output_tokens: 100 },
+    });
+    const result = await adapter.execute(createMockRequest());
+    expect(adapter.records[0].tokens).toEqual({
+      inputTokens: 1_000,
+      outputTokens: 100,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 0,
+    });
+    expect(result.metrics.cost).toBeCloseTo(
+      calculateCost(1_000, 100, OPENAI_PRICING['gpt-5.6-terra']),
+      12
+    );
+  });
+
+  it('tags billing basis from the resolved auth mode', async () => {
+    adapter.stdout = jsonl({
+      type: 'turn.completed',
+      usage: { input_tokens: 1_000, output_tokens: 100 },
+    });
+    adapter.setSubscription(true);
+    await adapter.execute(createMockRequest());
+    adapter.setSubscription(false);
+    await adapter.execute(createMockRequest());
+    expect(adapter.records.map((r) => r.billingBasis)).toEqual([
+      'api_equivalent',
+      'billed',
+    ]);
+  });
+});
+
+describe('CodexAdapter model-rejection retry ledger (U4)', () => {
+  /** Stub whose spawns are scripted: each entry returns or throws */
+  class ScriptedCodexAdapter extends CodexAdapter {
+    public records: SpawnRecord[] = [];
+    public attempts: AttemptRecord[] = [];
+    public script: Array<() => { stdout: string; stderr: string }> = [];
+
+    async init(config: AdapterConfig): Promise<void> {
+      this.config = config;
+      this.initialized = true;
+      this.setSpawnObserver({
+        onSpawnComplete: (record) => this.records.push(record),
+        onAttempt: (record) => this.attempts.push(record),
+      });
+    }
+
+    protected async executeWithSpawn(): Promise<{
+      stdout: string;
+      stderr: string;
+    }> {
+      const next = this.script.shift();
+      if (!next) throw new Error('no scripted spawn left');
+      return next();
+    }
+  }
+
+  const usage = (input: number, output: number): string =>
+    jsonl(
+      {
+        type: 'turn.completed',
+        usage: { input_tokens: input, output_tokens: output },
+      },
+      { type: 'item.completed', item: { text: 'done' } }
+    );
+
+  it('emits two llm_spawn events, one attempt event, and sums both spawns', async () => {
+    const adapter = new ScriptedCodexAdapter();
+    await adapter.init({ type: 'cli', model: 'gpt-5.6-terra' });
+    adapter.script = [
+      () => {
+        // Rejected after doing some billable work (partial usage salvaged)
+        throw Object.assign(new RetryableError('codex exited 1', undefined), {
+          stdout: usage(10_000, 500),
+          stderr: "The 'gpt-5.6-terra' model is not supported",
+        });
+      },
+      () => ({ stdout: usage(20_000, 1_000), stderr: '' }),
+    ];
+
+    const result = await adapter.execute(
+      createMockRequest({
+        spawnContext: {
+          workflowId: 'wf-codex',
+          stage: 'developer',
+          iteration: 1,
+        },
+      })
+    );
+
+    expect(result.success).toBe(true);
+    expect(adapter.records).toHaveLength(2);
+    const [rejected, retry] = adapter.records;
+    expect(rejected.success).toBe(false);
+    expect(rejected.costUsd).toBeGreaterThan(0);
+
+    expect(adapter.attempts).toHaveLength(1);
+    expect(adapter.attempts[0]).toMatchObject({
+      attempt: 1,
+      outcome: 'failure',
+      errorCategory: 'model_rejected',
+      backend: 'codex',
+      spawnId: rejected.spawnId,
+      workflowId: 'wf-codex',
+      stage: 'developer',
+      costUsd: rejected.costUsd,
+    });
+
+    // Stage aggregate equals the spawn sum
+    expect(result.metrics.cost).toBeCloseTo(
+      (rejected.costUsd ?? 0) + (retry.costUsd ?? 0),
+      10
+    );
+    expect(result.metrics.spawnCount).toBe(2);
+    expect(result.metrics.tokensUsed).toBe(
+      rejected.tokensUsed + retry.tokensUsed
+    );
+    const summary = result.metrics.costSummary;
+    expect(summary?.spawnCount).toBe(2);
+    expect(
+      (summary?.billedMicroUsd ?? 0) +
+        (summary?.apiEquivalentMicroUsd ?? 0) +
+        (summary?.unknownBasisMicroUsd ?? 0)
+    ).toBe(
+      Math.round((rejected.costUsd ?? 0) * 1e6) +
+        Math.round((retry.costUsd ?? 0) * 1e6)
+    );
+    expect(result.spawnId).toBe(retry.spawnId);
   });
 });

@@ -4,7 +4,14 @@
  */
 
 import { z } from 'zod';
-import type { AgentRole } from './types.js';
+import type {
+  AgentRole,
+  BillingBasis,
+  CostProvenance,
+  CostSummary,
+  NormalizedTokenUsage,
+  PromptSectionBytes,
+} from './types.js';
 import { AgentRoleSchema, FidelityConfigSchema } from './types.js';
 
 /**
@@ -207,6 +214,178 @@ export interface ExecutionRequest {
     /** Per-agent timeout override derived from fidelity level (milliseconds) */
     timeoutMs?: number;
   };
+  /**
+   * Attribution for the spawn(s) this request produces. Routed by the
+   * SpawnObserver into the ledger; absent → spawn is recorded unattributed.
+   */
+  spawnContext?: SpawnContext;
+}
+
+/**
+ * Attribution carried on an ExecutionRequest so every CLI spawn can be tied
+ * back to its workflow, stage and iteration.
+ */
+export interface SpawnContext {
+  workflowId: string;
+  stage: string;
+  /** 1-indexed iteration of the workflow (matches iteration history) */
+  iteration: number;
+  /** spawn_id of the spawn that delegated this one (CE sub-agents) */
+  parentSpawnId?: string;
+}
+
+/** Why a spawn ended */
+export const SPAWN_EXIT_REASONS = [
+  'ok',
+  'timeout',
+  'hang',
+  'signal',
+  'error',
+] as const;
+export type SpawnExitReason = (typeof SPAWN_EXIT_REASONS)[number];
+
+/** How the backend CLI authenticated (subscription login vs API key) */
+export type SpawnAuthMode = 'subscription' | 'api_key';
+
+/**
+ * Structured record of one completed CLI spawn, handed to the SpawnObserver.
+ * Later units extend this additively (provenance, billing basis,
+ * normalized tokens, pricing version, estimation labels).
+ */
+export interface SpawnRecord {
+  spawnId: string;
+  parentSpawnId?: string;
+  workflowId?: string;
+  stage?: string;
+  iteration?: number;
+  backend: BackendType;
+  /** Model the spawn was priced against (undefined when the CLI chose) */
+  model?: string;
+  authMode?: SpawnAuthMode;
+  agentRole: AgentRole;
+  promptBytes?: number;
+  promptSections?: PromptSectionBytes;
+  /** Raw (provider-reported or estimated) token figures, pre-normalization */
+  tokensUsed: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  /** UTC RFC 3339 */
+  startedAt: string;
+  /** UTC RFC 3339 */
+  endedAt: string;
+  durationMs: number;
+  exitReason: SpawnExitReason;
+  success: boolean;
+  /** True when metrics were recovered from a failed spawn's partial output */
+  salvaged: boolean;
+  /** Error class name on failure (an enum-like category, never the message) */
+  errorCategory?: string;
+  /** Provider session/thread ID when the CLI reports one */
+  providerSessionId?: string;
+  /** How real `costUsd` is; undefined = cost missing (unknown, not $0) */
+  costProvenance?: CostProvenance;
+  /** billed (API key) / api_equivalent (subscription) / unknown */
+  billingBasis?: BillingBasis;
+  /** Token×pricing cross-check kept alongside a reported cost */
+  derivedCostUsd?: number;
+  /** Pricing table version used for any derived figure */
+  pricingVersion?: string;
+  /** Known pricing modifiers (batch, fast mode, …) the table does not model */
+  unmodeledModifiers?: string[];
+  /** Normalized, OTel-aligned token counts (inclusive input) */
+  tokens?: NormalizedTokenUsage;
+  tokenProvenance?: 'reported' | 'estimated';
+  /** Estimation methods used for this spawn (chars_div_4, split_50_50) */
+  estimationMethods?: string[];
+  /** Allowlisted numeric copy of the provider's raw usage fields */
+  providerUsage?: Record<string, number>;
+  /** Claude Code modelUsage[*].costBasis, keyed by model */
+  costBasis?: Record<string, string>;
+  /** OTel GenAI semconv version the token fields map to */
+  semconvVersion?: string;
+  /** Kill-time estimate (USD) for a spawn that ended without cost JSON */
+  spendLostUsd?: number;
+  /** Partial cost (USD) recovered from a failed spawn's output */
+  spendSalvagedUsd?: number;
+}
+
+/**
+ * Receives one SpawnRecord per completed CLI spawn. Implementations must not
+ * throw; adapters additionally guard calls so a failing observer never
+ * affects execution.
+ */
+export interface SpawnObserver {
+  onSpawnComplete(record: SpawnRecord, request: ExecutionRequest): void;
+  /** One execution attempt (retry, fallback switch, model-rejection retry) */
+  onAttempt?(record: AttemptRecord, request: ExecutionRequest): void;
+  /** CE sub-agent delegation decision and completion */
+  onDelegation?(record: DelegationRecord, request: ExecutionRequest): void;
+}
+
+/**
+ * Correlation shared by decision events (copied from the request's
+ * spawnContext; absent fields → unattributed)
+ */
+export interface DecisionEventContext {
+  workflowId?: string;
+  stage?: string;
+  iteration?: number;
+  /** Spawn the event is about (the attempt's spawn / the delegating spawn) */
+  spawnId?: string;
+  parentSpawnId?: string;
+}
+
+/**
+ * One execution attempt that was retried, triggered a fallback, or
+ * succeeded after earlier failures. Clean first-attempt successes are not
+ * recorded (they are not a spend multiplier).
+ */
+export interface AttemptRecord extends DecisionEventContext {
+  /** 1-indexed, counted across fallback switches (never resets) */
+  attempt: number;
+  /** 1-indexed per-backend counter (resets after a fallback switch) */
+  backendAttempt: number;
+  /** Configured attempts per backend */
+  maxAttempts?: number;
+  backend: BackendType;
+  agentRole: AgentRole;
+  outcome: 'success' | 'failure';
+  /** Error class name / enum (never the provider message) */
+  errorCategory?: string;
+  /** This attempt's failure switched to another backend */
+  fallback: boolean;
+  fallbackTo?: BackendType;
+  /** Cost spent by this attempt (salvaged when it failed); undefined = unknown */
+  costUsd?: number;
+  costSummary?: CostSummary;
+}
+
+/** Why CE delegated to sub-agents */
+export type DelegationTriggerReason = 'length' | 'keyword';
+
+/**
+ * CE delegation: `decision` is emitted before sub-agents spawn, `completion`
+ * after they finish with the marginal sub-agent cost.
+ */
+export interface DelegationRecord extends DecisionEventContext {
+  phase: 'decision' | 'completion';
+  triggerReason: DelegationTriggerReason;
+  /** Matched keyword when triggerReason is `keyword` (or also matched) */
+  keyword?: string;
+  /** Where the keyword matched: the task text or the main spawn's analysis */
+  keywordSource?: 'task' | 'analysis';
+  taskLength: number;
+  lengthThreshold: number;
+  subAgentCount: number;
+  subAgents: string[];
+  /** completion only */
+  succeededCount?: number;
+  /** completion only: sum of the sub-agent spawns' costs */
+  marginalCostUsd?: number;
+  /** completion only: integer micro-USD sum of per-spawn ledger costs */
+  marginalCostMicroUsd?: number;
+  marginalCostSummary?: CostSummary;
 }
 
 /**
@@ -234,8 +413,27 @@ export interface ExecutionResult {
     provider?: string;
     /** Number of CLI spawns for this execution (1 for simple, >1 for compound) */
     spawnCount?: number;
+    /** UTF-8 byte size of the prompt sent to the backend */
+    promptBytes?: number;
+    /** Per-section byte breakdown of the prompt (explains large prompts) */
+    promptSections?: PromptSectionBytes;
+    /** Provenance/billing-tagged accounting of the spawn(s) behind `cost` */
+    costSummary?: CostSummary;
   };
   errors: Error[];
+  /**
+   * ID of the CLI spawn that produced this result (the main spawn when an
+   * adapter performs several, e.g. CE delegation)
+   */
+  spawnId?: string;
+}
+
+/**
+ * Prompt text plus its per-section byte breakdown
+ */
+export interface BuiltPrompt {
+  prompt: string;
+  sections: PromptSectionBytes;
 }
 
 /**
@@ -274,6 +472,18 @@ export interface ExecutionAdapter {
    * Clean up resources
    */
   cleanup(): Promise<void>;
+
+  /**
+   * Attach the observer notified after every CLI spawn (optional; adapters
+   * that never spawn may omit it)
+   */
+  setSpawnObserver?(observer: SpawnObserver | undefined): void;
+
+  /**
+   * The attached ledger observer, so callers that drive this adapter (e.g.
+   * the AgentInvoker retry loop) can emit decision events on the same route
+   */
+  getSpawnObserver?(): SpawnObserver | undefined;
 }
 
 /**

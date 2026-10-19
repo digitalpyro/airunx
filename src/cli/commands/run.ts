@@ -54,6 +54,7 @@ import {
 import { VerboseReporter } from '../../orchestrator/verbose-reporter.js';
 import type { StateManager } from '../../orchestrator/state-manager.js';
 import { resolveRepoLocation } from '../../utils/repo-resolver.js';
+import { isValidWorkflowId } from '../../utils/workflow-id.js';
 import { GitHubCLI } from '../../integrations/github-cli.js';
 
 /**
@@ -160,6 +161,11 @@ interface RunOptions {
   dotenv?: string;
   /** Poll GitHub Actions after PR creation and iterate on CI failures (overrides setting) */
   ciVerificationGate?: boolean;
+  /**
+   * Pre-assigned workflow ID (the heartbeat passes one so it can find the
+   * run report after a kill). Validated before any file access.
+   */
+  workflowId?: string;
 }
 
 export async function runOrchestrator(
@@ -174,6 +180,19 @@ export async function runOrchestrator(
   // Stored for restoration in case of future library usage outside CLI context.
   const originalConsoleLog = console.log;
   if (options.format === 'json') console.log = console.error;
+
+  // Validate --workflow-id before anything touches the filesystem: it names
+  // the run report file, so a crafted ID must never reach a path.
+  if (
+    options.workflowId !== undefined &&
+    !isValidWorkflowId(options.workflowId)
+  ) {
+    logger.error(
+      `Error: Invalid --workflow-id ${JSON.stringify(options.workflowId)} (expected 1-64 characters of A-Z, a-z, 0-9, '_' or '-')`
+    );
+    process.exit(1);
+    return;
+  }
 
   // Handle --dotenv override (highest priority for env loading)
   // Note: We use --dotenv instead of --env-file to avoid collision with Node.js 20+ built-in --env-file
@@ -634,10 +653,29 @@ export async function runOrchestrator(
         }
 
         // Create AdapterFactory for lazy adapter initialization
+        // One audit logger + spawn observer for the whole run: every CLI
+        // spawn (including CE sub-agents and adapter-internal retries) lands
+        // in the llm_spawn ledger, attributed via request.spawnContext
         const { createAdapterFactory } = await import(
           '../../adapters/adapter-factory.js'
         );
-        const adapterFactory = createAdapterFactory(config);
+        const { AuditLogger, createAuditSpawnObserver, getDefaultAuditDir } =
+          await import('../../audit/audit-logger.js');
+        // Also recorded by the shutdown coordinator, so a killed run's final
+        // report totals every spawn of the in-flight stage
+        const { shutdownCoordinator: spawnRecorder } = await import(
+          '../../utils/shutdown-coordinator.js'
+        );
+        const spawnObserver = spawnRecorder.observeSpawns(
+          createAuditSpawnObserver(
+            new AuditLogger(getDefaultAuditDir()),
+            (error) =>
+              logger.warn(
+                `Failed to record llm_spawn event: ${error instanceof Error ? error.message : String(error)}`
+              )
+          )
+        );
+        const adapterFactory = createAdapterFactory(config, { spawnObserver });
 
         // Load agent definitions from AGENTS.md for provider routing
         const { loadAgentsDefs } = await import('../../utils/agents-schema.js');
@@ -720,6 +758,14 @@ export async function runOrchestrator(
         const issueUrl =
           parsed.type === 'github' ? parsed.metadata.url : undefined;
 
+        // SIGTERM (heartbeat) / SIGINT (Ctrl-C): interrupt in-flight CLIs
+        // once, let them report, flush the final run report, then exit
+        const { installShutdownSignalHandlers, shutdownCoordinator } =
+          await import('../../utils/shutdown-coordinator.js');
+        const uninstallShutdownHandlers = installShutdownSignalHandlers({
+          exit: (code) => process.exit(code),
+        });
+
         try {
           workflowResult = await executor.execute({
             input: parsed.title,
@@ -744,10 +790,16 @@ export async function runOrchestrator(
             ciVerificationGate:
               options.ciVerificationGate ?? settings.ci_verification_gate,
             markIssueCheckboxes: settings.mark_issue_checkboxes,
+            workflowId: options.workflowId,
           });
         } finally {
           globalThis.clearInterval(updateInterval);
           await verboseReporterHelper?.getReporter()?.stop();
+          // A shutdown in progress owns the exit (after its report flush)
+          if (shutdownCoordinator.isShuttingDown) {
+            await shutdownCoordinator.shutdown();
+          }
+          uninstallShutdownHandlers();
         }
 
         // Update spinner based on actual status

@@ -3,7 +3,6 @@
  * Reads pipeline configuration and executes end-to-end workflows
  */
 
-import crypto from 'crypto';
 import { spawnAsync } from '../utils/async-spawn.js';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
@@ -22,7 +21,7 @@ import type { ProviderRouter } from './provider-router.js';
 import { StateManager } from './state-manager.js';
 import { LangGraphRunner } from './langgraph-runner.js';
 import { TodoManager } from '../utils/todo-manager.js';
-import { DEFAULT_TODO_DIR } from './constants.js';
+import { DEFAULT_STATE_DIR, DEFAULT_TODO_DIR } from './constants.js';
 import { FidelityExecutor } from './fidelity-executor.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
@@ -37,6 +36,11 @@ import type { AutoCommitResult } from '../pr-automation/auto-commit.js';
 import type { PRGeneratorResult } from '../pr-automation/pr-generator.js';
 import type { ContextResolver } from '../utils/context-resolver.js';
 import { loadSettings } from '../utils/settings.js';
+import {
+  assertValidWorkflowId,
+  generateWorkflowId,
+  getRunReportPath,
+} from '../utils/workflow-id.js';
 
 const logger = createLogger('pipeline-executor');
 
@@ -135,6 +139,12 @@ export interface WorkflowExecutionOptions {
   ciVerificationGate?: boolean;
   /** Mark completed checkboxes on source GitHub issues (default: true) */
   markIssueCheckboxes?: boolean;
+  /**
+   * Pre-assigned workflow ID (e.g. from the heartbeat via `--workflow-id`),
+   * used instead of minting one so the caller knows where the run report
+   * lands. Must match WORKFLOW_ID_PATTERN.
+   */
+  workflowId?: string;
 }
 
 /**
@@ -329,7 +339,23 @@ export class PipelineExecutor {
     logger.info(`Max iterations: ${maxIterations}`);
 
     // Create workflow context with pipeline name for resumability
-    const workflowId = this.generateWorkflowId();
+    let workflowId: string;
+    if (options.workflowId !== undefined) {
+      assertValidWorkflowId(options.workflowId);
+      // A reused ID would merge two runs' ledgers, state and run report
+      if (
+        existsSync(join(DEFAULT_STATE_DIR, `${options.workflowId}.json`)) ||
+        existsSync(getRunReportPath(options.workflowId))
+      ) {
+        throw new Error(
+          `Workflow ID '${options.workflowId}' is already in use (existing state or run report). ` +
+            `Pass a fresh --workflow-id (or omit it to generate one).`
+        );
+      }
+      workflowId = options.workflowId;
+    } else {
+      workflowId = generateWorkflowId();
+    }
     const workflowContext = this.stateManager.createWorkflowContext({
       id: workflowId,
       input: options.input,
@@ -591,15 +617,6 @@ export class PipelineExecutor {
       await this.stateManager.updateStatus(workflowId, 'failed');
       throw error;
     }
-  }
-
-  /**
-   * Generate unique workflow ID
-   */
-  private generateWorkflowId(): string {
-    const timestamp = Date.now();
-    const random = crypto.randomBytes(4).toString('hex');
-    return `workflow-${timestamp}-${random}`;
   }
 
   /**

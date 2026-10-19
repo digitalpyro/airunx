@@ -14,6 +14,7 @@ import {
   DEFAULT_MODELS,
 } from './constants.js';
 import { ConfigurationError } from '../utils/errors.js';
+import { withoutProviderAdminKeys } from '../utils/env-filter.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -69,9 +70,11 @@ export class CursorAdapter extends BaseCliAdapter {
 
     try {
       // Try to get cursor-agent status to check authentication
-      const { stdout, stderr } = await execFileAsync(cliConfig.cliCommand, [
-        'status',
-      ]);
+      const { stdout, stderr } = await execFileAsync(
+        cliConfig.cliCommand,
+        ['status'],
+        { env: withoutProviderAdminKeys() }
+      );
 
       const output = `${stdout} ${stderr}`.toLowerCase();
 

@@ -257,6 +257,86 @@ pipelines:
       expect(result.inputType).toBe('prompt');
     });
 
+    it('should use a pre-assigned workflowId instead of minting one', async () => {
+      await setupStandardPipelineConfig();
+      const id = `workflow-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const statePath = path.join('.airunx-state', 'workflows', `${id}.json`);
+
+      try {
+        const result = await pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: id,
+        });
+
+        expect(result.id).toBe(id);
+        const status = await pipelineExecutor.getStatus(id);
+        expect(status?.id).toBe(id);
+      } finally {
+        await rm(statePath, { force: true });
+      }
+    });
+
+    it('should reject a reused workflowId (existing state or run report)', async () => {
+      await setupStandardPipelineConfig();
+      const id = `workflow-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const statePath = path.join('.airunx-state', 'workflows', `${id}.json`);
+      const reportPath = path.join('.airunx-state', 'reports', `${id}.json`);
+
+      try {
+        await pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: id,
+        });
+        await expect(
+          pipelineExecutor.execute({
+            input: 'Test task',
+            inputType: 'prompt',
+            workflowId: id,
+          })
+        ).rejects.toThrow(/already in use/);
+
+        // A run report alone also marks the ID as used
+        await rm(statePath, { force: true });
+        await mkdir(path.dirname(reportPath), { recursive: true });
+        await writeFile(reportPath, '{}', 'utf-8');
+        await expect(
+          pipelineExecutor.execute({
+            input: 'Test task',
+            inputType: 'prompt',
+            workflowId: id,
+          })
+        ).rejects.toThrow(/fresh --workflow-id/);
+      } finally {
+        await rm(statePath, { force: true });
+        await rm(reportPath, { force: true });
+      }
+    });
+
+    it('should mint a pattern-valid workflowId when none is given', async () => {
+      await setupStandardPipelineConfig();
+
+      const result = await pipelineExecutor.execute({
+        input: 'Test task',
+        inputType: 'prompt',
+      });
+
+      expect(result.id).toMatch(/^workflow-\d+-[0-9a-f]{8}$/);
+    });
+
+    it('should reject an invalid workflowId before creating state', async () => {
+      await setupStandardPipelineConfig();
+
+      await expect(
+        pipelineExecutor.execute({
+          input: 'Test task',
+          inputType: 'prompt',
+          workflowId: '../../x',
+        })
+      ).rejects.toThrow(/Invalid workflow ID/);
+    });
+
     it('should use specified pipeline if found', async () => {
       await mkdir(TEST_CONFIG_DIR, { recursive: true });
       const yamlContent = `
