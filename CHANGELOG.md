@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-19
+
+### Added
+
+- Claude 5.5 family: `claude-fable-5-1` ($10/$50), `claude-fable-5`, `claude-opus-5-5` ($4/$20), `claude-opus-5`, `claude-sonnet-5-5` ($2/$10), and `claude-haiku-5-5` ($0.10/$0.50 for prompts up to 100K tokens)
+- GPT-6 family: `gpt-6-astra` ($10/$50), `gpt-6.1-sol` and `gpt-6-sol` ($2/$10), and `gpt-6-luna` ($0.10/$0.50)
+- New `fable` alias (Fable 5.1), plus pinned aliases `fable-5.1`, `fable-5`, `opus-5.5`, `opus-5`, `sonnet-5.5`, and `haiku-5.5`
+- Validation now flags OpenAI models with a scheduled API shutdown and suggests a replacement: a notice before the shutdown date and a warning once it has passed. Covers `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo`, `o1`, and `o1-mini` (2026-10-23), `gpt-4o` and `gpt-4o-mini` (2027-01-14), and `gpt-5.3-codex` and `gpt-5.4-nano` (2027-04-01). Retirement warnings are still shown when cost warnings are turned off.
+- Per-run spend ledger: every CLI spawn is written to the audit log as an attributed `llm_spawn` event, and each figure is labelled `reported`, `derived`, or `estimated`, and as either billed or API-equivalent
+- Per-model prompt-cache pricing (cache reads plus 5-minute and 1-hour cache writes) for Anthropic and OpenAI
+- `airunx costs [--workflow-id] [--json]` to show a run's spend, and `airunx costs reconcile` to compare API-key spend with provider billing
+- The ledger now records which models a spawn actually ran on (`response_models`), as well as the model it requested
+
+### Changed
+
+- Aliases repointed: `opus` → Opus 5.5, `sonnet` → Sonnet 5.5, and `haiku` → Haiku 5.5
+- Backend defaults are now `claude-sonnet-5-5` (Anthropic) and `gpt-6.1-sol` (OpenAI). Cursor passes the OpenAI default as `--model` on every run.
+- Shipped `config/default/AGENTS.md` refreshed: new model table, and the codex reviewer and judge roles now use `gpt-6.1-sol`. The generated template and README examples were updated to match.
+- Validation suggestions and cheaper-model hints no longer offer retiring models, or aliases that point to legacy models
+- Cancelling a run now stops each CLI with SIGINT, then SIGTERM, then SIGKILL, and the heartbeat ends the whole process group, so no CLI keeps running after its run is killed
+- Killed and timed-out runs now report a bounded `estimated` spend instead of $0
+- Provider admin API keys are removed from the environment of every child process
+- **Requires Codex CLI 0.163.0 or newer for GPT-6.** Older CLIs reject GPT-6 on a ChatGPT login. airunx then retries once on the CLI's own default model.
+
+### Fixed
+
+- Codex `auto` approval mode passed `--full-auto`, which Codex CLI 0.163 removed, so every codex stage failed. It now passes `--sandbox workspace-write`, which blocks writes outside the workspace exactly as `--full-auto` did, and older CLIs accept it too. Pipeline mode no longer passes `--sandbox` twice.
+- When a model was set in the backend config, the codex model-rejection retry sent that same model again; it now drops `--model` as intended. The spend from the rejected first attempt is included in the stage total.
+- Corrected prices: `gpt-5.6-sol` $4/$20, `gpt-5.6-terra` $2/$12, `gpt-5.6-luna` $0.20/$1.20; `claude-sonnet-5` $2/$10
+- `heartbeat stop` during a task no longer leaves the issue labelled both `airunx:failed` and `airunx:pending`, and no longer crashes while releasing the task
+- Spawns interrupted by shutdown are counted as killed-spawn losses, not retry waste
+- "failed after N attempt(s)" now reports the number of attempts actually made
+- If marking an issue as running fails, its `airunx:pending` label is restored and the error mentions possibly missing labels
+
 ## [0.1.5] - 2026-07-14
 
 ### Added
