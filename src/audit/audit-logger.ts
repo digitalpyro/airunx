@@ -333,6 +333,7 @@ export class AuditLogger {
           : {}),
         provider_usage: record.providerUsage,
         cost_basis: record.costBasis,
+        response_models: record.responseModels,
         // U5: killed-spawn spend (estimated lost / salvaged partial)
         ...(record.spendLostUsd !== undefined
           ? {

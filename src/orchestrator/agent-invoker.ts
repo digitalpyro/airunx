@@ -524,9 +524,7 @@ export class AgentInvoker {
 
     // All retries exhausted - update circuit breaker
     if (!shutdownRefused) {
-      logger.error(
-        `Agent execution failed after ${this.fidelityParams.retryCount} attempts`
-      );
+      logger.error(`Agent execution failed after ${globalAttempt} attempt(s)`);
     }
 
     // Only count retryable errors toward circuit breaker (a shutdown
@@ -553,7 +551,7 @@ export class AgentInvoker {
       {
         success: false,
         outputs: {
-          analysis: `Agent execution failed after ${this.fidelityParams.retryCount} attempts`,
+          analysis: `Agent execution failed after ${globalAttempt} attempt(s)`,
         },
         metrics: {
           tokensUsed: 0,

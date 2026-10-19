@@ -9,6 +9,9 @@ vi.mock('../../src/integrations/github-cli.js', () => ({
     getCurrentUser: vi.fn().mockResolvedValue('test-user'),
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
     addIssueComment: vi.fn().mockResolvedValue(undefined),
+    assignIssue: vi.fn().mockResolvedValue(undefined),
+    unassignIssue: vi.fn().mockResolvedValue(undefined),
+    getIssueAssignees: vi.fn().mockResolvedValue(['test-user']),
   },
 }));
 
@@ -18,6 +21,32 @@ describe('GitHubTaskQueue', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     queue = new GitHubTaskQueue('owner/repo', 'test-user');
+  });
+
+  describe('checkoutTask', () => {
+    // Live QA: with airunx:running missing from the repo, gh removed
+    // airunx:pending, then failed; the rollback only unassigned
+    it('restores airunx:pending when the label update fails', async () => {
+      const { GitHubCLI } = await import(
+        '../../src/integrations/github-cli.js'
+      );
+      vi.mocked(GitHubCLI.updateIssueLabels).mockRejectedValueOnce(
+        new Error("'airunx:running' not found")
+      );
+
+      await expect(queue.checkoutTask('4')).rejects.toThrow('not found');
+
+      expect(GitHubCLI.updateIssueLabels).toHaveBeenLastCalledWith(
+        'owner/repo',
+        '4',
+        { add: ['airunx:pending'] }
+      );
+      expect(GitHubCLI.unassignIssue).toHaveBeenCalledWith(
+        'owner/repo',
+        '4',
+        'test-user'
+      );
+    });
   });
 
   describe('completeTask', () => {
