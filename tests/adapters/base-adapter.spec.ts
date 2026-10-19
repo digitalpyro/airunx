@@ -4,7 +4,12 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { BaseAdapter } from '../../src/adapters/base-adapter.js';
+import {
+  BaseAdapter,
+  dominantPromptSection,
+} from '../../src/adapters/base-adapter.js';
+import { BaseCliAdapter } from '../../src/adapters/base-cli-adapter.js';
+import type { CliAdapterConfig } from '../../src/adapters/base-cli-adapter.js';
 import { DEFAULT_AGENT_CONFIGS } from '../../src/orchestrator/agent-defaults.js';
 import type {
   ExecutionRequest,
@@ -12,7 +17,10 @@ import type {
   AgentDef,
   ProjectContext,
   BackendAvailability,
+  BuiltPrompt,
+  AdapterConfig,
 } from '../../src/core/adapter-types.js';
+import type { PromptSectionBytes } from '../../src/core/types.js';
 
 // Create a concrete test subclass since BaseAdapter is abstract
 class TestableBaseAdapter extends BaseAdapter {
@@ -40,7 +48,69 @@ class TestableBaseAdapter extends BaseAdapter {
   ): string {
     return this.buildPrompt(agent, task, context);
   }
+
+  public testBuildPromptWithSections(
+    agent: AgentDef,
+    task: string,
+    context: ProjectContext
+  ): BuiltPrompt {
+    return this.buildPromptWithSections(agent, task, context);
+  }
 }
+
+// CLI adapter with a stubbed spawn, to verify sections reach the spawn path
+class StubSpawnCliAdapter extends BaseCliAdapter {
+  name = 'claude-code' as const;
+  public spawnedPrompt?: string;
+  public spawnResult: { stdout: string; stderr: string } | Error = {
+    stdout: JSON.stringify({
+      result: 'ok',
+      input_tokens: 10,
+      output_tokens: 5,
+    }),
+    stderr: '',
+  };
+
+  protected getCliConfig(): CliAdapterConfig {
+    return {
+      cliCommand: 'stub-cli',
+      installInstructions: 'n/a',
+      pricingMap: { 'stub-model': { inputPer1M: 3, outputPer1M: 15 } },
+      defaultModel: 'stub-model',
+    };
+  }
+
+  protected buildCliArgs(_request: ExecutionRequest, prompt: string): string[] {
+    this.spawnedPrompt = prompt;
+    return ['-p', prompt];
+  }
+
+  protected async executeWithSpawn(): Promise<{
+    stdout: string;
+    stderr: string;
+  }> {
+    if (this.spawnResult instanceof Error) throw this.spawnResult;
+    return this.spawnResult;
+  }
+
+  // Skip CLI availability check for unit tests
+  async init(config: AdapterConfig): Promise<void> {
+    this.config = config;
+    this.initialized = true;
+  }
+
+  async isAvailable(): Promise<BackendAvailability> {
+    return { available: true };
+  }
+}
+
+const sumSections = (s: PromptSectionBytes): number =>
+  s.staticContext +
+  s.dynamicContext +
+  s.handoffContext +
+  s.systemPrompt +
+  s.task +
+  s.other;
 
 /**
  * Factory function for creating type-safe mock agent definitions
@@ -74,7 +144,11 @@ describe('BaseAdapter', () => {
       const agent = createMockAgent({ role: 'developer' });
       const context = createMockContext();
 
-      const prompt = adapter.testBuildPrompt(agent, 'implement feature', context);
+      const prompt = adapter.testBuildPrompt(
+        agent,
+        'implement feature',
+        context
+      );
 
       expect(prompt).toContain('## RESTRICTIONS');
       expect(prompt).toContain('git commit, git push, git add');
@@ -85,7 +159,11 @@ describe('BaseAdapter', () => {
       const agent = createMockAgent({ role: 'orchestrator' });
       const context = createMockContext();
 
-      const prompt = adapter.testBuildPrompt(agent, 'coordinate workflow', context);
+      const prompt = adapter.testBuildPrompt(
+        agent,
+        'coordinate workflow',
+        context
+      );
 
       expect(prompt).not.toContain('## RESTRICTIONS');
       expect(prompt).not.toContain('MUST NOT run');
@@ -133,7 +211,11 @@ describe('BaseAdapter', () => {
       const agent = createMockAgent();
       const context = createMockContext();
 
-      const prompt = adapter.testBuildPrompt(agent, 'implement the feature', context);
+      const prompt = adapter.testBuildPrompt(
+        agent,
+        'implement the feature',
+        context
+      );
 
       expect(prompt).toContain('Task: implement the feature');
     });
@@ -184,7 +266,8 @@ describe('BaseAdapter', () => {
       const agent = createMockAgent();
       const context = createMockContext({
         additionalContext: {
-          handoffContext: '### orchestrate\nStatus: completed\nKey decisions made.',
+          handoffContext:
+            '### orchestrate\nStatus: completed\nKey decisions made.',
         },
       });
 
@@ -239,6 +322,129 @@ describe('BaseAdapter', () => {
       expect(prompt).toContain('Project uses TypeScript');
       expect(prompt).toContain('## Previous Stage Outputs');
       expect(prompt).toContain('### orchestrate');
+    });
+  });
+
+  describe('buildPromptWithSections byte accounting', () => {
+    it('should report section bytes that sum to the total when all sections are populated', () => {
+      const agent = createMockAgent({
+        systemPrompt: 'You write careful code.',
+      });
+      const context = createMockContext({
+        additionalContext: {
+          staticContext: 'static ctx',
+          dynamicContext: 'dynamic ctx contents',
+          handoffContext: 'handoff data',
+          toolConfigs: { linter: 'eslint' },
+        },
+      });
+
+      const { prompt, sections } = adapter.testBuildPromptWithSections(
+        agent,
+        'implement feature',
+        context
+      );
+
+      expect(sections.total).toBe(Buffer.byteLength(prompt, 'utf8'));
+      expect(sumSections(sections)).toBe(sections.total);
+      expect(sections.staticContext).toBe('static ctx'.length);
+      expect(sections.dynamicContext).toBe('dynamic ctx contents'.length);
+      expect(sections.handoffContext).toBe('handoff data'.length);
+      expect(sections.systemPrompt).toBe('You write careful code.'.length);
+      expect(sections.task).toBe('implement feature'.length);
+      expect(sections.other).toBeGreaterThan(0);
+    });
+
+    it('should report 0 for empty optional sections', () => {
+      const { sections } = adapter.testBuildPromptWithSections(
+        createMockAgent(),
+        'task',
+        createMockContext()
+      );
+
+      expect(sections.staticContext).toBe(0);
+      expect(sections.dynamicContext).toBe(0);
+      expect(sections.handoffContext).toBe(0);
+      expect(sections.systemPrompt).toBe(0);
+      expect(sections.task).toBe(4);
+      expect(sumSections(sections)).toBe(sections.total);
+    });
+
+    it('should count multi-byte UTF-8 content in bytes, not characters', () => {
+      const text = 'héllo 日本語 🚀';
+      const { prompt, sections } = adapter.testBuildPromptWithSections(
+        createMockAgent(),
+        text,
+        createMockContext({ additionalContext: { staticContext: text } })
+      );
+
+      expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(text.length);
+      expect(sections.task).toBe(Buffer.byteLength(text, 'utf8'));
+      expect(sections.staticContext).toBe(Buffer.byteLength(text, 'utf8'));
+      expect(sections.total).toBe(Buffer.byteLength(prompt, 'utf8'));
+      expect(sumSections(sections)).toBe(sections.total);
+    });
+
+    it('should return the same prompt text as buildPrompt', () => {
+      const agent = createMockAgent({ systemPrompt: 'sys' });
+      const context = createMockContext({
+        additionalContext: { staticContext: 'abc', handoffContext: 'xyz' },
+      });
+
+      expect(
+        adapter.testBuildPromptWithSections(agent, 'task', context).prompt
+      ).toBe(adapter.testBuildPrompt(agent, 'task', context));
+    });
+
+    it('should identify the dominant section', () => {
+      const { sections } = adapter.testBuildPromptWithSections(
+        createMockAgent(),
+        'task',
+        createMockContext({
+          additionalContext: { dynamicContext: 'x'.repeat(5000) },
+        })
+      );
+
+      expect(dominantPromptSection(sections)).toBe('dynamicContext');
+    });
+  });
+
+  describe('prompt sections on the CLI spawn path', () => {
+    const request = (): ExecutionRequest => ({
+      agent: createMockAgent(),
+      task: 'do the thing',
+      context: createMockContext({
+        additionalContext: { handoffContext: 'prior stage output' },
+      }),
+    });
+
+    it('should attach prompt bytes and sections to a successful result', async () => {
+      const cli = new StubSpawnCliAdapter();
+      await cli.init({});
+
+      const result = await cli.execute(request());
+
+      expect(result.success).toBe(true);
+      const sections = result.metrics.promptSections;
+      expect(sections).toBeDefined();
+      expect(result.metrics.promptBytes).toBe(
+        Buffer.byteLength(cli.spawnedPrompt ?? '', 'utf8')
+      );
+      expect(sections?.total).toBe(result.metrics.promptBytes);
+      expect(sections?.handoffContext).toBe('prior stage output'.length);
+      expect(sections?.task).toBe('do the thing'.length);
+    });
+
+    it('should attach prompt sections to a failed result', async () => {
+      const cli = new StubSpawnCliAdapter();
+      await cli.init({});
+      cli.spawnResult = new Error('boom');
+
+      const result = await cli.execute(request());
+
+      expect(result.success).toBe(false);
+      expect(result.metrics.promptSections?.task).toBe('do the thing'.length);
+      expect(result.metrics.promptBytes).toBeGreaterThan(0);
     });
   });
 });

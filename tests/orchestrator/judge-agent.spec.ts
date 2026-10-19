@@ -719,4 +719,53 @@ GAPS:
       expect(result.decision).toBe('PROCEED');
     });
   });
+
+  describe('Spawn attribution', () => {
+    it('forwards spawnContext (stage judge, current iteration) to the adapter request', async () => {
+      vi.mocked(mockAdapter.execute).mockResolvedValue({
+        success: true,
+        outputs: { analysis: 'DECISION: PROCEED\nREASON: Looks good' },
+        metrics: { tokensUsed: 100, duration: 1000 },
+        errors: [],
+      });
+
+      await judgeAgent.judge({
+        acceptanceCriteria: [],
+        fidelityCheckResult: mockFidelityResult,
+        currentIteration: 1,
+        maxIterations: 3,
+        workingDirectory: '/test',
+        spawnContext: { workflowId: 'wf-judge', stage: 'judge', iteration: 2 },
+      });
+
+      expect(mockAdapter.execute).toHaveBeenCalledTimes(1);
+      const request = vi.mocked(mockAdapter.execute).mock.calls[0][0];
+      expect(request.spawnContext).toEqual({
+        workflowId: 'wf-judge',
+        stage: 'judge',
+        iteration: 2,
+      });
+      expect(request.agent.role).toBe('code-judge');
+    });
+
+    it('sends no spawnContext when none is given', async () => {
+      vi.mocked(mockAdapter.execute).mockResolvedValue({
+        success: true,
+        outputs: { analysis: 'DECISION: PROCEED\nREASON: Looks good' },
+        metrics: { tokensUsed: 100, duration: 1000 },
+        errors: [],
+      });
+
+      await judgeAgent.judge({
+        acceptanceCriteria: [],
+        fidelityCheckResult: mockFidelityResult,
+        currentIteration: 1,
+        maxIterations: 3,
+        workingDirectory: '/test',
+      });
+
+      const request = vi.mocked(mockAdapter.execute).mock.calls[0][0];
+      expect(request.spawnContext).toBeUndefined();
+    });
+  });
 });

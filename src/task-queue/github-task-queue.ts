@@ -129,8 +129,20 @@ export class GitHubTaskQueue implements TaskQueue {
           add: ['airunx:running'],
         });
       } catch (error) {
-        // Rollback assignment on label update failure
-        logger.error(`Label update failed for task #${taskId}, rolling back`);
+        // Rollback assignment on label update failure. `gh issue edit` can
+        // apply the removal before failing on a missing label, so restore
+        // airunx:pending or the task silently leaves the queue
+        logger.error(
+          `Label update failed for task #${taskId}, rolling back (do the airunx:running/completed/failed labels exist in ${this.repo}?)`
+        );
+        await GitHubCLI.updateIssueLabels(this.repo, taskId, {
+          add: ['airunx:pending'],
+        }).catch((err) => {
+          logger.warn(
+            `Failed to restore airunx:pending during rollback for task #${taskId}`,
+            err
+          );
+        });
         await GitHubCLI.unassignIssue(
           this.repo,
           taskId,
@@ -430,6 +442,7 @@ function formatMetricsLine(metrics?: TaskResult['metrics']): string {
     parts.push(`Duration: ${(metrics.durationMs / 1000).toFixed(1)}s`);
   if (metrics.iterations != null)
     parts.push(`Iterations: ${metrics.iterations}`);
+  if (metrics.costSummaryLine) parts.push(`Spend: ${metrics.costSummaryLine}`);
 
   return parts.length > 0 ? `\n\n:bar_chart: ${parts.join(' | ')}` : '';
 }

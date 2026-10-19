@@ -439,6 +439,112 @@ export const TodoSchema = z.object({
 });
 
 /**
+ * Prompt sections whose byte size is tracked per spawn.
+ * `other` covers fixed scaffolding (role header, restrictions, project context,
+ * tool configuration, section headings, separators) so sections sum to `total`.
+ */
+export const PROMPT_SECTION_NAMES = [
+  'staticContext',
+  'dynamicContext',
+  'handoffContext',
+  'systemPrompt',
+  'task',
+  'other',
+] as const;
+export type PromptSectionName = (typeof PROMPT_SECTION_NAMES)[number];
+
+/**
+ * Per-section UTF-8 byte counts for a built prompt (sections sum to `total`)
+ */
+export const PromptSectionBytesSchema = z.object({
+  staticContext: z.number().int().nonnegative(),
+  dynamicContext: z.number().int().nonnegative(),
+  handoffContext: z.number().int().nonnegative(),
+  systemPrompt: z.number().int().nonnegative(),
+  task: z.number().int().nonnegative(),
+  other: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+});
+export type PromptSectionBytes = z.infer<typeof PromptSectionBytesSchema>;
+
+/**
+ * How real a cost or token figure is, strongest first:
+ * - reported: the CLI reported it (e.g. Claude Code `total_cost_usd`)
+ * - derived: real token counts × the versioned pricing table
+ * - estimated: chars÷4 / 50-50 split / kill-time fallback
+ */
+export const COST_PROVENANCES = ['reported', 'derived', 'estimated'] as const;
+export type CostProvenance = (typeof COST_PROVENANCES)[number];
+export const CostProvenanceSchema = z.enum(COST_PROVENANCES);
+
+/**
+ * What a dollar figure means:
+ * - billed: API-key spawn, money actually charged by the provider
+ * - api_equivalent: subscription spawn, priced as if it ran on the API
+ * - unknown: auth mode not known (treated as not billed)
+ */
+export const BILLING_BASES = ['billed', 'api_equivalent', 'unknown'] as const;
+export type BillingBasis = (typeof BILLING_BASES)[number];
+export const BillingBasisSchema = z.enum(BILLING_BASES);
+
+/**
+ * OpenTelemetry GenAI semantic-conventions version the normalized token
+ * fields map to (gen_ai.usage.input_tokens / output_tokens /
+ * cache_read.input_tokens / cache_creation.input_tokens /
+ * reasoning.output_tokens)
+ */
+export const GENAI_SEMCONV_VERSION = '1.38.0';
+
+/**
+ * Provider-independent token counts (OTel GenAI semantics):
+ * `inputTokens` is inclusive of cache reads and writes; `outputTokens` is
+ * inclusive of reasoning. Cache and reasoning fields are subsets.
+ */
+export const NormalizedTokenUsageSchema = z.object({
+  inputTokens: z.number().nonnegative(),
+  outputTokens: z.number().nonnegative(),
+  cacheReadInputTokens: z.number().nonnegative(),
+  cacheWriteInputTokens: z.number().nonnegative(),
+  cacheWrite5mInputTokens: z.number().nonnegative().optional(),
+  cacheWrite1hInputTokens: z.number().nonnegative().optional(),
+  reasoningOutputTokens: z.number().nonnegative().optional(),
+});
+export type NormalizedTokenUsage = z.infer<typeof NormalizedTokenUsageSchema>;
+
+/**
+ * Aggregate, provenance-tagged cost accounting for one or more spawns.
+ * Carried on ExecutionResult metrics, StageRecord, WorkflowMetrics and
+ * RunReport. Money is integer micro-USD. Billing-basis totals and
+ * provenance totals each partition the same priced spend.
+ */
+export const CostSummarySchema = z.object({
+  /** Weakest cost provenance across priced spawns (absent if none priced) */
+  provenance: CostProvenanceSchema.optional(),
+  /** Weakest token provenance across spawns that reported tokens */
+  tokenProvenance: z.enum(['reported', 'estimated']).optional(),
+  billedMicroUsd: z.number().int(),
+  apiEquivalentMicroUsd: z.number().int(),
+  unknownBasisMicroUsd: z.number().int(),
+  reportedMicroUsd: z.number().int(),
+  derivedMicroUsd: z.number().int(),
+  estimatedMicroUsd: z.number().int(),
+  /** Spawns folded into this summary */
+  spawnCount: z.number().int().nonnegative(),
+  /** Spawns whose cost is unknown (no figure, never counted as $0) */
+  missingCostSpawns: z.number().int().nonnegative(),
+  /** Spawns whose cost or tokens were estimated */
+  estimatedSpawns: z.number().int().nonnegative(),
+  /** Distinct estimation methods used (e.g. chars_div_4, split_50_50) */
+  estimationMethods: z.array(z.string()),
+  tokens: NormalizedTokenUsageSchema,
+  /** Distinct pricing table versions used by derived figures */
+  pricingVersions: z.array(z.string()),
+  /** Known pricing modifiers the table does not model */
+  unmodeledModifiers: z.array(z.string()),
+});
+export type CostSummary = z.infer<typeof CostSummarySchema>;
+
+/**
  * Quality metrics schema
  */
 export const QualityMetricsSchema = z.object({
@@ -463,6 +569,26 @@ export const WorkflowMetricsSchema = z.object({
   costEstimate: z.number().optional(),
   actualCost: z.number().optional(),
   totalCost: z.number().optional(),
+  /** Provenance/billing-tagged cost accounting across the run */
+  costSummary: CostSummarySchema.optional(),
+});
+
+/**
+ * Per-stage record schema (mirrors StageRecord; shared by top-level
+ * stageRecords and iteration history entries so both keep new fields)
+ */
+export const StageRecordSchema = z.object({
+  stage: z.string(),
+  agent: z.string(),
+  backend: z.string(),
+  spawnCount: z.number(),
+  durationMs: z.number(),
+  tokensUsed: z.number(),
+  costUsd: z.number(),
+  promptSummary: z.string().optional(),
+  timestamp: z.string(),
+  status: z.enum(['completed', 'error', 'skipped', 'killed']),
+  costSummary: CostSummarySchema.optional(),
 });
 
 /**
@@ -549,22 +675,7 @@ export const WorkflowContextSchema = z.object({
           durationMs: z.number().optional(),
           costUsd: z.number().optional(),
           tokensUsed: z.number().optional(),
-          stageRecords: z
-            .array(
-              z.object({
-                stage: z.string(),
-                agent: z.string(),
-                backend: z.string(),
-                spawnCount: z.number(),
-                durationMs: z.number(),
-                tokensUsed: z.number(),
-                costUsd: z.number(),
-                promptSummary: z.string().optional(),
-                timestamp: z.string(),
-                status: z.enum(['completed', 'error', 'skipped']),
-              })
-            )
-            .optional(),
+          stageRecords: z.array(StageRecordSchema).optional(),
         })
       ),
     })
@@ -591,22 +702,7 @@ export const WorkflowContextSchema = z.object({
     .optional(),
 
   // Rich per-stage records for run reporting
-  stageRecords: z
-    .array(
-      z.object({
-        stage: z.string(),
-        agent: z.string(),
-        backend: z.string(),
-        spawnCount: z.number(),
-        durationMs: z.number(),
-        tokensUsed: z.number(),
-        costUsd: z.number(),
-        promptSummary: z.string().optional(),
-        timestamp: z.string(),
-        status: z.enum(['completed', 'error', 'skipped']),
-      })
-    )
-    .optional(),
+  stageRecords: z.array(StageRecordSchema).optional(),
 
   // External integrations
   cardUrl: z.string().optional(),
@@ -666,7 +762,10 @@ export interface StageRecord {
   costUsd: number;
   promptSummary?: string; // first 200 chars of the task prompt
   timestamp: string; // ISO 8601 start time
-  status: 'completed' | 'error' | 'skipped';
+  /** `killed`: in flight when the run was shut down (final report only) */
+  status: 'completed' | 'error' | 'skipped' | 'killed';
+  /** Provenance/billing-tagged cost accounting for this stage's spawns */
+  costSummary?: CostSummary;
 }
 
 /**
@@ -699,6 +798,10 @@ export interface RunReport {
   iterations: IterationEntry[];
   stages: StageRecord[]; // flat list across all iterations
   timeline: TimelineEvent[]; // ordered list of key events
+  /** Provenance/billing-tagged cost accounting across the run */
+  costSummary?: CostSummary;
+  /** Human-readable cost line, e.g. "$1.20 billed / $3.40 API-equivalent — 95% reported/derived, 5% estimated" */
+  costSummaryLine?: string;
 }
 
 /**
@@ -806,6 +909,8 @@ export interface WorkflowMetrics {
   /** @deprecated Use totalCost instead. */
   actualCost?: number;
   totalCost?: number;
+  /** Provenance/billing-tagged cost accounting across the run */
+  costSummary?: CostSummary;
 }
 
 export interface AgentConfig {

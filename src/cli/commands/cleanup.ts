@@ -16,6 +16,7 @@ import { loadSettings } from '../../utils/settings.js';
 import { createLogger } from '../../utils/logger.js';
 import { findStaleRepos } from '../../utils/repo-resolver.js';
 import { spawnAsync } from '../../utils/async-spawn.js';
+import { assertValidWorkflowId } from '../../utils/workflow-id.js';
 
 const logger = createLogger('cleanup');
 
@@ -62,11 +63,40 @@ function getDebugFilesMaxAgeDays(options: CleanupOptions): number {
   return 0;
 }
 
-interface CleanupOptions {
+/** Default audit-log retention: long enough to reconcile any closed day. */
+const DEFAULT_AUDIT_LOG_RETENTION_DAYS = 30;
+
+/**
+ * Determine the audit log retention in days from options.
+ * Returns undefined when audit cleanup is not requested. Unlike debug files,
+ * 0 is meaningful here (remove every closed day; today's file is always kept).
+ */
+export function getAuditLogsMaxAgeDays(
+  options: CleanupOptions
+): number | undefined {
+  if (!options.all && options.auditLogs === undefined) {
+    return undefined;
+  }
+  if (
+    options.auditLogs === undefined ||
+    typeof options.auditLogs === 'boolean'
+  ) {
+    return DEFAULT_AUDIT_LOG_RETENTION_DAYS;
+  }
+  const days = Number(options.auditLogs);
+  if (!Number.isInteger(days) || days < 0) {
+    throw new Error('--audit-logs must be a non-negative integer');
+  }
+  return days;
+}
+
+export interface CleanupOptions {
   /** Clean up all orphan worktrees */
   worktrees?: boolean;
   /** Clean up debug files older than N days (default: 7) */
   debugFiles?: boolean | string;
+  /** Clean up audit logs older than N days (default: 30) */
+  auditLogs?: boolean | string;
   /** Clean up workflow state files */
   workflowState?: boolean;
   /** Clean up todo files */
@@ -87,6 +117,11 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
   const spinner = ora('Analyzing cleanup targets...').start();
 
   try {
+    // The ID becomes a state-file path; reject traversal before any I/O
+    if (options.workflowId !== undefined) {
+      assertValidWorkflowId(options.workflowId);
+    }
+
     // Load settings and resolve project directory
     const settings = loadSettings();
     const projectDir = resolveProjectDirectory(options.project, settings);
@@ -111,6 +146,7 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
       todos: options.all || options.todos || false,
       force: options.force || false,
       workflowId: options.workflowId,
+      auditLogsMaxAgeDays: getAuditLogsMaxAgeDays(options),
       dryRun: options.dryRun || false,
     };
 
@@ -119,6 +155,7 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
       options.all ||
       options.worktrees ||
       options.debugFiles !== undefined ||
+      options.auditLogs !== undefined ||
       options.workflowState ||
       options.todos ||
       options.workflowId;
@@ -153,6 +190,7 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
       { count: result.debugFilesRemoved, label: 'debug file' },
       { count: result.workflowStatesRemoved, label: 'workflow state' },
       { count: result.todosRemoved, label: 'todo' },
+      { count: result.auditLogsRemoved, label: 'audit log' },
     ];
 
     const items = cleanupItems
@@ -167,6 +205,14 @@ export async function cleanupCommand(options: CleanupOptions): Promise<void> {
     } else {
       for (const item of items) {
         console.log(chalk.green(`  ✓ ${item}`));
+      }
+    }
+
+    // List audit logs on dry run so retention can be reviewed before deleting
+    if (options.dryRun && result.auditLogFiles.length > 0) {
+      console.log(chalk.dim('\n  Audit logs that would be removed:'));
+      for (const file of result.auditLogFiles) {
+        console.log(chalk.dim(`    - ${file}`));
       }
     }
 

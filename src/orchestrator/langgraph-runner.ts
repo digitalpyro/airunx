@@ -5,17 +5,12 @@
 
 import { performance } from 'perf_hooks';
 import { spawnAsync } from '../utils/async-spawn.js';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { StateGraph, END, START } from '@langchain/langgraph';
 import type {
   Pipeline,
+  CostSummary,
   RunReport,
   StageRecord,
   TimelineEvent,
@@ -27,6 +22,7 @@ import {
   type ExecutionAdapter,
   type ExecutionResult,
   type ProjectContext,
+  type SpawnContext,
 } from '../core/adapter-types.js';
 import {
   selectAdapterForRole,
@@ -45,17 +41,37 @@ import {
   type IterationEntry,
 } from './iteration-history.js';
 import { FidelityExecutor } from './fidelity-executor.js';
+import { loadRunReport, writeRunReportFile } from '../utils/run-report-io.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
 import { DEFAULT_MAX_ITERATIONS } from './iteration-manager.js';
+import {
+  formatCostSummaryLine,
+  mergeCostSummaries,
+} from '../core/cost-accounting.js';
 import { formatHandoffContext } from './handoff-context.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+  type SpawnSpendSummary,
+} from '../utils/shutdown-coordinator.js';
 
 /**
  * Safety ceiling for LangGraph super-steps. Generous to avoid false trips;
  * the application's own IterationManager enforces the real iteration limit.
  */
 const LANGGRAPH_RECURSION_CEILING = 1000;
+
+/** Run-report timeline entry for a stage record */
+function timelineEventOf(sr: StageRecord): TimelineEvent {
+  return {
+    timestamp: sr.timestamp,
+    event: `${sr.stage} complete (${(sr.durationMs / 1000).toFixed(1)}s)`,
+    durationMs: sr.durationMs,
+    details: sr.agent !== sr.stage ? sr.agent : undefined,
+  };
+}
 
 const logger = createLogger('langgraph-runner');
 
@@ -67,7 +83,12 @@ type StageOutput =
   | {
       success: boolean;
       outputs: Record<string, unknown>;
-      metrics: { tokensUsed: number; duration: number; cost?: number };
+      metrics: {
+        tokensUsed: number;
+        duration: number;
+        cost?: number;
+        costSummary?: CostSummary;
+      };
       errors?: Error[];
     };
 
@@ -135,6 +156,15 @@ export class LangGraphRunner {
   private auditLogger?: AuditLogger;
   /** Workflow start time for incremental report writing */
   private workflowStartTime = 0;
+  /** 0-indexed iteration count, kept in step with the judge's iterations */
+  private currentIteration = 0;
+  /** Stages started but not yet returned, by name → start time (ISO) */
+  private inFlightStages = new Map<string, string>();
+  /**
+   * Set once the shutdown flush starts: the final `interrupted` report owns
+   * the file, so late incremental writes must not overwrite it
+   */
+  private shutdownFlushStarted = false;
 
   constructor(
     adapter: ExecutionAdapter,
@@ -196,6 +226,38 @@ export class LangGraphRunner {
     }
 
     this.iterationManager = new IterationManager(this.stateManager);
+    this.currentIteration = this.workflowContext.iterationCount ?? 0;
+  }
+
+  /**
+   * Ledger attribution for spawns made by a stage (iteration is 1-indexed,
+   * matching iteration history)
+   */
+  private buildSpawnContext(workflowId: string, stage: string): SpawnContext {
+    return { workflowId, stage, iteration: this.currentIteration + 1 };
+  }
+
+  /**
+   * Run a stage node, emitting stage_error if it throws
+   */
+  private async runStageNode(
+    workflowId: string,
+    stageName: string,
+    node: () => Promise<Partial<GraphState>>
+  ): Promise<Partial<GraphState>> {
+    this.inFlightStages.set(stageName, new Date().toISOString());
+    try {
+      const result = await node();
+      this.inFlightStages.delete(stageName);
+      return result;
+    } catch (error) {
+      this.auditLogger?.logStageError(
+        workflowId,
+        stageName,
+        toError(error).name
+      );
+      throw error;
+    }
   }
 
   /**
@@ -246,12 +308,16 @@ export class LangGraphRunner {
       if (stage.name === 'judge') {
         // Judge node has special handling
         graph.addNode(stage.name, async (state: GraphState) => {
-          return await this.executeJudgeNode(state, stage.name);
+          return await this.runStageNode(state.workflowId, stage.name, () =>
+            this.executeJudgeNode(state, stage.name)
+          );
         });
       } else {
         // Regular agent node
         graph.addNode(stage.name, async (state: GraphState) => {
-          return await this.executeAgentNode(state, stage.name);
+          return await this.runStageNode(state.workflowId, stage.name, () =>
+            this.executeAgentNode(state, stage.name)
+          );
         });
       }
     }
@@ -288,6 +354,12 @@ export class LangGraphRunner {
 
     // Update workflow status
     await this.stateManager.updateStatus(this.workflowContext.id, 'running');
+
+    // On run shutdown (SIGTERM/SIGINT), write a final report that includes
+    // the in-flight stage's spend once interrupted spawns have settled
+    const unregisterFlush = shutdownCoordinator.onFlush((spawns) =>
+      this.flushReportOnShutdown(spawns)
+    );
 
     // Execute graph
     logger.info('Executing StateGraph');
@@ -376,7 +448,136 @@ export class LangGraphRunner {
       logger.error('StateGraph execution failed:', toError(error));
       await this.stateManager.updateStatus(this.workflowContext.id, 'failed');
       throw error;
+    } finally {
+      unregisterFlush();
     }
+  }
+
+  /**
+   * A stage interrupted by run shutdown stops here, still in flight: the
+   * shutdown flush owns its (killed) record, so it is never persisted twice
+   */
+  private assertNotShuttingDown(): void {
+    if (shutdownCoordinator.isShuttingDown) {
+      throw new ShutdownInProgressError();
+    }
+  }
+
+  /**
+   * Final run report on shutdown. Stages still in flight get a `killed`
+   * stage record carrying the spend of every spawn they made since they
+   * started — completed earlier spawns (CE main spawn, failed retries),
+   * spawns finished but not yet persisted, timed-out ladders, and spawns
+   * shutdown interrupted (reported when the CLI answered SIGINT with result
+   * JSON, else estimated — the cost summary labels which).
+   *
+   * Base: the persisted state; if that is unavailable, the last on-disk run
+   * report (never the stale in-memory context, which would drop completed
+   * stages); if neither exists, nothing is written.
+   */
+  private async flushReportOnShutdown(
+    spawns: readonly SpawnSpendSummary[]
+  ): Promise<void> {
+    this.shutdownFlushStarted = true;
+    const workflowId = this.workflowContext.id;
+    const totalRuntimeMs = Math.round(
+      performance.now() - this.workflowStartTime
+    );
+
+    let context: WorkflowContext | null = null;
+    try {
+      context = await this.stateManager.load(workflowId);
+    } catch (error) {
+      logger.warn('Shutdown flush: could not load workflow state:', error);
+    }
+
+    let base: RunReport | null;
+    if (context) {
+      base = this.buildRunReport(context, totalRuntimeMs);
+    } else {
+      try {
+        base = loadRunReport(workflowId);
+      } catch {
+        base = null;
+      }
+      if (!base) {
+        logger.warn(
+          'Shutdown flush: no workflow state or run report to extend; skipping final report'
+        );
+        return;
+      }
+      logger.warn(
+        'Shutdown flush: workflow state unavailable; extending the last run report'
+      );
+    }
+
+    const killed = this.killedStageRecords(base.stages, spawns);
+    let costSummary = base.costSummary;
+    for (const record of killed) {
+      costSummary = mergeCostSummaries(costSummary, record.costSummary);
+    }
+    const report: RunReport = {
+      ...base,
+      status: 'interrupted',
+      completedAt: new Date().toISOString(),
+      totalDurationMs: context ? base.totalDurationMs : totalRuntimeMs,
+      totalTokens:
+        (base.totalTokens ?? 0) +
+        killed.reduce((sum, r) => sum + r.tokensUsed, 0),
+      totalCostUsd:
+        base.totalCostUsd + killed.reduce((sum, r) => sum + r.costUsd, 0),
+      stages: [...base.stages, ...killed],
+      timeline: [...base.timeline, ...killed.map(timelineEventOf)],
+      ...(costSummary
+        ? { costSummary, costSummaryLine: formatCostSummaryLine(costSummary) }
+        : {}),
+    };
+    this.persistRunReport(report);
+  }
+
+  /**
+   * `killed` records for in-flight stages that have not persisted their own
+   * record since they started, totalling every spawn of that stage run
+   */
+  private killedStageRecords(
+    existing: readonly StageRecord[],
+    spawns: readonly SpawnSpendSummary[]
+  ): StageRecord[] {
+    const workflowId = this.workflowContext.id;
+    const killed: StageRecord[] = [];
+    for (const [stage, startedAt] of this.inFlightStages) {
+      // The node may already have persisted its own (error) record
+      if (existing.some((r) => r.stage === stage && r.timestamp >= startedAt)) {
+        continue;
+      }
+      const stageSpawns = spawns.filter(
+        (s) =>
+          s.workflowId === workflowId &&
+          s.stage === stage &&
+          s.startedAt >= startedAt
+      );
+      const record: StageRecord = {
+        stage,
+        agent:
+          stageSpawns[0]?.agentRole ??
+          this.pipeline.stages.find((st) => st.name === stage)?.agent ??
+          stage,
+        backend:
+          stageSpawns[0]?.backend ?? this.workflowContext.backend ?? 'unknown',
+        spawnCount: stageSpawns.length,
+        durationMs: Date.now() - Date.parse(startedAt),
+        tokensUsed: stageSpawns.reduce((sum, s) => sum + s.tokensUsed, 0),
+        costUsd: stageSpawns.reduce((sum, s) => sum + (s.costUsd ?? 0), 0),
+        timestamp: startedAt,
+        status: 'killed',
+      };
+      const stageSummary = mergeCostSummaries(
+        ...stageSpawns.map((s) => s.costSummary)
+      );
+      if (stageSummary) record.costSummary = stageSummary;
+      killed.push(record);
+    }
+    return killed;
   }
 
   /**
@@ -629,6 +830,7 @@ export class LangGraphRunner {
     // Capture timing for performance visibility
     const stageStart = performance.now();
     const stageStartIso = new Date().toISOString();
+    this.auditLogger?.logStageStart(state.workflowId, stageName);
 
     // Verbose: Log stage start
     if (this.verbose) {
@@ -663,7 +865,17 @@ export class LangGraphRunner {
       task,
       projectContext,
       previousOutputs: state.stageOutputs,
+      spawnContext: this.buildSpawnContext(state.workflowId, stageName),
     });
+    this.assertNotShuttingDown();
+
+    if (!result.success) {
+      this.auditLogger?.logStageError(
+        state.workflowId,
+        stageName,
+        result.errors[0]?.name ?? 'StageFailed'
+      );
+    }
 
     const stageDuration = performance.now() - stageStart;
     const stageSpawnCount = result.metrics.spawnCount ?? 1;
@@ -694,6 +906,9 @@ export class LangGraphRunner {
       durationMs: stageDuration,
       tokensUsed: result.metrics.tokensUsed,
       costUsd: result.metrics.cost ?? 0,
+      ...(result.metrics.costSummary
+        ? { costSummary: result.metrics.costSummary }
+        : {}),
       promptSummary:
         task.length > 200
           ? task.slice(0, 200).replace(/\n/g, ' ') + '…'
@@ -716,6 +931,11 @@ export class LangGraphRunner {
           (context.metrics.totalTokens || 0) + result.metrics.tokensUsed;
         context.metrics.totalCost =
           (context.metrics.totalCost || 0) + (result.metrics.cost || 0);
+        // Provenance/billing-tagged totals (weakest provenance wins)
+        context.metrics.costSummary = mergeCostSummaries(
+          context.metrics.costSummary,
+          result.metrics.costSummary
+        );
         context.metrics.stagesCompleted =
           (context.metrics.stagesCompleted || 0) + 1;
 
@@ -843,6 +1063,7 @@ export class LangGraphRunner {
     // Capture timing for performance visibility
     const stageStart = performance.now();
     const stageStartIso = new Date().toISOString();
+    this.auditLogger?.logStageStart(state.workflowId, stageName);
 
     // Find stage configuration
     const stage = this.pipeline.stages.find((s) => s.name === stageName);
@@ -960,6 +1181,7 @@ export class LangGraphRunner {
     }
     const currentIteration = context.iterationCount ?? 0;
     const maxIterations = context.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.currentIteration = currentIteration;
 
     // Extract checkbox items from the task description (issue body) for the judge to evaluate
     // context.input is the short parsed title; context.taskDescription has the full issue body
@@ -1019,11 +1241,13 @@ export class LangGraphRunner {
       workingDirectory: this.workflowContext.worktreePath || process.cwd(),
       fidelityLevel: fidelityResolution.level,
       preJudgeTestOutput,
+      spawnContext: this.buildSpawnContext(state.workflowId, stageName),
       issueCheckboxes:
         issueCheckboxes && issueCheckboxes.length > 0
           ? issueCheckboxes
           : undefined,
     });
+    this.assertNotShuttingDown();
 
     // Build iteration history entry (will be enriched with cost data in state update)
     const stageOutput = state.stageOutputs[evaluatesStage];
@@ -1048,6 +1272,9 @@ export class LangGraphRunner {
 
     let shouldIterate = false;
     let iterationTarget: string | undefined;
+    /** Projected re-run cost on ITERATE (for the iteration_decision event) */
+    let projectedRerunCostUsd: number | undefined;
+    let remainingIterationsAfter: number | undefined;
 
     // Prepare updated stage outputs (may be modified for iteration)
     let updatedStageOutputs = { ...state.stageOutputs };
@@ -1065,6 +1292,8 @@ export class LangGraphRunner {
       const projectedCost = lastEntry?.costUsd ?? currentTotalCost;
       const remainingIterations =
         (this.workflowContext.maxIterations ?? 1) - currentIteration - 1;
+      projectedRerunCostUsd = projectedCost;
+      remainingIterationsAfter = remainingIterations;
       logger.info(
         `Iterating: cost so far $${currentTotalCost.toFixed(2)}, ` +
           `projected next iteration ~$${projectedCost.toFixed(2)}, ` +
@@ -1096,10 +1325,13 @@ export class LangGraphRunner {
       }
 
       // Start iteration - use evaluatesStage validated at function start
-      await this.iterationManager.startIteration(
+      const nextIteration = await this.iterationManager.startIteration(
         state.workflowId,
         evaluatesStage
       );
+      if (typeof nextIteration === 'number') {
+        this.currentIteration = nextIteration;
+      }
       shouldIterate = true;
       iterationTarget = evaluatesStage;
     } else {
@@ -1123,6 +1355,9 @@ export class LangGraphRunner {
         tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
         duration: judgeResult.metrics?.duration ?? 0,
         cost: judgeResult.metrics?.cost ?? 0,
+        ...(judgeResult.metrics?.costSummary
+          ? { costSummary: judgeResult.metrics.costSummary }
+          : {}),
       },
       errors:
         judgeResult.decision === 'FAIL'
@@ -1148,6 +1383,9 @@ export class LangGraphRunner {
       durationMs: stageDuration,
       tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
       costUsd: judgeResult.metrics?.cost ?? 0,
+      ...(judgeResult.metrics?.costSummary
+        ? { costSummary: judgeResult.metrics.costSummary }
+        : {}),
       timestamp: stageStartIso,
       status: judgeResult.decision === 'FAIL' ? 'error' : 'completed',
     };
@@ -1166,6 +1404,10 @@ export class LangGraphRunner {
         (judgeResult.metrics?.tokensUsed ?? 0);
       context.metrics.totalCost =
         (context.metrics.totalCost || 0) + (judgeResult.metrics?.cost ?? 0);
+      context.metrics.costSummary = mergeCostSummaries(
+        context.metrics.costSummary,
+        judgeResult.metrics?.costSummary
+      );
 
       // Record rich stage record for run reporting
       context.stageRecords = context.stageRecords || [];
@@ -1210,6 +1452,41 @@ export class LangGraphRunner {
 
       return context;
     });
+
+    // Every verdict is a spend decision: record it with the completed
+    // iteration's cost and (on ITERATE) the projected re-run cost
+    let runCostUsd: number | undefined;
+    try {
+      runCostUsd = (await this.stateManager.load(state.workflowId))?.metrics
+        .totalCost;
+    } catch {
+      // Best-effort figure only
+    }
+    this.auditLogger?.logIterationDecision(state.workflowId, {
+      stage: stageName,
+      evaluatesStage,
+      verdict: judgeResult.decision,
+      iteration: currentIteration + 1,
+      maxIterations,
+      gapCount: judgeResult.gaps.length,
+      willIterate: shouldIterate,
+      iterationCostUsd: iterationEntry.costUsd,
+      projectedRerunCostUsd,
+      remainingIterations: remainingIterationsAfter,
+      runCostUsd,
+    });
+
+    this.auditLogger?.logStageComplete(
+      state.workflowId,
+      stageName,
+      stageDuration,
+      {
+        tokensUsed: judgeResult.metrics?.tokensUsed ?? 0,
+        costUsd: judgeResult.metrics?.cost ?? 0,
+        agent: 'code-judge',
+        spawnCount: judgeStageRecord.spawnCount,
+      }
+    );
 
     return {
       currentStage: stageName,
@@ -1267,48 +1544,58 @@ export class LangGraphRunner {
   /**
    * Build and write a structured RunReport JSON to disk.
    * Consumers (issue comments, dashboards) read this file to render rich tables.
+   * Skipped once the shutdown flush started (it writes the final report).
    */
   private writeRunReport(
     context: WorkflowContext,
     totalRuntimeMs: number
   ): void {
+    if (this.shutdownFlushStarted) {
+      logger.debug('Skipping run report write: shutdown flush owns the file');
+      return;
+    }
     try {
-      const stageRecords = context.stageRecords || [];
+      this.persistRunReport(this.buildRunReport(context, totalRuntimeMs));
+    } catch (err) {
+      // Non-fatal: don't crash the pipeline if report building fails
+      logger.warn('Failed to write run report:', err);
+    }
+  }
 
-      // Build timeline from stage records
-      const timeline: TimelineEvent[] = stageRecords.map((sr) => ({
-        timestamp: sr.timestamp,
-        event: `${sr.stage} complete (${(sr.durationMs / 1000).toFixed(1)}s)`,
-        durationMs: sr.durationMs,
-        details: sr.agent !== sr.stage ? sr.agent : undefined,
-      }));
+  /** RunReport for a workflow context */
+  private buildRunReport(
+    context: WorkflowContext,
+    totalRuntimeMs: number
+  ): RunReport {
+    const stageRecords = context.stageRecords || [];
+    return {
+      workflowId: context.id,
+      taskTitle: context.taskTitle,
+      pipelineName: context.pipelineName,
+      status: context.status,
+      startedAt: new Date(context.createdAt).toISOString(),
+      completedAt: new Date().toISOString(),
+      totalDurationMs: totalRuntimeMs,
+      totalTokens: context.metrics.totalTokens ?? context.metrics.tokensUsed,
+      totalCostUsd: context.metrics.totalCost ?? 0,
+      iterationCount: context.iterationCount ?? 1,
+      maxIterations: context.maxIterations ?? 1,
+      iterations: context.iterationHistory?.entries ?? [],
+      stages: stageRecords,
+      timeline: stageRecords.map(timelineEventOf),
+      ...(context.metrics.costSummary
+        ? {
+            costSummary: context.metrics.costSummary,
+            costSummaryLine: formatCostSummaryLine(context.metrics.costSummary),
+          }
+        : {}),
+    };
+  }
 
-      const report: RunReport = {
-        workflowId: context.id,
-        taskTitle: context.taskTitle,
-        pipelineName: context.pipelineName,
-        status: context.status,
-        startedAt: context.createdAt.toISOString(),
-        completedAt: new Date().toISOString(),
-        totalDurationMs: totalRuntimeMs,
-        totalTokens: context.metrics.totalTokens ?? context.metrics.tokensUsed,
-        totalCostUsd: context.metrics.totalCost ?? 0,
-        iterationCount: context.iterationCount ?? 1,
-        maxIterations: context.maxIterations ?? 1,
-        iterations: context.iterationHistory?.entries ?? [],
-        stages: stageRecords,
-        timeline,
-      };
-
-      const reportsDir = join('.airunx-state', 'reports');
-      if (!existsSync(reportsDir)) {
-        mkdirSync(reportsDir, { recursive: true });
-      }
-      const reportPath = join(reportsDir, `${context.id}.json`);
-      // Atomic write: write to tmp file then rename to avoid partial reads
-      const tmpPath = reportPath + '.tmp';
-      writeFileSync(tmpPath, JSON.stringify(report, null, 2));
-      renameSync(tmpPath, reportPath);
+  /** Atomic, owner-only report write. Never throws. */
+  private persistRunReport(report: RunReport): void {
+    try {
+      const reportPath = writeRunReportFile(report);
       logger.info(`Run report written to ${reportPath}`);
     } catch (err) {
       // Non-fatal: don't crash the pipeline if report writing fails

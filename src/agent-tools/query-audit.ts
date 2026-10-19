@@ -5,7 +5,7 @@
  */
 
 import { z } from 'zod';
-import type { AgentContext } from '../task-queue/types.js';
+import { LEDGER_EVENT_TYPES, type AgentContext } from '../task-queue/types.js';
 import type { AuditEvent } from '../audit/audit-logger.js';
 import { isSensitiveKey } from '../utils/redaction.js';
 
@@ -24,7 +24,9 @@ export const queryAuditTool = {
   description:
     'Query audit log for past execution events in the current workflow. ' +
     'Use this to learn from history and understand what has happened. ' +
-    'Results are limited to the current workflow for security.',
+    'Results are limited to the current workflow for security. ' +
+    `Cost-ledger events (${LEDGER_EVENT_TYPES.join(', ')}) are hidden ` +
+    'unless requested by name in eventTypes.',
   parameters: {
     type: 'object' as const,
     properties: {
@@ -32,7 +34,9 @@ export const queryAuditTool = {
         type: 'array',
         items: { type: 'string' },
         description:
-          'Filter by event types (e.g., "task_completed", "stage_error")',
+          'Filter by event types (e.g., "task_completed", "stage_error"). ' +
+          `Ledger event types (${LEDGER_EVENT_TYPES.join(', ')}) are ` +
+          'excluded by default and only returned when listed here by name.',
       },
       since: {
         type: 'string',
@@ -56,10 +60,17 @@ export const queryAuditTool = {
   ): Promise<AuditEvent[]> => {
     const params = QueryAuditParamsSchema.parse(rawParams);
 
+    // Cost-ledger events are excluded unless explicitly requested by type
+    const requested = new Set(params.eventTypes ?? []);
+    const excludeEventTypes = LEDGER_EVENT_TYPES.filter(
+      (type) => !requested.has(type)
+    );
+
     // Security: Force current workflow only - agents cannot query other workflows
     const events = await context.auditLogger.query({
       workflowId: context.workflowId,
       eventTypes: params.eventTypes,
+      excludeEventTypes,
       since: params.since ? new Date(params.since) : undefined,
       limit: params.limit,
     });

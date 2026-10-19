@@ -3,13 +3,14 @@
  * Decides whether to iterate or proceed based on quality checks
  */
 
-import type { ExecutionAdapter } from '../core/adapter-types.js';
+import type { ExecutionAdapter, SpawnContext } from '../core/adapter-types.js';
 import type {
   FidelityParameters,
   ExecutionFidelityLevel,
 } from '../core/types.js';
 import type { FidelityCheckResult } from './fidelity-checker.js';
 import { AgentInvoker } from './agent-invoker.js';
+import type { CostSummary } from '../core/types.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import {
@@ -47,6 +48,8 @@ export interface ExtendedJudgeResult extends JudgeResult {
     tokensUsed: number;
     duration: number;
     cost: number;
+    /** Provenance/billing-tagged accounting of the judge spawn */
+    costSummary?: CostSummary;
   };
 }
 
@@ -65,6 +68,8 @@ export interface JudgeContext {
   issueCheckboxes?: string[];
   /** Pre-judge test output — if tests failed in the worktree, this contains the failure output */
   preJudgeTestOutput?: string;
+  /** Ledger attribution for the judge spawn (forwarded to the invoker) */
+  spawnContext?: SpawnContext;
 }
 
 /**
@@ -197,6 +202,7 @@ export class JudgeAgent {
         projectContext: {
           workingDirectory: context.workingDirectory,
         },
+        ...(context.spawnContext ? { spawnContext: context.spawnContext } : {}),
       });
 
       // Create parser with context-aware options
@@ -239,6 +245,9 @@ export class JudgeAgent {
           tokensUsed: result.metrics.tokensUsed,
           duration: result.metrics.duration,
           cost: result.metrics.cost ?? 0,
+          ...(result.metrics.costSummary
+            ? { costSummary: result.metrics.costSummary }
+            : {}),
         },
       };
     } catch (error) {

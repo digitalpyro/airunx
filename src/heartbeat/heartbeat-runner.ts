@@ -7,7 +7,6 @@
  */
 
 /* eslint-disable no-undef */
-import crypto from 'crypto';
 import { spawn, type ChildProcess } from 'child_process';
 import { join } from 'path';
 import { GitHubTaskQueue } from '../task-queue/github-task-queue.js';
@@ -19,6 +18,9 @@ import {
 } from '../utils/circuit-breaker.js';
 import { createLogger } from '../utils/logger.js';
 import { getPackageRoot } from '../utils/paths.js';
+import { generateWorkflowId } from '../utils/workflow-id.js';
+import { loadRunReport } from '../utils/run-report-io.js';
+import { formatCostSummaryLine } from '../core/cost-accounting.js';
 import type {
   HeartbeatConfig,
   GitHubTask,
@@ -26,6 +28,7 @@ import type {
   CycleResult,
 } from '../task-queue/types.js';
 import type {
+  CostSummary,
   ExecutionFidelityLevel,
   RunReport,
   StageRecord,
@@ -42,6 +45,13 @@ const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
 const HEARTBEAT_UPDATE_INTERVAL_MS = 30_000;
 
+/**
+ * Outer grace between SIGTERM to `run` (pid only) and SIGKILL to its whole
+ * process group. `run` needs ≤ ~7s: its CLI signal ladder (5s) plus writing
+ * spawn events and the final run report.
+ */
+export const HEARTBEAT_CHILD_GRACE_MS = 15_000;
+
 // Timer reference type for Node.js
 type TimerRef = ReturnType<typeof setTimeout>;
 
@@ -52,6 +62,8 @@ export interface HeartbeatRunnerOptions {
   auditDir?: string;
   /** Additional CLI args forwarded to each `airunx run` invocation (e.g. --backend, --dotenv) */
   runArgs?: string[];
+  /** Override HEARTBEAT_CHILD_GRACE_MS (tests) */
+  childGraceMs?: number;
 }
 
 export class HeartbeatRunner {
@@ -61,6 +73,7 @@ export class HeartbeatRunner {
   private processLock: ProcessLock;
   private repo: string;
   private runArgs: string[];
+  private childGraceMs: number;
 
   private isRunning = false;
   private idleCycles = 0;
@@ -69,10 +82,18 @@ export class HeartbeatRunner {
   private currentChild: ChildProcess | null = null;
   private backoffAttempt = 0;
   private heartbeatInterval: TimerRef | null = null;
+  /** In-flight stop(); repeat stop signals share it */
+  private stopPromise: Promise<void> | null = null;
+  /**
+   * One termination sequence per child, shared by the child timeout and
+   * stop(): a second SIGTERM would make `run` abandon its graceful shutdown
+   */
+  private terminations = new WeakMap<ChildProcess, Promise<void>>();
 
   constructor(options: HeartbeatRunnerOptions) {
     this.repo = options.repo;
     this.runArgs = options.runArgs ?? [];
+    this.childGraceMs = options.childGraceMs ?? HEARTBEAT_CHILD_GRACE_MS;
     this.auditLogger = new AuditLogger(options.auditDir);
     this.circuitBreaker = new CircuitBreaker(getDefaultStateFilePath());
     this.processLock = new ProcessLock(
@@ -106,6 +127,7 @@ export class HeartbeatRunner {
     }
 
     this.isRunning = true;
+    this.stopPromise = null;
     this.auditLogger.logHeartbeatStart({ config: fullConfig });
 
     logger.info('Heartbeat started');
@@ -132,36 +154,40 @@ export class HeartbeatRunner {
   /**
    * Stop the heartbeat execution loop gracefully.
    */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    // A second SIGINT/SIGTERM must not restart (and re-signal) the stop
+    if (!this.stopPromise) this.stopPromise = this.runStop();
+    return this.stopPromise;
+  }
+
+  private async runStop(): Promise<void> {
     logger.info('Stopping heartbeat...');
     this.isRunning = false;
 
-    // Kill running child process and wait for it to exit
-    if (this.currentChild && !this.currentChild.killed) {
+    // Capture before awaiting: the cycle clears these when the child exits
+    const task = this.currentTask;
+    const workflowId = this.currentWorkflowId;
+
+    // Terminate the running child (SIGTERM → grace → group SIGKILL) and
+    // wait for it, so its final run report is on disk before we release
+    if (this.currentChild) {
       logger.info('Terminating running child process...');
-      this.currentChild.kill('SIGTERM');
-      // Wait for child to exit (spawnAirunx clears this.currentChild on close)
-      const deadline = Date.now() + 10_000;
-      while (this.currentChild && Date.now() < deadline) {
-        await this.sleep(100);
-      }
-      if (this.currentChild) {
-        logger.warn('Child process did not exit within 10s, sending SIGKILL');
-        this.currentChild.kill('SIGKILL');
-        this.currentChild = null;
-      }
+      await this.terminateChild(this.currentChild);
+      this.currentChild = null;
     }
 
-    // Release current task if any
-    if (this.currentTask && this.taskQueue) {
+    // Release the interrupted task back to pending, unless the cycle already
+    // reported it (a run that finished just as the stop arrived)
+    if (task && this.taskQueue && this.currentTask === task) {
+      this.currentTask = null;
+      this.currentWorkflowId = null;
       try {
-        await this.taskQueue.releaseTask(this.currentTask.id);
+        await this.taskQueue.releaseTask(task.id);
         this.auditLogger.logTaskReleased(
-          this.currentWorkflowId ?? 'shutdown',
-          this.currentTask.id,
+          workflowId ?? 'shutdown',
+          task.id,
           'graceful_shutdown'
         );
-        this.currentWorkflowId = null;
       } catch (error) {
         logger.warn('Failed to release task during shutdown:', error);
       }
@@ -215,7 +241,9 @@ export class HeartbeatRunner {
       }
 
       this.currentTask = task;
-      this.currentWorkflowId = this.generateWorkflowId();
+      // Pre-generated and passed to `run --workflow-id`, so the heartbeat's
+      // events share the pipeline's ID and the run report's path is known
+      this.currentWorkflowId = generateWorkflowId();
       this.auditLogger.logTaskClaimed(
         this.currentWorkflowId,
         task.id,
@@ -232,11 +260,22 @@ export class HeartbeatRunner {
       const result = await this.executePipeline(
         task,
         pipeline,
-        config.fidelityLevel
+        config.fidelityLevel,
+        this.currentWorkflowId
       );
+      const costDetails = taskCostDetails(result);
 
       // Stop heartbeat updates
       this.stopHeartbeatUpdates();
+
+      // A stop interrupted this run: stop() releases the task back to
+      // pending, so don't also mark it failed
+      if (this.stopPromise && result.status !== 'completed') {
+        logger.info(
+          `Task #${task.id} interrupted by heartbeat stop; leaving release to shutdown`
+        );
+        return { action: 'wait' };
+      }
 
       // Report result
       if (result.status === 'completed') {
@@ -244,7 +283,8 @@ export class HeartbeatRunner {
         if (!result.prUrl) {
           this.auditLogger.logTaskCompletedNoPR(
             this.currentWorkflowId!,
-            task.id
+            task.id,
+            costDetails
           );
         }
 
@@ -254,7 +294,8 @@ export class HeartbeatRunner {
           this.auditLogger.logTaskCompleted(
             this.currentWorkflowId!,
             task.id,
-            result.prUrl
+            result.prUrl,
+            costDetails
           );
           logger.info(`Task #${task.id} completed successfully`);
         } else {
@@ -265,7 +306,8 @@ export class HeartbeatRunner {
         this.auditLogger.logTaskFailed(
           this.currentWorkflowId!,
           task.id,
-          result.error?.message || 'Unknown error'
+          result.error?.message || 'Unknown error',
+          costDetails
         );
         logger.warn(`Task #${task.id} failed: ${result.error?.message}`);
       }
@@ -334,7 +376,8 @@ export class HeartbeatRunner {
   private async executePipeline(
     task: GitHubTask,
     pipelineName: string,
-    fidelityLevel?: ExecutionFidelityLevel
+    fidelityLevel: ExecutionFidelityLevel | undefined,
+    workflowId: string
   ): Promise<TaskResult> {
     const args = [
       'run',
@@ -343,6 +386,8 @@ export class HeartbeatRunner {
       pipelineName,
       '--format',
       'json',
+      '--workflow-id',
+      workflowId,
       ...this.runArgs,
     ];
     if (fidelityLevel) {
@@ -354,6 +399,25 @@ export class HeartbeatRunner {
     try {
       const result = await this.spawnAirunx(args);
 
+      // Final stdout JSON is preferred, but a killed/timed-out child leaves
+      // none — fall back to the incrementally-written run report, taking
+      // whichever has more stage records.
+      const json = result.stdout.trim()
+        ? this.parseJsonFromStdout(result.stdout)
+        : null;
+      const jsonMetrics = this.metricsFromJson(json);
+      const jsonReport = this.buildRunReport(json, jsonMetrics);
+      const fileReport = this.readRunReportFile(workflowId);
+      const useFile =
+        fileReport !== undefined &&
+        fileReport.stages.length > (jsonReport?.stages.length ?? 0);
+      const runReport = useFile ? fileReport : jsonReport;
+      const metrics =
+        useFile && fileReport
+          ? this.metricsFromReport(fileReport)
+          : (jsonMetrics ??
+            (fileReport ? this.metricsFromReport(fileReport) : undefined));
+
       if (result.exitCode !== 0) {
         return {
           status: 'failed',
@@ -362,11 +426,10 @@ export class HeartbeatRunner {
             result.stderr.trim() ||
               `airunx run failed with exit code ${result.exitCode}`
           ),
+          metrics,
+          runReport,
         };
       }
-
-      // Parse JSON output from --format json
-      const json = this.parseJsonFromStdout(result.stdout);
 
       const deliverables: string[] = [];
       if (json?.commitSha) deliverables.push(`commit:${json.commitSha}`);
@@ -382,32 +445,6 @@ export class HeartbeatRunner {
       // Extract failure reason from pipeline JSON (set by CI fallback, test gate, etc.)
       const failureReason =
         typeof json?.failureReason === 'string' ? json.failureReason : null;
-
-      // Extract metrics from pipeline JSON output
-      const jsonMetrics = json?.metrics as Record<string, unknown> | undefined;
-      const metrics = jsonMetrics
-        ? {
-            costUsd:
-              typeof jsonMetrics.cost === 'number'
-                ? jsonMetrics.cost
-                : undefined,
-            tokensUsed:
-              typeof jsonMetrics.tokensUsed === 'number'
-                ? jsonMetrics.tokensUsed
-                : undefined,
-            durationMs:
-              typeof jsonMetrics.durationMs === 'number'
-                ? jsonMetrics.durationMs
-                : undefined,
-            iterations:
-              typeof jsonMetrics.iterations === 'number'
-                ? jsonMetrics.iterations
-                : undefined,
-          }
-        : undefined;
-
-      // Build RunReport from structured stage data when available
-      const runReport = this.buildRunReport(json, metrics);
 
       return {
         status: isSuccess ? 'completed' : 'failed',
@@ -433,11 +470,85 @@ export class HeartbeatRunner {
   }
 
   /**
+   * Stop a `run` child: SIGTERM to its pid only (run interrupts its own CLIs
+   * once), wait up to the outer grace for it to exit, then SIGKILL its whole
+   * process group — always, so a CLI that outlived run is reaped too.
+   * Resolves once the group kill has been sent. Never rejects. Repeat calls
+   * for the same child (timeout, then stop) share the first sequence.
+   */
+  private terminateChild(child: ChildProcess): Promise<void> {
+    let termination = this.terminations.get(child);
+    if (!termination) {
+      termination = this.runTermination(child);
+      this.terminations.set(child, termination);
+    }
+    return termination;
+  }
+
+  private async runTermination(child: ChildProcess): Promise<void> {
+    const exited = (): boolean =>
+      child.exitCode !== null || child.signalCode !== null;
+    const closed = new Promise<void>((resolve) => {
+      if (exited()) resolve();
+      child.once('exit', () => resolve());
+      child.once('close', () => resolve());
+    });
+
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // Already gone
+    }
+
+    let timer: TimerRef | undefined;
+    const timedOut = await Promise.race([
+      closed.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), this.childGraceMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      logger.warn(
+        `Child did not exit within ${this.childGraceMs / 1000}s of SIGTERM, sending SIGKILL to its process group`
+      );
+    }
+    this.killChildGroup(child);
+  }
+
+  /**
+   * SIGKILL the child's process group (it is a group leader: spawned
+   * detached). Falls back to the pid when group signalling is unavailable.
+   */
+  private killChildGroup(child: ChildProcess): void {
+    if (child.pid === undefined) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already gone
+      }
+      return;
+    }
+    try {
+      if (process.platform === 'win32') {
+        child.kill('SIGKILL');
+      } else {
+        process.kill(-child.pid, 'SIGKILL');
+      }
+    } catch {
+      // ESRCH: the group is already empty
+    }
+  }
+
+  /**
    * Spawn `airunx` CLI as a child process and capture output.
    * Resolves the CLI entry point relative to this package using
    * cross-platform-safe path resolution (no URL.pathname).
    * Includes a configurable timeout (AIRUNX_CHILD_TIMEOUT_MS, default 150 min)
-   * with SIGTERM → SIGKILL escalation to prevent hung children from blocking the daemon.
+   * with SIGTERM → group SIGKILL escalation to prevent hung children from
+   * blocking the daemon. The child is spawned detached so it leads its own
+   * process group (its CLI children join it); it is still awaited and its
+   * stdio captured (never unref'd).
    */
   private spawnAirunx(
     args: string[]
@@ -453,6 +564,7 @@ export class HeartbeatRunner {
       const child = spawn(process.execPath, [cliPath, ...args], {
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
       });
 
       // Track child so stop() can terminate it on shutdown
@@ -468,12 +580,7 @@ export class HeartbeatRunner {
         logger.error(
           `Child process timed out after ${CHILD_TIMEOUT_MS / 60000}min, sending SIGTERM`
         );
-        child.kill('SIGTERM');
-        const killTimer = setTimeout(() => {
-          logger.error('Child did not exit after SIGTERM, sending SIGKILL');
-          child.kill('SIGKILL');
-        }, 10_000);
-        child.once('close', () => clearTimeout(killTimer));
+        void this.terminateChild(child);
       }, CHILD_TIMEOUT_MS);
 
       child.stdout.on('data', (data: Buffer) => {
@@ -495,6 +602,15 @@ export class HeartbeatRunner {
       child.on('close', (code) => {
         clearTimeout(timer);
         this.currentChild = null;
+        // `run` exited (on its own or signalled): reap anything it left in
+        // its process group (CLI dev servers, orphaned CLIs). ESRCH = empty.
+        if (process.platform !== 'win32' && child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {
+            // Group already empty
+          }
+        }
         resolve(
           timedOut
             ? {
@@ -537,6 +653,58 @@ export class HeartbeatRunner {
   }
 
   /**
+   * Extract summary metrics from `airunx run --format json` output
+   */
+  private metricsFromJson(
+    json: Record<string, unknown> | null
+  ): TaskResult['metrics'] {
+    const jsonMetrics = json?.metrics as Record<string, unknown> | undefined;
+    if (!jsonMetrics) return undefined;
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' ? v : undefined;
+    return {
+      costUsd: num(jsonMetrics.cost),
+      tokensUsed: num(jsonMetrics.tokensUsed),
+      durationMs: num(jsonMetrics.durationMs),
+      iterations: num(jsonMetrics.iterations),
+      costSummaryLine:
+        typeof jsonMetrics.costSummaryLine === 'string'
+          ? jsonMetrics.costSummaryLine
+          : undefined,
+    };
+  }
+
+  /**
+   * Summary metrics from a run report read off disk
+   */
+  private metricsFromReport(report: RunReport): TaskResult['metrics'] {
+    return {
+      costUsd: report.totalCostUsd,
+      tokensUsed: report.totalTokens,
+      durationMs: report.totalDurationMs,
+      iterations: report.iterationCount,
+      costSummaryLine:
+        report.costSummaryLine ??
+        (report.costSummary
+          ? formatCostSummaryLine(report.costSummary)
+          : undefined),
+    };
+  }
+
+  /**
+   * Read `.airunx-state/reports/<workflowId>.json` (the report `run` writes
+   * after every stage). Undefined when absent or unreadable.
+   */
+  private readRunReportFile(workflowId: string): RunReport | undefined {
+    try {
+      return loadRunReport(workflowId) ?? undefined;
+    } catch (error) {
+      logger.warn(`Could not read run report for ${workflowId}:`, error);
+      return undefined;
+    }
+  }
+
+  /**
    * Build a RunReport from parsed JSON output of `airunx run --format json`.
    * Returns undefined if stage records are not available.
    */
@@ -563,6 +731,9 @@ export class HeartbeatRunner {
       details: sr.agent !== sr.stage ? sr.agent : undefined,
     }));
 
+    const jsonMetrics = json.metrics as Record<string, unknown> | undefined;
+    const costSummary = jsonMetrics?.costSummary as CostSummary | undefined;
+
     return {
       workflowId: typeof json.workflowId === 'string' ? json.workflowId : '',
       taskTitle:
@@ -586,6 +757,15 @@ export class HeartbeatRunner {
         : [],
       stages: stageRecords,
       timeline,
+      ...(costSummary && typeof costSummary === 'object'
+        ? {
+            costSummary,
+            costSummaryLine:
+              typeof jsonMetrics?.costSummaryLine === 'string'
+                ? jsonMetrics.costSummaryLine
+                : formatCostSummaryLine(costSummary),
+          }
+        : {}),
     };
   }
 
@@ -640,15 +820,6 @@ export class HeartbeatRunner {
   }
 
   /**
-   * Generate a unique workflow ID.
-   */
-  private generateWorkflowId(): string {
-    const timestamp = Date.now();
-    const random = crypto.randomBytes(4).toString('hex');
-    return `heartbeat-${timestamp}-${random}`;
-  }
-
-  /**
    * Resolve partial config with defaults.
    */
   private resolveConfig(partial?: Partial<HeartbeatConfig>): HeartbeatConfig {
@@ -683,4 +854,18 @@ export class HeartbeatRunner {
     this.processLock.release();
     logger.info('Heartbeat cleanup complete');
   }
+}
+
+/**
+ * Cost fields for heartbeat task_* audit events (undefined when the run
+ * produced no cost figures)
+ */
+function taskCostDetails(
+  result: TaskResult
+): { costUsd?: number; costSummaryLine?: string } | undefined {
+  const costUsd = result.metrics?.costUsd ?? result.runReport?.totalCostUsd;
+  const costSummaryLine =
+    result.metrics?.costSummaryLine ?? result.runReport?.costSummaryLine;
+  if (costUsd === undefined && costSummaryLine === undefined) return undefined;
+  return { costUsd, costSummaryLine };
 }

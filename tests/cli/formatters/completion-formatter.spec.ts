@@ -3,12 +3,19 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { WorkflowContext, WorkflowStatus } from '../../../src/core/types.js';
+import type {
+  WorkflowContext,
+  WorkflowStatus,
+} from '../../../src/core/types.js';
 import {
   formatCompletion,
   formatCompletionJson,
   type FormattedCompletion,
 } from '../../../src/cli/formatters/completion-formatter.js';
+import {
+  mergeCostSummaries,
+  spawnCostSummary,
+} from '../../../src/core/cost-accounting.js';
 
 describe('Completion Formatter', () => {
   // Mock console.log to prevent output during tests
@@ -57,7 +64,9 @@ describe('Completion Formatter', () => {
         const context = createMockContext('completed');
         const result = formatCompletion(context, { tty: false });
 
-        expect(result.header).toBe('[COMPLETED] Workflow completed successfully');
+        expect(result.header).toBe(
+          '[COMPLETED] Workflow completed successfully'
+        );
       });
 
       it('should include appropriate next steps', () => {
@@ -67,7 +76,9 @@ describe('Completion Formatter', () => {
         const result = formatCompletion(context, { tty: true });
 
         expect(result.nextSteps).toContain('Review changes in the worktree');
-        expect(result.nextSteps).toContain('Run tests to verify implementation');
+        expect(result.nextSteps).toContain(
+          'Run tests to verify implementation'
+        );
         expect(result.nextSteps).toContain('Create a pull request');
       });
 
@@ -90,7 +101,11 @@ describe('Completion Formatter', () => {
       it('should extract failed stages from stageResults', () => {
         const context = createMockContext('completed_with_errors', {
           stageResults: {
-            stage1: { success: true, outputs: {}, metrics: { tokensUsed: 100, duration: 1000 } },
+            stage1: {
+              success: true,
+              outputs: {},
+              metrics: { tokensUsed: 100, duration: 1000 },
+            },
             stage2: {
               success: false,
               outputs: {},
@@ -119,14 +134,16 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('Review changes in worktree'))).toBe(true);
+        expect(
+          result.nextSteps.some((s) => s.includes('Review changes in worktree'))
+        ).toBe(true);
       });
 
       it('should suggest running doctor', () => {
         const context = createMockContext('completed_with_errors');
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('doctor'))).toBe(true);
+        expect(result.nextSteps.some((s) => s.includes('doctor'))).toBe(true);
       });
     });
 
@@ -151,7 +168,9 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('authentication'))).toBe(true);
+        expect(result.nextSteps.some((s) => s.includes('authentication'))).toBe(
+          true
+        );
       });
 
       it('should detect timeout error pattern', () => {
@@ -167,7 +186,11 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('timed out') || s.includes('timeout'))).toBe(true);
+        expect(
+          result.nextSteps.some(
+            (s) => s.includes('timed out') || s.includes('timeout')
+          )
+        ).toBe(true);
       });
 
       it('should detect circuit error pattern', () => {
@@ -177,20 +200,24 @@ describe('Completion Formatter', () => {
               success: false,
               outputs: {},
               metrics: { tokensUsed: 0, duration: 0 },
-              errors: [{ message: "CircuitOpenError: Backend 'cursor' circuit is OPEN" }],
+              errors: [
+                {
+                  message: "CircuitOpenError: Backend 'cursor' circuit is OPEN",
+                },
+              ],
             },
           },
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('circuit'))).toBe(true);
+        expect(result.nextSteps.some((s) => s.includes('circuit'))).toBe(true);
       });
 
       it('should suggest DEBUG mode', () => {
         const context = createMockContext('failed');
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.nextSteps.some(s => s.includes('DEBUG'))).toBe(true);
+        expect(result.nextSteps.some((s) => s.includes('DEBUG'))).toBe(true);
       });
     });
 
@@ -210,7 +237,9 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.metrics.some(m => m.includes('2,500') || m.includes('2500'))).toBe(true);
+        expect(
+          result.metrics.some((m) => m.includes('2,500') || m.includes('2500'))
+        ).toBe(true);
       });
 
       it('should include cost in metrics', () => {
@@ -228,7 +257,9 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.metrics.some(m => m.includes('$') && m.includes('0.01'))).toBe(true);
+        expect(
+          result.metrics.some((m) => m.includes('$') && m.includes('0.01'))
+        ).toBe(true);
       });
 
       it('should include duration in metrics', () => {
@@ -245,7 +276,9 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.metrics.some(m => m.includes('45') && m.includes('s'))).toBe(true);
+        expect(
+          result.metrics.some((m) => m.includes('45') && m.includes('s'))
+        ).toBe(true);
       });
 
       it('should include stage progress in metrics', () => {
@@ -261,7 +294,9 @@ describe('Completion Formatter', () => {
         });
         const result = formatCompletion(context, { tty: true });
 
-        expect(result.metrics.some(m => m.includes('3') && m.includes('5'))).toBe(true);
+        expect(
+          result.metrics.some((m) => m.includes('3') && m.includes('5'))
+        ).toBe(true);
       });
     });
   });
@@ -296,7 +331,12 @@ describe('Completion Formatter', () => {
         iterationCount: 2,
       });
       const result = formatCompletionJson(context) as {
-        metrics: { tokensUsed: number; cost: number; durationMs: number; iterations: number };
+        metrics: {
+          tokensUsed: number;
+          cost: number;
+          durationMs: number;
+          iterations: number;
+        };
       };
 
       expect(result.metrics.tokensUsed).toBe(2000);
@@ -308,7 +348,11 @@ describe('Completion Formatter', () => {
     it('should extract failed stage names', () => {
       const context = createMockContext('completed_with_errors', {
         stageResults: {
-          stage1: { success: true, outputs: {}, metrics: { tokensUsed: 100, duration: 1000 } },
+          stage1: {
+            success: true,
+            outputs: {},
+            metrics: { tokensUsed: 100, duration: 1000 },
+          },
           stage2: {
             success: false,
             outputs: {},
@@ -317,7 +361,9 @@ describe('Completion Formatter', () => {
           },
         },
       });
-      const result = formatCompletionJson(context) as { failedStages: string[] };
+      const result = formatCompletionJson(context) as {
+        failedStages: string[];
+      };
 
       expect(result.failedStages).toContain('stage2');
       expect(result.failedStages).not.toContain('stage1');
@@ -356,6 +402,55 @@ describe('Completion Formatter', () => {
       const parsed = JSON.parse(stringified);
 
       expect(parsed.status).toBe('completed');
+    });
+  });
+  describe('cost provenance and billing basis', () => {
+    const costSummary = mergeCostSummaries(
+      spawnCostSummary({
+        costUsd: 3,
+        costProvenance: 'reported',
+        billingBasis: 'api_equivalent',
+      }),
+      spawnCostSummary({
+        costUsd: 1,
+        costProvenance: 'estimated',
+        billingBasis: 'billed',
+        estimationMethods: ['chars_div_4'],
+      })
+    )!;
+
+    it('shows the billing/provenance line and one estimation warning', () => {
+      const context = createMockContext('completed');
+      context.metrics.costSummary = costSummary;
+      const formatted = formatCompletion(context, { tty: false });
+      expect(formatted.metrics).toContain(
+        'Cost Basis: $1.00 billed / $3.00 API-equivalent — 75% reported/derived, 25% estimated'
+      );
+      expect(
+        formatted.metrics.filter((m) => m.startsWith('Warning:'))
+      ).toHaveLength(1);
+    });
+
+    it('includes the summary in JSON output', () => {
+      const context = createMockContext('completed');
+      context.metrics.costSummary = costSummary;
+      const json = formatCompletionJson(context) as {
+        metrics: Record<string, unknown>;
+      };
+      expect(json.metrics.billedMicroUsd).toBe(1_000_000);
+      expect(json.metrics.apiEquivalentMicroUsd).toBe(3_000_000);
+      expect(json.metrics.costSummaryLine).toContain('25% estimated');
+      expect(json.metrics.provenanceMix).toMatchObject({ estimatedPct: 25 });
+      expect(json.metrics.estimationWarning).toBeDefined();
+    });
+
+    it('omits cost-basis output when no summary exists', () => {
+      const formatted = formatCompletion(createMockContext('completed'), {
+        tty: false,
+      });
+      expect(formatted.metrics.some((m) => m.startsWith('Cost Basis'))).toBe(
+        false
+      );
     });
   });
 });

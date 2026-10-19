@@ -38,7 +38,7 @@ const VALID_AGENTS_MD = `# Agents
 - **Responsibilities**: Write code
 
 ### Reviewer
-- **Model**: opus
+- **Model**: fable
 - **Responsibilities**: Review code
 `;
 
@@ -170,10 +170,35 @@ describe('validateAgentsMdWithConfirmation', () => {
         }
       );
 
-      // Without cost warnings should have equal or fewer issues
-      expect(resultWithoutWarnings.issues.length).toBeLessThanOrEqual(
+      // fable ($10/$50) is the fixture's expensive model, so the filter
+      // must actually remove a warning
+      expect(resultWithoutWarnings.issues.length).toBeLessThan(
         resultWithWarnings.issues.length
       );
+    });
+
+    it('keeps retirement warnings when cost warnings are disabled', async () => {
+      const filePath = join(tmpDir, 'AGENTS.md');
+      writeFileSync(
+        filePath,
+        `# Agents
+
+## Configuration
+
+### Developer
+- **Model**: gpt-4o
+- **Responsibilities**: Write code
+`
+      );
+
+      const result = await validateAgentsMdWithConfirmation(filePath, {
+        interactive: false,
+        costWarnings: false,
+      });
+
+      expect(
+        result.issues.some((issue) => issue.message.includes('OpenAI'))
+      ).toBe(true);
     });
   });
 });

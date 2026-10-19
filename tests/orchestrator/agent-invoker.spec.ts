@@ -3,14 +3,24 @@
  * Validates agent execution with fidelity parameters and retry logic
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { AgentInvoker } from '../../src/orchestrator/agent-invoker.js';
 import type {
+  AttemptRecord,
   ExecutionAdapter,
   ExecutionRequest,
   ExecutionResult,
+  SpawnObserver,
 } from '../../src/core/adapter-types.js';
-import type { FidelityParameters } from '../../src/core/types.js';
+import type { CostSummary, FidelityParameters } from '../../src/core/types.js';
+import type { AdapterFactory } from '../../src/adapters/adapter-factory.js';
+import type { ProviderRouter } from '../../src/orchestrator/provider-router.js';
+import { spawnCostSummary } from '../../src/core/cost-accounting.js';
+import { ConfigurationError, TimeoutError } from '../../src/utils/errors.js';
+import {
+  ShutdownInProgressError,
+  shutdownCoordinator,
+} from '../../src/utils/shutdown-coordinator.js';
 
 // Mock settings to prevent AGENTS.md loading during tests (use defaults)
 vi.mock('../../src/utils/settings.js', () => ({
@@ -340,7 +350,7 @@ describe('Agent Invoker', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.outputs.analysis).toContain('failed after 1 attempts');
+      expect(result.outputs.analysis).toContain('failed after 1 attempt(s)');
       expect(result.errors?.[0].message).toBe('Complete failure');
     });
   });
@@ -533,8 +543,13 @@ describe('Agent Invoker', () => {
           'orchestrator' as const,
           {
             role: 'orchestrator' as const,
-            purpose: 'Coordinate and plan work across multiple specialized agents.',
-            responsibilities: ['task planning', 'agent coordination', 'progress tracking'],
+            purpose:
+              'Coordinate and plan work across multiple specialized agents.',
+            responsibilities: [
+              'task planning',
+              'agent coordination',
+              'progress tracking',
+            ],
             tools: ['TaskManager', 'AgentRouter'],
             output: 'execution plan with assigned tasks',
           },
@@ -643,8 +658,12 @@ describe('Agent Invoker', () => {
 
       const call = vi.mocked(mockAdapter.execute).mock.calls[0][0];
       // Should use default prompt since developer wasn't loaded
-      expect(call.agent.systemPrompt).toContain('developer agent responsible for both strategic design and implementation');
-      expect(call.agent.systemPrompt).not.toContain('Only orchestrator is loaded');
+      expect(call.agent.systemPrompt).toContain(
+        'developer agent responsible for both strategic design and implementation'
+      );
+      expect(call.agent.systemPrompt).not.toContain(
+        'Only orchestrator is loaded'
+      );
     });
 
     it('should accept loadedAgents in constructor', async () => {
@@ -671,7 +690,11 @@ describe('Agent Invoker', () => {
       ]);
 
       // Pass loadedAgents to constructor
-      const invoker = new AgentInvoker(mockAdapter, fidelityParams, loadedAgents);
+      const invoker = new AgentInvoker(
+        mockAdapter,
+        fidelityParams,
+        loadedAgents
+      );
 
       await invoker.execute({
         role: 'developer',
@@ -681,7 +704,323 @@ describe('Agent Invoker', () => {
 
       const call = vi.mocked(mockAdapter.execute).mock.calls[0][0];
       expect(call.agent.systemPrompt).toContain('developer agent');
-      expect(call.agent.systemPrompt).toContain('Write production-quality code');
+      expect(call.agent.systemPrompt).toContain(
+        'Write production-quality code'
+      );
+    });
+  });
+});
+
+describe('Agent Invoker attempt events (U4)', () => {
+  const fidelity: FidelityParameters = {
+    temperature: 0.2,
+    maxTokens: 4096,
+    retryCount: 3,
+    useCaching: true,
+    enableVerification: true,
+    reviewIterations: 2,
+  };
+
+  const spawnContext = {
+    workflowId: 'wf-attempts',
+    stage: 'developer',
+    iteration: 1,
+  };
+
+  const summary = (micro: number): CostSummary =>
+    spawnCostSummary({
+      costUsd: micro / 1_000_000,
+      costProvenance: 'reported',
+      billingBasis: 'billed',
+    });
+
+  const failed = (cost: number, spawnId: string): ExecutionResult => ({
+    success: false,
+    outputs: {},
+    metrics: {
+      tokensUsed: 10,
+      duration: 5,
+      cost,
+      costSummary: summary(cost * 1_000_000),
+    },
+    errors: [new TimeoutError(1000, 'cli')],
+    spawnId,
+  });
+
+  const succeeded = (cost: number, spawnId: string): ExecutionResult => ({
+    success: true,
+    outputs: { analysis: 'ok' },
+    metrics: {
+      tokensUsed: 100,
+      duration: 50,
+      cost,
+      spawnCount: 1,
+      costSummary: summary(cost * 1_000_000),
+    },
+    errors: [],
+    spawnId,
+  });
+
+  const observedAdapter = (
+    name: string,
+    attempts: AttemptRecord[]
+  ): ExecutionAdapter => {
+    const observer: SpawnObserver = {
+      onSpawnComplete: vi.fn(),
+      onAttempt: (record) => attempts.push(record),
+    };
+    return {
+      execute: vi.fn(),
+      name,
+      getSpawnObserver: () => observer,
+    } as unknown as ExecutionAdapter;
+  };
+
+  it('emits one attempt event per attempt and keeps failed-attempt spend', async () => {
+    const attempts: AttemptRecord[] = [];
+    const adapter = observedAdapter('claude-code', attempts);
+    vi.mocked(adapter.execute)
+      .mockResolvedValueOnce(failed(0.1, 's1'))
+      .mockResolvedValueOnce(failed(0.2, 's2'))
+      .mockResolvedValueOnce(succeeded(0.3, 's3'));
+
+    const invoker = new AgentInvoker(adapter, fidelity);
+    const result = await invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+      spawnContext,
+    });
+
+    expect(result.success).toBe(true);
+    expect(attempts.map((a) => [a.attempt, a.outcome, a.spawnId])).toEqual([
+      [1, 'failure', 's1'],
+      [2, 'failure', 's2'],
+      [3, 'success', 's3'],
+    ]);
+    expect(attempts[0]).toMatchObject({
+      backend: 'claude-code',
+      errorCategory: 'TimeoutError',
+      fallback: false,
+      costUsd: 0.1,
+      workflowId: 'wf-attempts',
+      stage: 'developer',
+      iteration: 1,
+      maxAttempts: 3,
+    });
+    // Run total includes both failed attempts' salvaged cost
+    expect(result.metrics.cost).toBeCloseTo(0.6);
+    expect(result.metrics.tokensUsed).toBe(120);
+    expect(result.metrics.spawnCount).toBe(3);
+    expect(result.metrics.costSummary?.billedMicroUsd).toBe(600_000);
+    expect(result.metrics.costSummary?.spawnCount).toBe(3);
+  });
+
+  it('emits no attempt event for a clean first-attempt success', async () => {
+    const attempts: AttemptRecord[] = [];
+    const adapter = observedAdapter('claude-code', attempts);
+    vi.mocked(adapter.execute).mockResolvedValueOnce(succeeded(0.3, 's1'));
+
+    const invoker = new AgentInvoker(adapter, fidelity);
+    const result = await invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+    });
+
+    expect(attempts).toEqual([]);
+    expect(result.metrics.cost).toBe(0.3);
+  });
+
+  it('folds earlier failures into the last result when all attempts fail', async () => {
+    const attempts: AttemptRecord[] = [];
+    const adapter = observedAdapter('claude-code', attempts);
+    vi.mocked(adapter.execute)
+      .mockResolvedValueOnce(failed(0.1, 's1'))
+      .mockResolvedValueOnce(failed(0.2, 's2'))
+      .mockResolvedValueOnce(failed(0.3, 's3'));
+
+    const invoker = new AgentInvoker(adapter, fidelity);
+    const result = await invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+    });
+
+    expect(result.success).toBe(false);
+    expect(attempts).toHaveLength(3);
+    expect(result.metrics.cost).toBeCloseTo(0.6);
+    expect(result.metrics.costSummary?.billedMicroUsd).toBe(600_000);
+  });
+
+  it('marks the attempt that switched providers as a fallback', async () => {
+    const attempts: AttemptRecord[] = [];
+    const primary = observedAdapter('claude-code', attempts);
+    const secondary = observedAdapter('codex', attempts);
+    vi.mocked(primary.execute).mockResolvedValueOnce({
+      ...failed(0.05, 'p1'),
+      errors: [new ConfigurationError('auth missing', 'authentication')],
+    });
+    vi.mocked(secondary.execute).mockResolvedValueOnce(succeeded(0.2, 'f1'));
+
+    const adapters: Record<string, ExecutionAdapter> = {
+      'claude-code': primary,
+      codex: secondary,
+    };
+    let unavailable = false;
+    const providerRouter = {
+      selectProvider: vi.fn(() => ({
+        provider: unavailable ? 'codex' : 'claude-code',
+        reason: 'test',
+      })),
+      setProviderAvailability: vi.fn(() => {
+        unavailable = true;
+      }),
+    };
+    const adapterFactory = {
+      getAdapter: vi.fn(async (backend: string) => adapters[backend]),
+    };
+
+    const invoker = new AgentInvoker({
+      adapterFactory: adapterFactory as unknown as AdapterFactory,
+      providerRouter: providerRouter as unknown as ProviderRouter,
+      fidelityParams: fidelity,
+    });
+    const result = await invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+      spawnContext,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.metrics.provider).toBe('codex');
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]).toMatchObject({
+      attempt: 1,
+      backendAttempt: 1,
+      backend: 'claude-code',
+      outcome: 'failure',
+      errorCategory: 'ConfigurationError',
+      fallback: true,
+      fallbackTo: 'codex',
+    });
+    // Per-backend counter resets, the global attempt number does not
+    expect(attempts[1]).toMatchObject({
+      attempt: 2,
+      backendAttempt: 1,
+      backend: 'codex',
+      outcome: 'success',
+      fallback: false,
+    });
+    expect(result.metrics.cost).toBeCloseTo(0.25);
+  });
+
+  it('never lets a throwing observer break execution', async () => {
+    const adapter = {
+      execute: vi
+        .fn()
+        .mockResolvedValueOnce(failed(0.1, 's1'))
+        .mockResolvedValueOnce(succeeded(0.1, 's2')),
+      name: 'claude-code',
+      getSpawnObserver: () => ({
+        onSpawnComplete: vi.fn(),
+        onAttempt: () => {
+          throw new Error('ledger down');
+        },
+      }),
+    } as unknown as ExecutionAdapter;
+
+    const invoker = new AgentInvoker(adapter, fidelity);
+    const result = await invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  describe('after run shutdown starts', () => {
+    const refused = (): ExecutionResult => ({
+      success: false,
+      outputs: { error: 'Shutdown in progress: no new CLI spawns' },
+      metrics: { tokensUsed: 0, duration: 0 },
+      errors: [new ShutdownInProgressError()],
+    });
+
+    afterEach(() => {
+      shutdownCoordinator.reset();
+    });
+
+    it('a not-spawned refusal is no attempt, no spawn and stops retrying', async () => {
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute)
+        .mockResolvedValueOnce(failed(0.1, 's1'))
+        .mockResolvedValueOnce(refused())
+        .mockResolvedValueOnce(succeeded(0.3, 's3'));
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(2);
+      expect(result.success).toBe(false);
+      expect(attempts.map((a) => [a.attempt, a.outcome])).toEqual([
+        [1, 'failure'],
+      ]);
+      // Only the real (failed) spawn counts
+      expect(result.metrics.spawnCount).toBe(1);
+      expect(result.metrics.cost).toBeCloseTo(0.1);
+    });
+
+    it('a thrown ShutdownInProgressError counts zero spawns and no attempts', async () => {
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute).mockRejectedValue(
+        new ShutdownInProgressError()
+      );
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const started = Date.now();
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(1);
+      expect(Date.now() - started).toBeLessThan(500); // no retry backoff
+      expect(attempts).toEqual([]);
+      expect(result.metrics.spawnCount).toBe(0);
+    });
+
+    it('a spawn failing during shutdown is recorded once and not retried', async () => {
+      void shutdownCoordinator.shutdown({ timeoutMs: 10, flushTimeoutMs: 10 });
+      const attempts: AttemptRecord[] = [];
+      const adapter = observedAdapter('claude-code', attempts);
+      vi.mocked(adapter.execute)
+        .mockRejectedValueOnce(new Error('interrupted'))
+        .mockResolvedValueOnce(succeeded(0.3, 's2'));
+
+      const invoker = new AgentInvoker(adapter, fidelity);
+      const started = Date.now();
+      const result = await invoker.execute({
+        role: 'developer',
+        task: 'Implement',
+        projectContext: { workingDirectory: '/test' },
+        spawnContext,
+      });
+
+      expect(adapter.execute).toHaveBeenCalledTimes(1);
+      expect(Date.now() - started).toBeLessThan(500); // no retry backoff
+      expect(result.success).toBe(false);
+      expect(attempts.map((a) => a.outcome)).toEqual(['failure']);
     });
   });
 });

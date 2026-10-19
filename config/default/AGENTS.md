@@ -6,14 +6,15 @@
 
 ## Model Reference
 
-| Model         | Provider    | Cost (in/out per 1M) | Best For                                                          |
-| ------------- | ----------- | -------------------- | ----------------------------------------------------------------- |
-| opus          | claude-code | $5 / $25             | Complex reasoning, architecture (Opus 4.8)                        |
-| sonnet        | claude-code | $3 / $15             | General tasks, code generation (Sonnet 5; intro $2/$10 to Aug 2026) |
-| haiku         | claude-code | $1 / $5              | Simple tasks, high volume (Haiku 4.5)                             |
-| gpt-5.6-terra | codex       | $2.50 / $15          | Default codex model, ChatGPT subscription compatible              |
-| gpt-5.6-luna  | codex       | $1 / $6              | Cost-effective, high volume                                       |
-| gpt-5.6-sol   | codex       | $5 / $30             | Maximum reasoning (rarely needed)                                 |
+| Model       | Provider    | Cost (in/out per 1M) | Best For                                                   |
+| ----------- | ----------- | -------------------- | ---------------------------------------------------------- |
+| fable       | claude-code | $10 / $50            | Hardest reasoning, long-horizon work (Fable 5.1)           |
+| opus        | claude-code | $4 / $20             | Complex reasoning, architecture (Opus 5.5)                 |
+| sonnet      | claude-code | $2 / $10             | General tasks, code generation (Sonnet 5.5)                |
+| haiku       | claude-code | $0.10 / $0.50        | Simple tasks, high volume (Haiku 5.5; >100K-token prompts $0.50 / $2.50) |
+| gpt-6.1-sol | codex       | $2 / $10             | Default codex model, ChatGPT subscription compatible       |
+| gpt-6-luna  | codex       | $0.10 / $0.50        | Cost-effective, high volume                                |
+| gpt-6-astra | codex       | $10 / $50            | Maximum reasoning (rarely needed)                          |
 
 ## Agent Roles
 
@@ -25,7 +26,7 @@
 - **Output**: Workflow state, GitHub PRs/issues
 - **Provider**: claude-code
 - **Model**: sonnet
-- **Model-Rationale**: Balanced reasoning for pipeline coordination without opus overhead ($3/$15 vs $5/$25)
+- **Model-Rationale**: Balanced reasoning for pipeline coordination without opus overhead ($2/$10 vs $4/$20)
 - **Provider-Rationale**: Strong reasoning and orchestration capabilities
 - **Provider-Config**:
   - disable-compound-engineering: true
@@ -63,7 +64,7 @@
 - **Output**: Implementation strategy and code changes
 - **Provider**: claude-code
 - **Model**: sonnet
-- **Model-Rationale**: Balanced reasoning for both strategic planning and implementation ($3/$15)
+- **Model-Rationale**: Balanced reasoning for both strategic planning and implementation ($2/$10)
 - **Provider-Rationale**: Excellent code generation and reasoning for design and implementation
 - **Fallback-Provider**: codex
 - **System-Prompt**: You are a senior developer who thinks strategically and implements with precision. You understand best practices, design elegant solutions, and produce working, secure, well-designed code.
@@ -106,7 +107,7 @@
 - **Tools**: codebase_read, static_analysis, security_scanners
 - **Output**: Review feedback, issues list, pass count report
 - **Provider**: codex
-- **Model**: gpt-5.6-terra
+- **Model**: gpt-6.1-sol
 - **Model-Rationale**: ChatGPT subscription compatible; multi-pass review benefits from strong reasoning
 - **Provider-Rationale**: Independent perspective prevents self-deception in reviews (different AI reviews Claude's code)
 - **Fallback-Provider**: claude-code
@@ -177,7 +178,7 @@
 - **Output**: Analysis reports, pass/fail status, test failure diagnosis
 - **Provider**: claude-code
 - **Model**: haiku
-- **Model-Rationale**: Rule-based checking plus lightweight reasoning for test failure interpretation ($1/$5)
+- **Model-Rationale**: Rule-based checking plus lightweight reasoning for test failure interpretation ($0.10/$0.50)
 - **Provider-Config**:
   - disable-compound-engineering: true
 - **Provider-Rationale**: Code analysis benefits from reasoning ability
@@ -233,7 +234,7 @@
 - **Output**: Test files, manual QA checklist
 - **Provider**: claude-code
 - **Model**: sonnet
-- **Model-Rationale**: Test design needs reasoning; runs once before implementation ($3/$15)
+- **Model-Rationale**: Test design needs reasoning; runs once before implementation ($2/$10)
 - **Provider-Config**:
   - disable-compound-engineering: true
 - **Provider-Rationale**: Strong reasoning for comprehensive test design
@@ -277,7 +278,7 @@
 - **Tools**: all_outputs, gh
 - **Output**: Quality verdict (ENUM), iteration decision, GitHub updates
 - **Provider**: codex
-- **Model**: gpt-5.6-terra
+- **Model**: gpt-6.1-sol
 - **Model-Rationale**: Final verdict needs strong reasoning; ChatGPT subscription compatible
 - **Provider-Rationale**: Independent perspective maintains separation from dev agents; complex reasoning for quality assessments
 - **Fallback-Provider**: claude-code
@@ -336,7 +337,7 @@
 - **Output**: Documentation files, changelog entries
 - **Provider**: claude-code
 - **Model**: haiku
-- **Model-Rationale**: Documentation generation is straightforward text synthesis; high volume ($1/$5)
+- **Model-Rationale**: Documentation generation is straightforward text synthesis; high volume ($0.10/$0.50)
 - **Provider-Rationale**: Documentation quality from reasoning
 - **Fallback-Provider**: codex
 - **Provider-Config**:

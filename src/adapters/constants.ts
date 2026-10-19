@@ -10,11 +10,12 @@ import type { BackendType } from '../core/adapter-types.js';
  * Default models for each backend
  */
 export const DEFAULT_MODELS = {
-  // Drives the cursor adapter's --model flag and cost-estimation fallbacks.
-  // The claude CLI runs its own default (no --model is passed) and codex
-  // passes --model only when explicitly configured.
-  OPENAI: 'gpt-5.6-terra',
-  ANTHROPIC: 'claude-sonnet-5',
+  // Drives cost-estimation fallbacks, and the cursor adapter passes OPENAI as
+  // --model on every run without a configured model (no retry fallback), so
+  // cursor-agent must accept it. The claude CLI runs its own default (no
+  // --model is passed) and codex passes --model only when explicitly configured.
+  OPENAI: 'gpt-6.1-sol',
+  ANTHROPIC: 'claude-sonnet-5-5',
 } as const;
 
 /**
@@ -56,9 +57,26 @@ export const FIDELITY_CLI_TIMEOUT: Record<ExecutionFidelityLevel, number> = {
 export const HANG_CHECK_INTERVAL_MS = 30000; // 30 seconds
 
 /**
+ * Signal ladder for stopping a CLI spawn (timeout, hang, or run shutdown):
+ * SIGINT → SIGINT_GRACE_PERIOD_MS → SIGTERM → SIGTERM_GRACE_PERIOD_MS →
+ * SIGKILL. SIGINT first lets a CLI finish its turn and print result JSON
+ * (reported cost); escalation is decided on actual exit, not `child.killed`.
+ * Total 5s, inside the heartbeat's 15s outer grace (HEARTBEAT_CHILD_GRACE_MS).
+ */
+export const SIGINT_GRACE_PERIOD_MS = 3000; // 3 seconds
+
+/**
  * Grace period before escalating SIGTERM to SIGKILL (in milliseconds)
  */
-export const SIGTERM_GRACE_PERIOD_MS = 5000; // 5 seconds
+export const SIGTERM_GRACE_PERIOD_MS = 2000; // 2 seconds
+
+/**
+ * Once an interrupted CLI has exited (at any ladder step) or been
+ * SIGKILLed, how long to wait for its stdio to close before settling with
+ * the output collected so far (a grandchild holding the pipe open must not
+ * keep the spawn pending)
+ */
+export const POST_KILL_SETTLE_MS = 1000; // 1 second
 
 /**
  * Interval for polling hang detection (in milliseconds)
@@ -125,7 +143,8 @@ export const APPROVAL_MODE_FLAGS: Record<
 > = {
   codex: {
     manual: [],
-    auto: ['--full-auto'],
+    // --full-auto was removed in Codex CLI 0.163; it was shorthand for this sandbox.
+    auto: ['--sandbox', 'workspace-write'],
     yolo: ['--dangerously-bypass-approvals-and-sandbox'],
   },
   'claude-code': {

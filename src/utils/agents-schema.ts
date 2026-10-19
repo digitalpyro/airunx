@@ -23,6 +23,7 @@ import {
   MODEL_ALIASES,
   ANTHROPIC_PRICING,
   OPENAI_PRICING,
+  resolveModelAlias,
 } from '../adapters/pricing.js';
 
 /**
@@ -56,7 +57,7 @@ const EXPENSIVE_MODEL_OUTPUT_THRESHOLD = 25; // $25 per 1M output tokens
  * Primary Anthropic model aliases (short, user-friendly names)
  * Used for display and filtering out version-specific aliases
  */
-const PRIMARY_ANTHROPIC_ALIASES = ['opus', 'sonnet', 'haiku'] as const;
+const PRIMARY_ANTHROPIC_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'] as const;
 
 /**
  * Legacy OpenAI models to exclude from common suggestions
@@ -66,6 +67,8 @@ const PRIMARY_ANTHROPIC_ALIASES = ['opus', 'sonnet', 'haiku'] as const;
 const LEGACY_OPENAI_MODELS = [
   'gpt-5.5',
   'gpt-5.4',
+  'gpt-5.4-nano',
+  'gpt-5.3-codex',
   'gpt-4o',
   'gpt-4o-mini',
   'o1',
@@ -74,6 +77,26 @@ const LEGACY_OPENAI_MODELS = [
   'gpt-4',
   'gpt-3.5-turbo',
 ] as const;
+
+/**
+ * Announced OpenAI API shutdowns for models still in OPENAI_PRICING
+ * Configs naming these keep validating (backward compat) but get an
+ * info-level warning with the shutdown date and a replacement.
+ */
+const RETIRING_OPENAI_MODELS: Record<
+  string,
+  { shutdownDate: string; replacement: string }
+> = {
+  'gpt-4': { shutdownDate: '2026-10-23', replacement: 'gpt-6-luna' },
+  'gpt-4-turbo': { shutdownDate: '2026-10-23', replacement: 'gpt-6-luna' },
+  'gpt-3.5-turbo': { shutdownDate: '2026-10-23', replacement: 'gpt-6-luna' },
+  o1: { shutdownDate: '2026-10-23', replacement: 'gpt-6.1-sol' },
+  'o1-mini': { shutdownDate: '2026-10-23', replacement: 'gpt-6.1-sol' },
+  'gpt-4o': { shutdownDate: '2027-01-14', replacement: 'gpt-6-luna' },
+  'gpt-4o-mini': { shutdownDate: '2027-01-14', replacement: 'gpt-6-luna' },
+  'gpt-5.3-codex': { shutdownDate: '2027-04-01', replacement: 'gpt-6-sol' },
+  'gpt-5.4-nano': { shutdownDate: '2027-04-01', replacement: 'gpt-6-luna' },
+};
 
 /**
  * Legacy Anthropic models to exclude from suggestions
@@ -155,12 +178,58 @@ const LEGACY_MODEL_IDS = new Set<string>([
 
 /**
  * Models eligible for "did you mean" suggestions
- * Excludes legacy IDs so validation never recommends a deprecated or
- * never-existed historical ID; they stay in VALID_MODELS for backward compat.
+ * Excludes legacy IDs, and aliases that resolve to them, so validation never
+ * recommends a deprecated or never-existed historical ID; they stay in
+ * VALID_MODELS for backward compat.
  */
 const SUGGESTABLE_MODELS: readonly string[] = VALID_MODELS.filter(
-  (model) => !LEGACY_MODEL_IDS.has(model)
+  (model) =>
+    !LEGACY_MODEL_IDS.has(model) &&
+    !LEGACY_MODEL_IDS.has(MODEL_ALIASES[model] ?? '')
 );
+
+/**
+ * Create a retirement warning for models with an announced shutdown date
+ */
+function createRetirementWarningIssue(
+  agentRole: string,
+  model: string,
+  lineNumber: number,
+  today: Date = new Date()
+): ValidationIssue | null {
+  const retirement = RETIRING_OPENAI_MODELS[resolveModelAlias(model)];
+  if (!retirement) return null;
+
+  // Shutdown dates are UTC calendar days; compare as YYYY-MM-DD strings
+  const isShutDown =
+    today.toISOString().slice(0, 10) >= retirement.shutdownDate;
+  return {
+    // After shutdown, runs with this model fail at the API, so escalate
+    severity: isShutDown ? 'warning' : 'info',
+    path: `agents.${agentRole}.model`,
+    message: isShutDown
+      ? `Agent '${agentRole}' uses model '${model}', which OpenAI retired (API shutdown ${retirement.shutdownDate})`
+      : `Agent '${agentRole}' uses model '${model}', which OpenAI is retiring (API shutdown ${retirement.shutdownDate})`,
+    value: model,
+    suggestedValue: retirement.replacement,
+    suggestion: isShutDown
+      ? `Switch to '${retirement.replacement}'; runs with '${model}' will fail`
+      : `Switch to '${retirement.replacement}' before ${retirement.shutdownDate}`,
+    lineNumber,
+  };
+}
+
+/**
+ * Whether a validation issue is an expensive-model cost warning
+ * (used by the cost-warnings toggle so it doesn't hide other model notices)
+ */
+export function isCostWarningIssue(issue: ValidationIssue): boolean {
+  return (
+    issue.severity === 'info' &&
+    issue.path.endsWith('.model') &&
+    issue.message.includes('per 1M tokens')
+  );
+}
 
 /**
  * Helper to create a validation issue for an invalid model field
@@ -202,14 +271,17 @@ const PROVIDER_MODEL_FAMILIES: Record<
     examples: string;
   }
 > = {
-  'claude-code': { family: 'anthropic', examples: "'opus', 'sonnet', 'haiku'" },
+  'claude-code': {
+    family: 'anthropic',
+    examples: "'opus', 'sonnet', 'haiku', 'fable'",
+  },
   cursor: {
     family: 'openai',
-    examples: "'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4-mini'",
+    examples: "'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-astra'",
   },
   codex: {
     family: 'openai',
-    examples: "'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4-mini'",
+    examples: "'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-astra'",
   },
 };
 
@@ -300,7 +372,7 @@ function getModelCostInfo(model: string): ModelCostInfo | null {
 
 /**
  * Get user-friendly name for a model
- * Returns primary aliases (opus, sonnet, haiku) for Anthropic models
+ * Returns primary aliases (opus, sonnet, haiku, fable) for Anthropic models
  * Returns the model ID directly for OpenAI models (already user-friendly)
  */
 function getModelDisplayName(modelId: string): string {
@@ -338,7 +410,11 @@ function findCheaperAlternatives(
         pricing.input < currentCost.input &&
         pricing.output < currentCost.output &&
         // Cast needed: legacyModels has literal tuple type from 'as const'
-        !(legacyModels as readonly string[]).includes(modelId)
+        !(legacyModels as readonly string[]).includes(modelId) &&
+        // Anthropic: suggest only current-generation primary alias targets,
+        // not superseded IDs (e.g. claude-haiku-4-5 at 10x haiku's price)
+        (currentCost.provider === 'openai' ||
+          getModelDisplayName(modelId) !== modelId)
     )
     .map(([modelId, pricing]) => ({
       name: getModelDisplayName(modelId),
@@ -948,6 +1024,15 @@ export function validateParsedAgents(
           issues.push(costWarning);
         }
       }
+
+      const retirementWarning = createRetirementWarningIssue(
+        agent.role,
+        agent.model,
+        agent.lineNumber
+      );
+      if (retirementWarning) {
+        issues.push(retirementWarning);
+      }
     }
 
     // Validate model-provider compatibility
@@ -1124,7 +1209,7 @@ export function generateAgentsMdTemplate(): string {
 - **Responsibilities**: Line-by-line review, touch point analysis, multi-pass review
 - **Tools**: Codebase read, static analysis
 - **Provider**: codex
-- **Model**: gpt-5.6-terra
+- **Model**: gpt-6.1-sol
 - **Model-Rationale**: ChatGPT subscription compatible; strong reasoning for reviews
 - **Provider-Rationale**: Independent perspective prevents self-deception
 - **Fallback-Provider**: claude-code

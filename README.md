@@ -90,6 +90,8 @@ Authentication options:
 - **Subscription**: `codex login` (uses your ChatGPT Plus/Team quota)
 - **API Key**: `export OPENAI_API_KEY=sk-...` (pay-per-token)
 
+Use Codex CLI 0.163.0 or newer for the GPT-6 models. The default AGENTS.md sets `gpt-6.1-sol` for codex roles; agents with no `Model` run on the Codex CLI's own default. Older CLIs reject GPT-6 on a ChatGPT login, and airunx then retries once on the CLI's own default model.
+
 **Option C: Cursor CLI (experimental — least tested backend)**
 
 ```bash
@@ -586,14 +588,15 @@ airunx agents-validate --non-interactive --json
 
 - Agent role names (with typo suggestions)
 - Provider field values (`claude-code`, `cursor`, `codex`)
-- **Model field values** (`opus`, `sonnet`, `haiku`, `gpt-4o`, `o1`, etc.)
+- **Model field values** (`opus`, `sonnet`, `haiku`, `fable`, `gpt-6.1-sol`, etc.)
 - Required fields (Purpose)
 
 **Model validation features:**
 
 - Detects typos using Levenshtein distance (e.g., `sonnett` → `sonnet`)
 - Interactive prompts to fix invalid values
-- Cost warnings for expensive models (`opus`, `o1`)
+- Cost warnings for expensive models (`fable`, `gpt-6-astra`)
+- Retirement warnings for models with an announced shutdown date (e.g., `gpt-4o`), with a suggested replacement
 - Auto-fix mode for CI/CD pipelines
 
 #### `airunx heartbeat`
@@ -1050,7 +1053,7 @@ AIRunX supports 3 approval modes to control CLI adapter permission handling:
 | Mode       | Description                         | Adapter Flags                                                                                                        |
 | ---------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | **manual** | Interactive prompts for all actions | No auto-approval flags                                                                                               |
-| **auto**   | Auto-approve all actions (default)  | Codex: `--full-auto`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
+| **auto**   | Auto-approve all actions (default)  | Codex: `--sandbox workspace-write`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags                                |
 | **yolo**   | Skip all approvals and sandboxing   | Codex: `--dangerously-bypass-approvals-and-sandbox`, Claude Code: `--dangerously-skip-permissions`, Cursor: No flags |
 
 ### Configuration
@@ -1350,12 +1353,12 @@ backends:
   cursor:
     type: cli
     executable: cursor-agent
-    model: gpt-4o # Default model for this backend
+    model: gpt-6.1-sol # Default model for this backend
     timeout: 300
   codex:
     type: cli
     executable: codex
-    model: gpt-4o # Default model for this backend
+    model: gpt-6.1-sol # Default model for this backend
     timeout: 300
 ```
 
@@ -1678,7 +1681,7 @@ Define agent roles and responsibilities using a structured markdown format. Each
 | **Provider**           |          | Backend to use: `claude-code`, `cursor`, or `codex`                 | Routes agent execution to specified backend       |
 | **Provider-Rationale** |          | Explanation for why this provider was chosen                        | Documentation only (not used at runtime)          |
 | **Fallback-Provider**  |          | Backup backend if primary is unavailable                            | Automatic failover when primary fails             |
-| **Model**              |          | Model alias to use: `opus`, `sonnet`, `haiku`, `gpt-4o`, `o1`, etc. | Overrides backend default model for this agent    |
+| **Model**              |          | Model alias to use: `opus`, `sonnet`, `haiku`, `fable`, `gpt-6.1-sol`, etc. | Overrides backend default model for this agent    |
 | **Model-Rationale**    |          | Explanation for why this model was chosen                           | Documentation only (not used at runtime)          |
 | **System-Prompt**      |          | Custom natural language instructions for the agent                  | **Overrides auto-generated prompt when provided** |
 | **Used in**            |          | Pipeline stages where this agent is assigned                        | Documentation only (not used at runtime)          |
