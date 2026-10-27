@@ -7,6 +7,12 @@
  *     amounts are decimal strings in cents)
  *   - OpenAI `GET /v1/organization/costs` (daily buckets, float dollars)
  *
+ * Token cross-check (Anthropic only): ledger token counts per class
+ * (uncached input, cache read, cache write, output) against the Admin API
+ * `GET /v1/organizations/usage_report/messages`, with the same key, scope,
+ * finality and fail-closed rules as the cost report. Catches token
+ * normalization or cache-accounting drift that dollar totals can hide.
+ *
  * Day assignment: a spawn belongs to the UTC day of its `started_at`
  * (fallback `ended_at`, then the event timestamp). A spawn whose start and
  * end fall on different UTC days is flagged as straddling midnight; its cost
@@ -24,7 +30,10 @@ import chalk from 'chalk';
 import { existsSync } from 'fs';
 import { AuditLogger, getDefaultAuditDir } from '../audit/audit-logger.js';
 import type { AuditEvent } from '../task-queue/types.js';
-import { spawnEventCostSummary } from '../core/run-cost-summary.js';
+import {
+  spawnEventCostSummary,
+  spawnEventTokens,
+} from '../core/run-cost-summary.js';
 import {
   formatMicroUsd,
   usdToMicroUsdOrUndefined,
@@ -77,6 +86,9 @@ export const PROVIDER_ENDPOINTS = {
   anthropic: 'https://api.anthropic.com/v1/organizations/cost_report',
   openai: 'https://api.openai.com/v1/organization/costs',
 } as const;
+/** Anthropic token usage feed for the token cross-check */
+export const ANTHROPIC_USAGE_ENDPOINT =
+  'https://api.anthropic.com/v1/organizations/usage_report/messages';
 const ALLOWED_HOSTS = new Set(['api.anthropic.com', 'api.openai.com']);
 const ANTHROPIC_VERSION = '2023-06-01';
 
@@ -94,6 +106,33 @@ const SCOPE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 /** Scope value that selects Anthropic's default workspace (`workspace_id: null`). */
 export const ANTHROPIC_DEFAULT_WORKSPACE = 'default';
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Token classes compared by the cross-check. `uncachedInput` excludes cache
+ * reads and writes; `cacheWrite` sums the 5m and 1h cache-creation tiers
+ * (the ledger's tier split is partial, so only the total is compared).
+ */
+export const TOKEN_CLASSES = [
+  'uncachedInput',
+  'cacheRead',
+  'cacheWrite',
+  'output',
+] as const;
+export type TokenClass = (typeof TOKEN_CLASSES)[number];
+export type TokenCounts = Record<TokenClass, number>;
+
+function emptyTokenCounts(): TokenCounts {
+  return { uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+}
+
+function addTokenCounts(a: TokenCounts, b: TokenCounts): TokenCounts {
+  return {
+    uncachedInput: a.uncachedInput + b.uncachedInput,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    output: a.output + b.output,
+  };
+}
 
 // ─── Money ──────────────────────────────────────────────────────────────
 
@@ -214,6 +253,14 @@ export interface LedgerDay {
   /** Subscription (api_equivalent) or unknown-basis spawns — never reconciled */
   nonReconcilableSpawns: number;
   nonReconcilableMicroUsd: number;
+  /** Billed-spawn tokens on their start day, by class */
+  tokens: TokenCounts;
+  /** Tokens that may legitimately differ: estimated-token and straddling spawns */
+  tokenBand: TokenCounts;
+  /** Billed spawns with no recorded token usage (unknown, not 0) */
+  missingTokenSpawns: number;
+  /** Billed spawns whose token counts were estimated */
+  estimatedTokenSpawns: number;
 }
 
 export interface LedgerSummary {
@@ -236,6 +283,31 @@ function emptyLedgerDay(): LedgerDay {
     },
     nonReconcilableSpawns: 0,
     nonReconcilableMicroUsd: 0,
+    tokens: emptyTokenCounts(),
+    tokenBand: emptyTokenCounts(),
+    missingTokenSpawns: 0,
+    estimatedTokenSpawns: 0,
+  };
+}
+
+/**
+ * Ledger tokens by reconcile class. Ledger `input_tokens` is inclusive of
+ * cache reads and writes (OTel semantics), so uncached input is the
+ * remainder. Undefined when the spawn recorded no usage.
+ */
+export function spawnTokenCounts(event: AuditEvent): TokenCounts | undefined {
+  const usage = spawnEventTokens(event);
+  if (!usage) return undefined;
+  return {
+    uncachedInput: Math.max(
+      0,
+      usage.inputTokens -
+        usage.cacheReadInputTokens -
+        usage.cacheWriteInputTokens
+    ),
+    cacheRead: usage.cacheReadInputTokens,
+    cacheWrite: usage.cacheWriteInputTokens,
+    output: usage.outputTokens,
   };
 }
 
@@ -333,6 +405,8 @@ export function summarizeLedger(
     const straddles = startDay !== endDay;
     const estimated = summary.estimatedSpawns > 0;
     const unmodeled = summary.unmodeledModifiers.length > 0;
+    const tokens = spawnTokenCounts(event);
+    const tokensEstimated = d.token_provenance === 'estimated';
 
     if (inWindow.has(startDay)) {
       const entry = dayFor(provider, startDay);
@@ -343,6 +417,15 @@ export function summarizeLedger(
       if (unmodeled) entry.band.unmodeledMicroUsd += micro;
       if (estimated || unmodeled || straddles)
         entry.band.totalMicroUsd += micro;
+      if (!tokens) {
+        entry.missingTokenSpawns++;
+      } else {
+        entry.tokens = addTokenCounts(entry.tokens, tokens);
+        if (tokensEstimated) {
+          entry.estimatedTokenSpawns++;
+          entry.tokenBand = addTokenCounts(entry.tokenBand, tokens);
+        }
+      }
     }
     if (straddles) {
       for (const day of touched) {
@@ -351,6 +434,10 @@ export function summarizeLedger(
         entry.band.straddleMicroUsd += micro;
         // Start-day band already includes this spawn above
         if (day !== startDay) entry.band.totalMicroUsd += micro;
+        // Start-day token band already includes an estimated spawn
+        if (tokens && (day !== startDay || !tokensEstimated)) {
+          entry.tokenBand = addTokenCounts(entry.tokenBand, tokens);
+        }
       }
     }
   }
@@ -384,12 +471,18 @@ export interface ProviderFetchOptions {
   pageCap: number;
 }
 
-export interface ProviderCosts {
-  /** UTC day → billed micro-USD */
-  byDay: Map<string, number>;
+/** Per-day provider figures from a paged daily-bucket report */
+export interface ProviderDaily<T> {
+  byDay: Map<string, T>;
   /** Sanitized failure reason; when set, byDay is incomplete */
   error?: string;
 }
+
+/** UTC day → billed micro-USD */
+export type ProviderCosts = ProviderDaily<number>;
+
+/** UTC day → tokens by class */
+export type ProviderTokens = ProviderDaily<TokenCounts>;
 
 class ProviderRequestError extends Error {}
 
@@ -470,14 +563,35 @@ function parsePage(
   return { buckets, hasMore: root.has_more === true, nextPage };
 }
 
-async function fetchPaged(
+/** How one result row folds into a day's running total */
+interface Accumulator<T> {
+  zero: () => T;
+  /** Undefined when the result is unparsable (fails the whole fetch) */
+  add: (total: T, result: Record<string, unknown>) => T | undefined;
+  invalidMessage: string;
+}
+
+function microSum(
+  resultMicro: (r: Record<string, unknown>) => number | undefined
+): Accumulator<number> {
+  return {
+    zero: () => 0,
+    add: (total, result): number | undefined => {
+      const micro = resultMicro(result);
+      return micro === undefined ? undefined : total + micro;
+    },
+    invalidMessage: 'unparsable cost amount',
+  };
+}
+
+async function fetchPaged<T>(
   options: ProviderFetchOptions,
   buildUrl: (page?: string) => URL,
   headers: Record<string, string>,
   bucketDay: (b: Record<string, unknown>) => string | undefined,
-  resultMicro: (r: Record<string, unknown>) => number | undefined
-): Promise<ProviderCosts> {
-  const byDay = new Map<string, number>();
+  accumulator: Accumulator<T>
+): Promise<ProviderDaily<T>> {
+  const byDay = new Map<string, T>();
   const inWindow = new Set(options.windowDays);
   let page: string | undefined;
   try {
@@ -496,14 +610,14 @@ async function fetchPaged(
       const parsed = parsePage(body, bucketDay);
       for (const bucket of parsed.buckets) {
         if (!inWindow.has(bucket.day)) continue;
-        let total = byDay.get(bucket.day) ?? 0;
+        let total = byDay.get(bucket.day) ?? accumulator.zero();
         for (const raw of bucket.results) {
           const result = asRecord(raw);
-          const micro = result ? resultMicro(result) : undefined;
-          if (micro === undefined) {
-            throw new ProviderRequestError('unparsable cost amount');
+          const next = result ? accumulator.add(total, result) : undefined;
+          if (next === undefined) {
+            throw new ProviderRequestError(accumulator.invalidMessage);
           }
-          total += micro;
+          total = next;
         }
         byDay.set(bucket.day, total);
       }
@@ -532,21 +646,25 @@ function windowBounds(windowDays: readonly string[]): {
 }
 
 /**
- * Anthropic `cost_report`: `data[].starting_at` (RFC 3339) buckets with
- * `results[].amount` as a decimal string in cents and `currency` "USD";
- * grouped by workspace so a scope can be applied client-side.
+ * Anthropic Admin API daily report (cost_report / usage_report): 1d buckets
+ * over the window, grouped by workspace so the scope is always re-checked
+ * client-side. `extraParams` adds endpoint-specific query parameters.
  */
-export function fetchAnthropicCosts(
-  options: ProviderFetchOptions
-): Promise<ProviderCosts> {
+function fetchAnthropicDaily<T>(
+  options: ProviderFetchOptions,
+  endpoint: string,
+  accumulator: Accumulator<T>,
+  extraParams?: (url: URL) => void
+): Promise<ProviderDaily<T>> {
   const { startMs, endMs } = windowBounds(options.windowDays);
   const buildUrl = (page?: string): URL => {
-    const url = new URL(PROVIDER_ENDPOINTS.anthropic);
+    const url = new URL(endpoint);
     url.searchParams.set('starting_at', new Date(startMs).toISOString());
     url.searchParams.set('ending_at', new Date(endMs).toISOString());
     url.searchParams.set('bucket_width', '1d');
     url.searchParams.set('limit', String(options.windowDays.length));
     url.searchParams.append('group_by[]', 'workspace_id');
+    extraParams?.(url);
     if (page) url.searchParams.set('page', page);
     return url;
   };
@@ -561,12 +679,41 @@ export function fetchAnthropicCosts(
       const ms = parseTime(bucket.starting_at);
       return ms === undefined ? undefined : utcDay(ms);
     },
-    (result) => {
-      // The default workspace reports `workspace_id: null`.
-      const workspaceId = result.workspace_id ?? ANTHROPIC_DEFAULT_WORKSPACE;
-      if (options.scopeId !== undefined && workspaceId !== options.scopeId) {
-        return 0;
-      }
+    accumulator
+  );
+}
+
+/**
+ * Whether an Anthropic result belongs to the scope. The default workspace
+ * reports `workspace_id: null`. A scoped fetch fails closed on a result with
+ * no `workspace_id` key at all: it was not grouped by workspace, so it may be
+ * org-wide and cannot be attributed.
+ */
+function inAnthropicScope(
+  result: Record<string, unknown>,
+  scopeId: string | undefined
+): boolean {
+  if (scopeId === undefined) return true;
+  if (!('workspace_id' in result)) {
+    throw new ProviderRequestError('result not grouped by workspace');
+  }
+  const workspaceId = result.workspace_id ?? ANTHROPIC_DEFAULT_WORKSPACE;
+  return workspaceId === scopeId;
+}
+
+/**
+ * Anthropic `cost_report`: `data[].starting_at` (RFC 3339) buckets with
+ * `results[].amount` as a decimal string in cents and `currency` "USD";
+ * grouped by workspace so a scope can be applied client-side.
+ */
+export function fetchAnthropicCosts(
+  options: ProviderFetchOptions
+): Promise<ProviderCosts> {
+  return fetchAnthropicDaily(
+    options,
+    PROVIDER_ENDPOINTS.anthropic,
+    microSum((result) => {
+      if (!inAnthropicScope(result, options.scopeId)) return 0;
       if (
         typeof result.currency === 'string' &&
         result.currency.toUpperCase() !== 'USD'
@@ -576,6 +723,69 @@ export function fetchAnthropicCosts(
       return typeof result.amount === 'string'
         ? centsStringToMicroUsd(result.amount)
         : undefined;
+    })
+  );
+}
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/**
+ * One `usage_report/messages` result → tokens by class. Uncached input,
+ * cache read and output are required; `cache_creation` must be an object
+ * whose 5m / 1h tiers (absent = 0) are summed into the cache-write class.
+ */
+export function usageResultTokens(
+  result: Record<string, unknown>
+): TokenCounts | undefined {
+  const uncachedInput = tokenCount(result.uncached_input_tokens);
+  const cacheRead = tokenCount(result.cache_read_input_tokens);
+  const output = tokenCount(result.output_tokens);
+  const creation = asRecord(result.cache_creation);
+  if (
+    uncachedInput === undefined ||
+    cacheRead === undefined ||
+    output === undefined ||
+    !creation
+  ) {
+    return undefined;
+  }
+  const tier = (value: unknown): number | undefined =>
+    value === undefined ? 0 : tokenCount(value);
+  const w5m = tier(creation.ephemeral_5m_input_tokens);
+  const w1h = tier(creation.ephemeral_1h_input_tokens);
+  if (w5m === undefined || w1h === undefined) return undefined;
+  return { uncachedInput, cacheRead, cacheWrite: w5m + w1h, output };
+}
+
+/**
+ * Anthropic `usage_report/messages`: same buckets, paging and scope rules
+ * as the cost report. A real workspace scope is also sent server-side as
+ * `workspace_ids[]` (the default workspace has no ID to filter on).
+ */
+export function fetchAnthropicUsage(
+  options: ProviderFetchOptions
+): Promise<ProviderTokens> {
+  const { scopeId } = options;
+  return fetchAnthropicDaily(
+    options,
+    ANTHROPIC_USAGE_ENDPOINT,
+    {
+      zero: emptyTokenCounts,
+      add: (total, result) => {
+        if (!inAnthropicScope(result, scopeId)) return total;
+        const tokens = usageResultTokens(result);
+        return tokens ? addTokenCounts(total, tokens) : undefined;
+      },
+      invalidMessage: 'unparsable token count',
+    },
+    (url) => {
+      if (scopeId !== undefined && scopeId !== ANTHROPIC_DEFAULT_WORKSPACE) {
+        url.searchParams.append('workspace_ids[]', scopeId);
+      }
     }
   );
 }
@@ -612,7 +822,7 @@ export function fetchOpenAiCosts(
       Number.isFinite(bucket.start_time)
         ? utcDay(bucket.start_time * 1000)
         : undefined,
-    (result) => {
+    microSum((result) => {
       if (
         options.scopeId !== undefined &&
         result.project_id !== undefined &&
@@ -629,11 +839,37 @@ export function fetchOpenAiCosts(
         return undefined;
       }
       return dollarsToMicroUsd(amount.value);
-    }
+    })
   );
 }
 
 // ─── Reconciliation ─────────────────────────────────────────────────────
+
+export interface TokenClassComparison {
+  ledger: number;
+  /** null when the usage report was not queried or failed */
+  provider: number | null;
+  /** ledger − provider */
+  drift: number | null;
+  /** drift as % of the provider count; null when provider count is 0/absent */
+  driftPct: number | null;
+  /** Within ±10% or within the token variance band (null when not comparable) */
+  withinTolerance: boolean | null;
+  /** Tokens from estimated-token or midnight-straddling spawns */
+  band: number;
+}
+
+/** Ledger vs Anthropic usage report token counts for one day */
+export interface TokenReconcile {
+  /** Same status rules as the dollar row; `drift` when any class drifts */
+  status: ReconcileStatus;
+  classes: Record<TokenClass, TokenClassComparison>;
+  /** Classes outside tolerance (only when status is ok/drift) */
+  driftClasses: TokenClass[];
+  missingTokenSpawns: number;
+  estimatedTokenSpawns: number;
+  notes: string[];
+}
 
 export interface ReconcileRow {
   provider: ReconcileProvider;
@@ -658,6 +894,8 @@ export interface ReconcileRow {
   scope: string | null;
   final: boolean;
   notes: string[];
+  /** Token cross-check (Anthropic only; null for other providers) */
+  tokens: TokenReconcile | null;
 }
 
 export interface ReconcileReport {
@@ -741,6 +979,90 @@ function compare(
   };
 }
 
+function tokenReconcile(args: {
+  day: LedgerDay;
+  date: string;
+  adminKey: string | undefined;
+  usage: ProviderTokens | undefined;
+  final: boolean;
+  scope: string | undefined;
+}): TokenReconcile {
+  const { day, date, adminKey, usage, final, scope } = args;
+  const providerTokens =
+    usage && !usage.error
+      ? (usage.byDay.get(date) ?? emptyTokenCounts())
+      : undefined;
+  const classes = {} as Record<TokenClass, TokenClassComparison>;
+  for (const cls of TOKEN_CLASSES) {
+    const ledger = day.tokens[cls];
+    const band = day.tokenBand[cls];
+    if (providerTokens === undefined) {
+      classes[cls] = {
+        ledger,
+        provider: null,
+        drift: null,
+        driftPct: null,
+        withinTolerance: null,
+        band,
+      };
+      continue;
+    }
+    const provider = providerTokens[cls];
+    const c = compare(ledger, provider, band);
+    classes[cls] = {
+      ledger,
+      provider,
+      drift: c.driftMicroUsd,
+      driftPct: c.driftPct,
+      withinTolerance: c.withinTolerance,
+      band,
+    };
+  }
+
+  const notes: string[] = [];
+  let status: ReconcileStatus;
+  let driftClasses: TokenClass[] = [];
+  if (!adminKey) {
+    status = 'non-reconcilable';
+    notes.push(`${ADMIN_KEY_ENV.anthropic} not set`);
+  } else if (usage?.error) {
+    status = 'error';
+    notes.push(usage.error);
+  } else if (!final) {
+    status = 'not-yet-final';
+    notes.push('provider figures not yet final');
+  } else if (!scope) {
+    status = 'non-attributable';
+    notes.push('org-wide provider usage');
+  } else {
+    driftClasses = TOKEN_CLASSES.filter(
+      (cls) => classes[cls].withinTolerance === false
+    );
+    status = driftClasses.length > 0 ? 'drift' : 'ok';
+  }
+  if (providerTokens !== undefined && !usage?.byDay.has(date)) {
+    notes.push('usage report returned no bucket for this day (counted as 0)');
+  }
+  if (day.missingTokenSpawns > 0) {
+    notes.push(
+      `${day.missingTokenSpawns} billed spawn(s) with no recorded tokens`
+    );
+  }
+  if (day.estimatedTokenSpawns > 0) {
+    notes.push(
+      `${day.estimatedTokenSpawns} billed spawn(s) with estimated tokens`
+    );
+  }
+  return {
+    status,
+    classes,
+    driftClasses,
+    missingTokenSpawns: day.missingTokenSpawns,
+    estimatedTokenSpawns: day.estimatedTokenSpawns,
+    notes: notes.map(redactSecrets),
+  };
+}
+
 /**
  * Reconcile ledger billed spend against provider cost reports for closed
  * UTC days. Never throws for provider failures or missing keys — those
@@ -781,6 +1103,7 @@ export async function reconcileUsage(
     const adminKey = env[ADMIN_KEY_ENV[provider]]?.trim();
     const scope = scopes[provider];
     let costs: ProviderCosts | undefined;
+    let usage: ProviderTokens | undefined;
     if (!adminKey) {
       warnings.push(
         `${provider}: ${ADMIN_KEY_ENV[provider]} not set; billed spend is non-reconcilable`
@@ -802,6 +1125,21 @@ export async function reconcileUsage(
         warnings.push(
           `${provider}: no ${provider === 'anthropic' ? 'workspace' : 'project'} scope; provider totals are org-wide (non-attributable)`
         );
+      }
+      if (provider === 'anthropic') {
+        usage = await fetchAnthropicUsage({
+          adminKey,
+          windowDays,
+          scopeId: scope,
+          fetchImpl,
+          timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          pageCap: options.pageCap ?? DEFAULT_PAGE_CAP,
+        });
+        if (usage.error) {
+          warnings.push(
+            redactSecrets(`${provider}: usage report failed (${usage.error})`)
+          );
+        }
       }
     }
 
@@ -866,6 +1204,10 @@ export async function reconcileUsage(
         scope: scope ?? null,
         final,
         notes: notes.map(redactSecrets),
+        tokens:
+          provider === 'anthropic'
+            ? tokenReconcile({ day, date, adminKey, usage, final, scope })
+            : null,
       });
     }
   }
@@ -906,6 +1248,101 @@ function statusCell(status: ReconcileStatus): string {
   }
 }
 
+const TOKEN_CLASS_LABELS: Record<TokenClass, string> = {
+  uncachedInput: 'input (uncached)',
+  cacheRead: 'cache read',
+  cacheWrite: 'cache write',
+  output: 'output',
+};
+
+function count(value: number | null, signed = false): string {
+  if (value === null) return '-';
+  const text = Math.abs(value).toLocaleString('en-US');
+  if (value < 0) return `-${text}`;
+  return signed && value > 0 ? `+${text}` : text;
+}
+
+/** First `leftCols` columns left-aligned, the rest right; status colored */
+function renderTable(
+  headers: string[],
+  rows: string[][],
+  leftCols: number
+): string[] {
+  const widths = headers.map((h, i) =>
+    Math.max(h.length, ...rows.map((row) => row[i].length))
+  );
+  const line = (cells: string[], colorStatus = false): string =>
+    '  ' +
+    cells
+      .map((c, i) => {
+        const padded =
+          i < leftCols ? c.padEnd(widths[i]) : c.padStart(widths[i]);
+        return colorStatus && i === cells.length - 1
+          ? statusCell(c as ReconcileStatus) + ' '.repeat(widths[i] - c.length)
+          : padded;
+      })
+      .join('  ');
+  return [
+    chalk.bold(line(headers)),
+    `  ${'─'.repeat(widths.reduce((a, w) => a + w, 0) + 2 * (widths.length - 1))}`,
+    ...rows.map((row) => line(row, true)),
+  ];
+}
+
+/** Anthropic token cross-check table + notes (empty when no token rows) */
+function formatTokenSection(report: ReconcileReport): string[] {
+  const tokenRows = report.rows.filter(
+    (r): r is ReconcileRow & { tokens: TokenReconcile } => r.tokens !== null
+  );
+  if (tokenRows.length === 0) return [];
+  const rows: string[][] = [];
+  for (const r of tokenRows) {
+    const comparable = r.tokens.status === 'ok' || r.tokens.status === 'drift';
+    for (const cls of TOKEN_CLASSES) {
+      const c = r.tokens.classes[cls];
+      rows.push([
+        r.date,
+        TOKEN_CLASS_LABELS[cls],
+        count(c.ledger),
+        count(c.provider),
+        count(c.drift, true),
+        c.driftPct === null ? '-' : `${c.driftPct.toFixed(2)}%`,
+        count(c.band),
+        comparable ? (c.withinTolerance ? 'ok' : 'drift') : r.tokens.status,
+      ]);
+    }
+  }
+  const out = [
+    '',
+    chalk.bold(
+      'Anthropic token cross-check (usage report, billed spawns only)'
+    ),
+    '',
+    ...renderTable(
+      [
+        'Day',
+        'Class',
+        'Ledger',
+        'Provider',
+        'Drift',
+        'Drift %',
+        'Band',
+        'Status',
+      ],
+      rows,
+      2
+    ),
+  ];
+  const noted = tokenRows.filter((r) => r.tokens.notes.length > 0);
+  if (noted.length > 0) {
+    out.push('', chalk.bold('Token notes'));
+    for (const r of noted) {
+      out.push(`  ${r.provider} ${r.date}: ${r.tokens.notes.join('; ')}`);
+    }
+  }
+  return out;
+}
+
 /** Human-readable table for `airunx costs reconcile` */
 export function formatReconcileReport(report: ReconcileReport): string {
   const headers = [
@@ -928,28 +1365,12 @@ export function formatReconcileReport(report: ReconcileReport): string {
     usd(r.band.totalMicroUsd),
     r.status,
   ]);
-  const widths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((row) => row[i].length))
-  );
-  const line = (cells: string[], colorStatus = false): string =>
-    '  ' +
-    cells
-      .map((c, i) => {
-        const padded = i <= 1 ? c.padEnd(widths[i]) : c.padStart(widths[i]);
-        return colorStatus && i === cells.length - 1
-          ? statusCell(c as ReconcileStatus) + ' '.repeat(widths[i] - c.length)
-          : padded;
-      })
-      .join('  ');
-
   const out = [
     chalk.bold(
       `Cost reconciliation — ${report.days[0]}${report.days.length > 1 ? ` … ${report.days[report.days.length - 1]}` : ''} (UTC, billed spend only)`
     ),
     '',
-    chalk.bold(line(headers)),
-    `  ${'─'.repeat(widths.reduce((a, w) => a + w, 0) + 2 * (widths.length - 1))}`,
-    ...rows.map((row) => line(row, true)),
+    ...renderTable(headers, rows, 2),
   ];
 
   const noted = report.rows.filter((r) => r.notes.length > 0);
@@ -959,6 +1380,7 @@ export function formatReconcileReport(report: ReconcileReport): string {
       out.push(`  ${r.provider} ${r.date}: ${r.notes.join('; ')}`);
     }
   }
+  out.push(...formatTokenSection(report));
   if (report.skippedLines > 0) {
     out.push(
       '',
@@ -968,7 +1390,7 @@ export function formatReconcileReport(report: ReconcileReport): string {
   out.push(
     '',
     chalk.dim(
-      `  ok = within ±${DRIFT_TOLERANCE * 100}% or within the variance band (estimated + unmodeled + midnight-straddling spend)`
+      `  ok = within ±${DRIFT_TOLERANCE * 100}% or within the variance band (estimated + unmodeled + midnight-straddling spend; for tokens, estimated-token + straddling spawns)`
     )
   );
   return out.join('\n');

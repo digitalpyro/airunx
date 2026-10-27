@@ -211,7 +211,7 @@ export function registerCostsCommands(program: Command): Command {
   costs
     .command('reconcile')
     .description(
-      'Compare billed (API-key) ledger spend per closed UTC day against provider cost reports (needs ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY)'
+      'Compare billed (API-key) ledger spend per closed UTC day against provider cost reports, plus an Anthropic per-token-class cross-check (needs ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY)'
     )
     .option(
       '--date <YYYY-MM-DD>',
