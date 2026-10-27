@@ -37,7 +37,7 @@ describe('TemplateEngine', () => {
         taskDescription: 'Implement a dark mode toggle for the application',
         fidelityLevel: 'standard',
         backend: 'claude-code',
-        iterationCount: 2,
+        iterationCount: 1, // 0-indexed: two iterations run
         maxIterations: 3,
         todos: [
           {
@@ -68,7 +68,9 @@ describe('TemplateEngine', () => {
 
       const rendered = await templateEngine.render(context);
 
-      expect(rendered).toContain('Implement a dark mode toggle for the application');
+      expect(rendered).toContain(
+        'Implement a dark mode toggle for the application'
+      );
       expect(rendered).toContain('standard');
       expect(rendered).toContain('claude-code');
       expect(rendered).toContain('2/3');
@@ -232,7 +234,9 @@ describe('TemplateEngine', () => {
 
       const rendered = await templateEngine.render(context);
 
-      expect(rendered).toMatch(/^Closes https:\/\/github\.com\/owner\/repo\/issues\/123\n\n/);
+      expect(rendered).toMatch(
+        /^Closes https:\/\/github\.com\/owner\/repo\/issues\/123\n\n/
+      );
     });
 
     it('should not include Closes link when issueUrl is not provided', async () => {

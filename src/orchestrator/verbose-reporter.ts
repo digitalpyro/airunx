@@ -12,6 +12,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { StateManager } from './state-manager.js';
 import { createLogger } from '../utils/logger.js';
+import { iterationsRun } from '../utils/iterations.js';
 
 const logger = createLogger('VerboseReporter');
 
@@ -190,7 +191,7 @@ export class VerboseReporter {
       const elapsed = Date.now() - this.startTime;
       const minutes = Math.floor(elapsed / 60_000);
       const stage = state.currentStage ?? 'unknown';
-      const iteration = state.iterationCount ?? 0;
+      const iteration = iterationsRun(state);
 
       const message = `[${minutes}m elapsed] Stage: ${stage} (iteration ${iteration})`;
       this.output(message);

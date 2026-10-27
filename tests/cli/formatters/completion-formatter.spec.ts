@@ -46,7 +46,7 @@ describe('Completion Formatter', () => {
         errors: 0,
         totalCost: 0.0025,
       },
-      iterationCount: 2,
+      iterationCount: 1, // 0-indexed: two iterations run
       ...overrides,
     };
   }
@@ -328,7 +328,7 @@ describe('Completion Formatter', () => {
           errors: 0,
           totalCost: 0.05,
         },
-        iterationCount: 2,
+        iterationCount: 1, // 0-indexed: two iterations run
       });
       const result = formatCompletionJson(context) as {
         metrics: {
