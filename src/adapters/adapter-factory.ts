@@ -109,6 +109,10 @@ export class AdapterFactory {
       retryCount: backendConfig.retry_count,
       useCaching: backendConfig.use_caching,
       enableVerification: backendConfig.enable_verification,
+      mcpConfig:
+        backendConfig.mcp_config === undefined
+          ? undefined
+          : ([] as string[]).concat(backendConfig.mcp_config),
     };
 
     await adapter.init(config);

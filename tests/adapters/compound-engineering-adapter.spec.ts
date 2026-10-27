@@ -164,3 +164,21 @@ describe('CompoundEngineeringAdapter delegation events', () => {
     expect(delegations).toEqual([]);
   });
 });
+
+describe('CompoundEngineeringAdapter MCP isolation (issue #20)', () => {
+  it('passes --strict-mcp-config to the main and every sub-agent spawn', async () => {
+    const { adapter } = makeAdapter([0.5, 0.1, 0.1, 0.1]);
+    const spy = vi.mocked(
+      (adapter as unknown as { executeWithSpawn: () => Promise<unknown> })
+        .executeWithSpawn
+    );
+    await adapter.execute(
+      makeRequest({ task: 'Implement this carefully. '.repeat(30) })
+    );
+
+    expect(spy.mock.calls).toHaveLength(4);
+    for (const call of spy.mock.calls as unknown[][]) {
+      expect(call[1]).toContain('--strict-mcp-config');
+    }
+  });
+});

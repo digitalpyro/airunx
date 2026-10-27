@@ -59,6 +59,12 @@ export const BackendConfigSchema = z.object({
   retry_count: z.number().int().min(0).optional(),
   use_caching: z.boolean().optional(),
   enable_verification: z.boolean().optional(),
+  /**
+   * claude-code only: MCP server config(s) passed via --mcp-config (file
+   * paths or JSON strings). Spawns always run with --strict-mcp-config, so
+   * these are the ONLY MCP servers a spawn sees.
+   */
+  mcp_config: z.union([z.string(), z.array(z.string())]).optional(),
 });
 
 /**
@@ -136,6 +142,8 @@ export interface AdapterConfig {
   retryCount?: number;
   useCaching?: boolean;
   enableVerification?: boolean;
+  /** MCP server configs (paths or JSON strings) for --mcp-config */
+  mcpConfig?: string[];
 }
 
 /**

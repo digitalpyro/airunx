@@ -27,6 +27,10 @@ class TestableClaudeCodeAdapter extends ClaudeCodeAdapter {
   public testBuildCliArgs(request: ExecutionRequest, prompt: string): string[] {
     return this.buildCliArgs(request, prompt);
   }
+
+  public testBuildEnv(): Record<string, string | undefined> {
+    return this.buildEnv();
+  }
 }
 
 /**
@@ -103,6 +107,51 @@ describe('ClaudeCodeAdapter', () => {
       const args = adapter.testBuildCliArgs(request, specialPrompt);
 
       expect(args[args.length - 1]).toBe(specialPrompt);
+    });
+  });
+
+  describe('MCP isolation (issue #20)', () => {
+    it('passes --strict-mcp-config on every spawn by default', () => {
+      for (const role of ['developer', 'orchestrator'] as const) {
+        for (const pipelineMode of [false, true]) {
+          const args = adapter.testBuildCliArgs(
+            createMockRequest({
+              agent: { role, capabilities: [], contextRequired: [] },
+              context: {
+                workingDirectory: '/test/path',
+                additionalContext: { pipelineMode },
+              },
+            }),
+            'test prompt'
+          );
+          expect(args).toContain('--strict-mcp-config');
+          expect(args).not.toContain('--mcp-config');
+          expect(args[args.length - 1]).toBe('test prompt');
+        }
+      }
+    });
+
+    it('passes configured mcpConfig entries via --mcp-config, still strict', () => {
+      Object.assign(adapter, {
+        config: {
+          type: 'cli',
+          mcpConfig: ['/repo/.airunx/mcp.json', '{"mcpServers":{}}'],
+        } satisfies AdapterConfig,
+      });
+      const args = adapter.testBuildCliArgs(createMockRequest(), 'prompt');
+
+      expect(args).toContain('--strict-mcp-config');
+      const i = args.indexOf('--mcp-config');
+      expect(args.slice(i, i + 3)).toEqual([
+        '--mcp-config',
+        '/repo/.airunx/mcp.json',
+        '{"mcpServers":{}}',
+      ]);
+      expect(args[args.length - 1]).toBe('prompt');
+    });
+
+    it('disables claude.ai MCP connectors in the spawn env', () => {
+      expect(adapter.testBuildEnv().ENABLE_CLAUDEAI_MCP_SERVERS).toBe('false');
     });
   });
 

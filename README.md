@@ -1362,6 +1362,15 @@ backends:
     timeout: 300
 ```
 
+**MCP servers (claude-code):** every headless `claude` spawn runs with `--strict-mcp-config` (and `ENABLE_CLAUDEAI_MCP_SERVERS=false`), so spawns do not inherit your claude.ai connectors or `~/.claude.json` / `.mcp.json` servers. To give spawns specific MCP servers, set `mcp_config` on the `claude-code` backend to a path or JSON string (or a list of them); each is passed via `--mcp-config`:
+
+```yaml
+backends:
+  claude-code:
+    type: cli
+    mcp_config: .airunx/mcp.json # or a list of paths / JSON strings
+```
+
 ### Provider Routing Priority
 
 ```
