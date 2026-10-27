@@ -918,6 +918,7 @@ Heartbeat mode provides tools that agents can use to control their own workflow:
 | `list_pipelines`    | Discover available pipelines and their configurations                   |
 | `query_audit`       | Query past execution events for learning from history                   |
 | `iteration_history` | Get history of previous iterations to avoid repeating failed approaches |
+| `get_run_cost`      | Get a run's aggregate spend summary (same data as `airunx costs`)       |
 
 These tools shift control from rigid orchestration to agent-driven decisions, enabling more intelligent task handling.
 
