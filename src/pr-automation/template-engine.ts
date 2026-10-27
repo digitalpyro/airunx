@@ -11,6 +11,7 @@ import type { WorkflowContext } from '../core/types.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { formatDuration, formatDurationHuman } from '../utils/formatting.js';
+import { iterationsRun } from '../utils/iterations.js';
 import { PR_AUTOMATION_DEFAULTS } from './constants.js';
 import {
   getPackageDefaultDir,
@@ -281,7 +282,7 @@ export class TemplateEngine {
       fidelityLevel:
         context.fidelityLevel || PR_AUTOMATION_DEFAULTS.FIDELITY_LEVEL,
       backend: context.backend || PR_AUTOMATION_DEFAULTS.BACKEND,
-      iterationCount: context.iterationCount || 0,
+      iterationCount: iterationsRun(context),
       maxIterations:
         context.maxIterations || PR_AUTOMATION_DEFAULTS.MAX_ITERATIONS,
       runtime: formatDuration(context.metrics?.totalRuntimeMs || 0),
@@ -362,10 +363,11 @@ export class TemplateEngine {
   private buildIterationHistory(context: WorkflowContext): string {
     const entries = context.iterationHistory?.entries;
     if (!entries || entries.length === 0) {
-      if (!context.iterationCount || context.iterationCount <= 1) {
+      const iterations = iterationsRun(context);
+      if (iterations <= 1) {
         return '';
       }
-      return `_Completed in ${context.iterationCount} iteration(s)_`;
+      return `_Completed in ${iterations} iteration(s)_`;
     }
 
     // Build per-iteration breakdown table

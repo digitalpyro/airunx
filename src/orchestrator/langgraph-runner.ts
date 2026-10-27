@@ -43,6 +43,7 @@ import {
 import { FidelityExecutor } from './fidelity-executor.js';
 import { loadRunReport, writeRunReportFile } from '../utils/run-report-io.js';
 import { createLogger } from '../utils/logger.js';
+import { iterationsRun } from '../utils/iterations.js';
 import { toError } from '../utils/error-handlers.js';
 import { ContextResolver } from '../utils/context-resolver.js';
 import { DEFAULT_MAX_ITERATIONS } from './iteration-manager.js';
@@ -1578,7 +1579,7 @@ export class LangGraphRunner {
       totalDurationMs: totalRuntimeMs,
       totalTokens: context.metrics.totalTokens ?? context.metrics.tokensUsed,
       totalCostUsd: context.metrics.totalCost ?? 0,
-      iterationCount: context.iterationCount ?? 1,
+      iterationCount: iterationsRun(context),
       maxIterations: context.maxIterations ?? 1,
       iterations: context.iterationHistory?.entries ?? [],
       stages: stageRecords,

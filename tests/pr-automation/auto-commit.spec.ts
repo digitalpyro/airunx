@@ -32,12 +32,33 @@ describe('AutoCommit', () => {
         taskTitle: 'Add dark mode feature',
         fidelityLevel: 'standard',
         backend: 'claude-code',
-        iterationCount: 2,
+        iterationCount: 1, // 0-indexed: two iterations run
         maxIterations: 3,
         todos: [
-          { id: '001', title: 'Implement toggle UI', status: 'completed', priority: 'p1', createdAt: new Date(), updatedAt: new Date() },
-          { id: '002', title: 'Add state management', status: 'completed', priority: 'p2', createdAt: new Date(), updatedAt: new Date() },
-          { id: '003', title: 'Write tests', status: 'pending', priority: 'p3', createdAt: new Date(), updatedAt: new Date() },
+          {
+            id: '001',
+            title: 'Implement toggle UI',
+            status: 'completed',
+            priority: 'p1',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          {
+            id: '002',
+            title: 'Add state management',
+            status: 'completed',
+            priority: 'p2',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          {
+            id: '003',
+            title: 'Write tests',
+            status: 'pending',
+            priority: 'p3',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
         ],
         metrics: {
           tokensUsed: 8500,
@@ -105,7 +126,9 @@ describe('AutoCommit', () => {
         },
       };
 
-      const message = autoCommit.generateMessage(context, { commitType: 'fix' });
+      const message = autoCommit.generateMessage(context, {
+        commitType: 'fix',
+      });
 
       expect(message).toContain('fix: Fix authentication bug');
     });

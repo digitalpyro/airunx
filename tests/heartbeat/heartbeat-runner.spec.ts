@@ -19,7 +19,11 @@ import {
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
-import type { RunReport } from '../../src/core/types.js';
+import type {
+  Pipeline,
+  RunReport,
+  WorkflowContext,
+} from '../../src/core/types.js';
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
@@ -53,6 +57,9 @@ import type {
   HeartbeatConfig,
 } from '../../src/task-queue/types.js';
 import { WORKFLOW_ID_PATTERN } from '../../src/utils/workflow-id.js';
+import { formatCompletionJson } from '../../src/cli/formatters/completion-formatter.js';
+import { LangGraphRunner } from '../../src/orchestrator/langgraph-runner.js';
+import { StateManager } from '../../src/orchestrator/state-manager.js';
 
 const COST_LINE =
   '$0.42 API-equivalent (subscription) — 60% reported/derived, 40% estimated';
@@ -263,6 +270,111 @@ describe('HeartbeatRunner killed-run report hand-off', () => {
     expect(result.status).toBe('completed');
     expect(result.metrics?.costUsd).toBe(1.5);
     expect(result.runReport?.stages[0].costUsd).toBe(1.5);
+  });
+
+  describe('iteration count for a run the judge accepted on the first pass', () => {
+    /** Final context of a one-iteration run (iterationCount is 0-indexed) */
+    const oneIterationContext = (workflowId: string): WorkflowContext => ({
+      id: workflowId,
+      input: 'Do the thing',
+      inputType: 'prompt',
+      mode: 'autonomous',
+      fidelityLevel: 'standard',
+      createdAt: new Date(),
+      status: 'completed',
+      iterationCount: 0,
+      maxIterations: 2,
+      todos: [],
+      prUrl: 'https://github.com/o/r/pull/1',
+      stageRecords: makeReport(workflowId).stages,
+      metrics: {
+        tokensUsed: 12_345,
+        totalTokens: 12_345,
+        runtime: 0,
+        totalRuntimeMs: 60_000,
+        stagesCompleted: 1,
+        totalStages: 1,
+        errors: 0,
+        totalCost: 0.42,
+      },
+    });
+
+    const commentBody = (): string =>
+      vi.mocked(GitHubCLI.addIssueComment).mock.calls[0][0].body;
+
+    it('JSON metrics path: `run --format json` output yields Iterations: 1', async () => {
+      vi.mocked(spawn).mockImplementation(((
+        _cmd: string,
+        args: readonly string[]
+      ) => {
+        const workflowId = args[args.indexOf('--workflow-id') + 1];
+        const child = new EventEmitter() as FakeChild;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.killed = false;
+        child.kill = (): boolean => true;
+        setImmediate(() => {
+          child.stdout.write(
+            JSON.stringify(
+              formatCompletionJson(oneIterationContext(workflowId))
+            )
+          );
+          setImmediate(() => child.emit('close', 0, null));
+        });
+        return child;
+      }) as unknown as typeof spawn);
+      const completeTask = vi.spyOn(queue, 'completeTask');
+
+      await runner.runOneCycle(config);
+
+      const result = completeTask.mock.calls[0][1];
+      expect(result.metrics?.iterations).toBe(1);
+      expect(result.runReport?.iterationCount).toBe(1);
+      expect(commentBody()).toContain('Iterations: 1');
+      expect(commentBody()).not.toContain('Iterations: 0');
+    });
+
+    it('report-on-disk path: the run report LangGraphRunner writes yields Iterations: 1', async () => {
+      vi.mocked(spawn).mockImplementation(((
+        _cmd: string,
+        args: readonly string[]
+      ) => {
+        const workflowId = args[args.indexOf('--workflow-id') + 1];
+        const context = oneIterationContext(workflowId);
+        const langGraphRunner = new LangGraphRunner(
+          { execute: vi.fn(), name: 'mock', capabilities: [] },
+          new StateManager(join(tmpDir, 'state')),
+          { name: 'p', description: 'p', stages: [] } as unknown as Pipeline,
+          context
+        );
+        const report = (
+          langGraphRunner as unknown as {
+            buildRunReport: (c: WorkflowContext, ms: number) => RunReport;
+          }
+        ).buildRunReport(context, 60_000);
+        const dir = join(tmpDir, '.airunx-state', 'reports');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${workflowId}.json`), JSON.stringify(report));
+
+        // No stdout JSON: the heartbeat must fall back to the report on disk
+        const child = new EventEmitter() as FakeChild;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.killed = false;
+        child.kill = (): boolean => true;
+        setImmediate(() => child.emit('close', 0, null));
+        return child;
+      }) as unknown as typeof spawn);
+      const failTask = vi.spyOn(queue, 'failTask');
+
+      await runner.runOneCycle(config);
+
+      const result = failTask.mock.calls[0][1];
+      expect(result.runReport?.iterationCount).toBe(1);
+      expect(result.metrics?.iterations).toBe(1);
+      expect(commentBody()).toContain('Iterations: 1');
+      expect(commentBody()).not.toContain('Iterations: 0');
+    });
   });
 });
 
