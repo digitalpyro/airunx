@@ -30,43 +30,88 @@ import chalk from 'chalk';
 import { existsSync } from 'fs';
 import { AuditLogger, getDefaultAuditDir } from '../audit/audit-logger.js';
 import type { AuditEvent } from '../task-queue/types.js';
-import {
-  spawnEventCostSummary,
-  spawnEventTokens,
-} from '../core/run-cost-summary.js';
+import { spawnEventCostSummary } from '../core/run-cost-summary.js';
 import {
   formatMicroUsd,
   usdToMicroUsdOrUndefined,
 } from '../core/cost-accounting.js';
 import { redactSecrets } from '../utils/redaction.js';
+import {
+  ADMIN_KEY_ENV,
+  DAY_MS,
+  DRIFT_TOLERANCE,
+  asRecord,
+  compare,
+  dayStartMs,
+  fetchAnthropicDaily,
+  fetchPaged,
+  inAnthropicScope,
+  parseTime,
+  renderTable,
+  utcDay,
+  windowBounds,
+  type Accumulator,
+  type FetchLike,
+  type ProviderDaily,
+  type ProviderFetchOptions,
+  type ReconcileProvider,
+  type ReconcileStatus,
+} from './usage-reconciler-shared.js';
+import {
+  addTokenCounts,
+  emptyTokenCounts,
+  fetchAnthropicUsage,
+  formatTokenSection,
+  spawnTokenCounts,
+  tokenReconcile,
+  type ProviderTokens,
+  type LedgerTokenDay,
+  type TokenReconcile,
+} from './usage-reconciler-tokens.js';
+
+// Re-exports: the public surface of this module is unchanged
+export {
+  ADMIN_KEY_ENV,
+  ANTHROPIC_DEFAULT_WORKSPACE,
+  DRIFT_TOLERANCE,
+} from './usage-reconciler-shared.js';
+export type {
+  FetchLike,
+  ProviderDaily,
+  ProviderFetchOptions,
+  ReconcileProvider,
+  ReconcileStatus,
+} from './usage-reconciler-shared.js';
+export {
+  ANTHROPIC_USAGE_ENDPOINT,
+  TOKEN_CLASSES,
+  fetchAnthropicUsage,
+  spawnTokenCounts,
+  usageResultTokens,
+} from './usage-reconciler-tokens.js';
+export type {
+  ProviderTokens,
+  TokenClass,
+  TokenClassComparison,
+  TokenCounts,
+  TokenReconcile,
+} from './usage-reconciler-tokens.js';
 
 /** Bumped when the JSON shape of ReconcileReport changes incompatibly */
 export const RECONCILE_REPORT_VERSION = 1;
-
-export type ReconcileProvider = 'anthropic' | 'openai';
 
 export const RECONCILE_PROVIDERS: readonly ReconcileProvider[] = [
   'anthropic',
   'openai',
 ];
 
-export type ReconcileStatus =
-  | 'ok'
-  | 'drift'
-  | 'not-yet-final'
-  | 'non-reconcilable'
-  | 'non-attributable'
-  | 'error';
-
-/** Drift within this share of the provider total is "ok" */
-export const DRIFT_TOLERANCE = 0.1;
 /** Pagination stops (and the provider is reported as error) past this */
 export const DEFAULT_PAGE_CAP = 20;
 export const DEFAULT_TIMEOUT_MS = 30_000;
 /** Longest window accepted by `--days` (Anthropic 1d buckets cap at 31) */
 export const MAX_RECONCILE_DAYS = 31;
 
-const DAY_MS = 86_400_000;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const HOUR_MS = 3_600_000;
 
 /** How long after a UTC day closes the provider's figures are final */
@@ -86,53 +131,13 @@ export const PROVIDER_ENDPOINTS = {
   anthropic: 'https://api.anthropic.com/v1/organizations/cost_report',
   openai: 'https://api.openai.com/v1/organization/costs',
 } as const;
-/** Anthropic token usage feed for the token cross-check */
-export const ANTHROPIC_USAGE_ENDPOINT =
-  'https://api.anthropic.com/v1/organizations/usage_report/messages';
-const ALLOWED_HOSTS = new Set(['api.anthropic.com', 'api.openai.com']);
-const ANTHROPIC_VERSION = '2023-06-01';
 
-export const ADMIN_KEY_ENV: Record<ReconcileProvider, string> = {
-  anthropic: 'ANTHROPIC_ADMIN_KEY',
-  openai: 'OPENAI_ADMIN_KEY',
-};
 export const SCOPE_ENV: Record<ReconcileProvider, string> = {
   anthropic: 'AIRUNX_ANTHROPIC_WORKSPACE_ID',
   openai: 'AIRUNX_OPENAI_PROJECT_ID',
 };
 
 const SCOPE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
-/** Scope value that selects Anthropic's default workspace (`workspace_id: null`). */
-export const ANTHROPIC_DEFAULT_WORKSPACE = 'default';
-const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
-/**
- * Token classes compared by the cross-check. `uncachedInput` excludes cache
- * reads and writes; `cacheWrite` sums the 5m and 1h cache-creation tiers
- * (the ledger's tier split is partial, so only the total is compared).
- */
-export const TOKEN_CLASSES = [
-  'uncachedInput',
-  'cacheRead',
-  'cacheWrite',
-  'output',
-] as const;
-export type TokenClass = (typeof TOKEN_CLASSES)[number];
-export type TokenCounts = Record<TokenClass, number>;
-
-function emptyTokenCounts(): TokenCounts {
-  return { uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
-}
-
-function addTokenCounts(a: TokenCounts, b: TokenCounts): TokenCounts {
-  return {
-    uncachedInput: a.uncachedInput + b.uncachedInput,
-    cacheRead: a.cacheRead + b.cacheRead,
-    cacheWrite: a.cacheWrite + b.cacheWrite,
-    output: a.output + b.output,
-  };
-}
 
 // ─── Money ──────────────────────────────────────────────────────────────
 
@@ -177,14 +182,6 @@ export function dollarsToMicroUsd(dollars: unknown): number | undefined {
 }
 
 // ─── Window ─────────────────────────────────────────────────────────────
-
-function dayStartMs(day: string): number {
-  return Date.parse(`${day}T00:00:00Z`);
-}
-
-function utcDay(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 10);
-}
 
 /** Validate a YYYY-MM-DD calendar date */
 export function isValidUtcDate(day: string): boolean {
@@ -242,7 +239,7 @@ export interface VarianceBand {
   straddleMicroUsd: number;
 }
 
-export interface LedgerDay {
+export interface LedgerDay extends LedgerTokenDay {
   billedMicroUsd: number;
   billedSpawns: number;
   /** Billed spawns with no cost figure (unknown, not $0) */
@@ -253,14 +250,6 @@ export interface LedgerDay {
   /** Subscription (api_equivalent) or unknown-basis spawns — never reconciled */
   nonReconcilableSpawns: number;
   nonReconcilableMicroUsd: number;
-  /** Billed-spawn tokens on their start day, by class */
-  tokens: TokenCounts;
-  /** Tokens that may legitimately differ: estimated-token and straddling spawns */
-  tokenBand: TokenCounts;
-  /** Billed spawns with no recorded token usage (unknown, not 0) */
-  missingTokenSpawns: number;
-  /** Billed spawns whose token counts were estimated */
-  estimatedTokenSpawns: number;
 }
 
 export interface LedgerSummary {
@@ -290,35 +279,8 @@ function emptyLedgerDay(): LedgerDay {
   };
 }
 
-/**
- * Ledger tokens by reconcile class. Ledger `input_tokens` is inclusive of
- * cache reads and writes (OTel semantics), so uncached input is the
- * remainder. Undefined when the spawn recorded no usage.
- */
-export function spawnTokenCounts(event: AuditEvent): TokenCounts | undefined {
-  const usage = spawnEventTokens(event);
-  if (!usage) return undefined;
-  return {
-    uncachedInput: Math.max(
-      0,
-      usage.inputTokens -
-        usage.cacheReadInputTokens -
-        usage.cacheWriteInputTokens
-    ),
-    cacheRead: usage.cacheReadInputTokens,
-    cacheWrite: usage.cacheWriteInputTokens,
-    output: usage.outputTokens,
-  };
-}
-
 function ledgerKey(provider: ReconcileProvider, day: string): string {
   return `${provider}|${day}`;
-}
-
-function parseTime(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined;
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : undefined;
 }
 
 function spawnBasis(
@@ -446,130 +408,8 @@ export function summarizeLedger(
 
 // ─── Provider side ──────────────────────────────────────────────────────
 
-export type FetchLike = (
-  input: string,
-  init: {
-    method: 'GET';
-    headers: Record<string, string>;
-    redirect: 'error';
-    signal: AbortSignal;
-  }
-) => Promise<{
-  ok: boolean;
-  status: number;
-  json(): Promise<unknown>;
-  body?: { cancel(): Promise<void> } | null;
-}>;
-
-export interface ProviderFetchOptions {
-  adminKey: string;
-  windowDays: readonly string[];
-  /** Workspace (Anthropic) / project (OpenAI) to restrict to */
-  scopeId?: string;
-  fetchImpl: FetchLike;
-  timeoutMs: number;
-  pageCap: number;
-}
-
-/** Per-day provider figures from a paged daily-bucket report */
-export interface ProviderDaily<T> {
-  byDay: Map<string, T>;
-  /** Sanitized failure reason; when set, byDay is incomplete */
-  error?: string;
-}
-
 /** UTC day → billed micro-USD */
 export type ProviderCosts = ProviderDaily<number>;
-
-/** UTC day → tokens by class */
-export type ProviderTokens = ProviderDaily<TokenCounts>;
-
-class ProviderRequestError extends Error {}
-
-async function getJson(
-  url: URL,
-  headers: Record<string, string>,
-  fetchImpl: FetchLike,
-  timeoutMs: number
-): Promise<unknown> {
-  // Defense in depth: only the fixed provider hosts, only https
-  if (url.protocol !== 'https:' || !ALLOWED_HOSTS.has(url.hostname)) {
-    throw new ProviderRequestError('refused non-provider URL');
-  }
-  let response: Awaited<ReturnType<FetchLike>>;
-  try {
-    response = await fetchImpl(url.toString(), {
-      method: 'GET',
-      headers,
-      redirect: 'error',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (error) {
-    const name = error instanceof Error ? error.name : 'Error';
-    throw new ProviderRequestError(
-      name === 'TimeoutError' || name === 'AbortError'
-        ? 'request timed out'
-        : 'request failed'
-    );
-  }
-  if (!response.ok) {
-    try {
-      await response.body?.cancel();
-    } catch {
-      // Body already consumed or unsupported — nothing to release
-    }
-    throw new ProviderRequestError(`HTTP ${response.status}`);
-  }
-  try {
-    return await response.json();
-  } catch {
-    throw new ProviderRequestError('invalid JSON response');
-  }
-}
-
-interface Page {
-  buckets: Array<{ day: string; results: unknown[] }>;
-  hasMore: boolean;
-  nextPage?: string;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function parsePage(
-  body: unknown,
-  bucketDay: (b: Record<string, unknown>) => string | undefined
-): Page {
-  const root = asRecord(body);
-  if (!root || !Array.isArray(root.data)) {
-    throw new ProviderRequestError('unexpected response shape');
-  }
-  const buckets: Page['buckets'] = [];
-  for (const raw of root.data) {
-    const bucket = asRecord(raw);
-    const day = bucket ? bucketDay(bucket) : undefined;
-    if (!bucket || !day || !Array.isArray(bucket.results)) {
-      throw new ProviderRequestError('unexpected response shape');
-    }
-    buckets.push({ day, results: bucket.results });
-  }
-  const nextPage =
-    typeof root.next_page === 'string' && root.next_page.length > 0
-      ? root.next_page
-      : undefined;
-  return { buckets, hasMore: root.has_more === true, nextPage };
-}
-
-/** How one result row folds into a day's running total */
-interface Accumulator<T> {
-  zero: () => T;
-  /** Undefined when the result is unparsable (fails the whole fetch) */
-  add: (total: T, result: Record<string, unknown>) => T | undefined;
-  invalidMessage: string;
-}
 
 function microSum(
   resultMicro: (r: Record<string, unknown>) => number | undefined
@@ -582,123 +422,6 @@ function microSum(
     },
     invalidMessage: 'unparsable cost amount',
   };
-}
-
-async function fetchPaged<T>(
-  options: ProviderFetchOptions,
-  buildUrl: (page?: string) => URL,
-  headers: Record<string, string>,
-  bucketDay: (b: Record<string, unknown>) => string | undefined,
-  accumulator: Accumulator<T>
-): Promise<ProviderDaily<T>> {
-  const byDay = new Map<string, T>();
-  const inWindow = new Set(options.windowDays);
-  let page: string | undefined;
-  try {
-    for (let n = 0; ; n++) {
-      if (n >= options.pageCap) {
-        throw new ProviderRequestError(
-          `page cap (${options.pageCap}) reached; totals incomplete`
-        );
-      }
-      const body = await getJson(
-        buildUrl(page),
-        headers,
-        options.fetchImpl,
-        options.timeoutMs
-      );
-      const parsed = parsePage(body, bucketDay);
-      for (const bucket of parsed.buckets) {
-        if (!inWindow.has(bucket.day)) continue;
-        let total = byDay.get(bucket.day) ?? accumulator.zero();
-        for (const raw of bucket.results) {
-          const result = asRecord(raw);
-          const next = result ? accumulator.add(total, result) : undefined;
-          if (next === undefined) {
-            throw new ProviderRequestError(accumulator.invalidMessage);
-          }
-          total = next;
-        }
-        byDay.set(bucket.day, total);
-      }
-      if (!parsed.hasMore) break;
-      if (!parsed.nextPage) {
-        throw new ProviderRequestError('has_more without next_page');
-      }
-      page = parsed.nextPage;
-    }
-  } catch (error) {
-    const message =
-      error instanceof ProviderRequestError ? error.message : 'request failed';
-    return { byDay, error: redactSecrets(message) };
-  }
-  return { byDay };
-}
-
-function windowBounds(windowDays: readonly string[]): {
-  startMs: number;
-  endMs: number;
-} {
-  return {
-    startMs: dayStartMs(windowDays[0]),
-    endMs: dayStartMs(windowDays[windowDays.length - 1]) + DAY_MS,
-  };
-}
-
-/**
- * Anthropic Admin API daily report (cost_report / usage_report): 1d buckets
- * over the window, grouped by workspace so the scope is always re-checked
- * client-side. `extraParams` adds endpoint-specific query parameters.
- */
-function fetchAnthropicDaily<T>(
-  options: ProviderFetchOptions,
-  endpoint: string,
-  accumulator: Accumulator<T>,
-  extraParams?: (url: URL) => void
-): Promise<ProviderDaily<T>> {
-  const { startMs, endMs } = windowBounds(options.windowDays);
-  const buildUrl = (page?: string): URL => {
-    const url = new URL(endpoint);
-    url.searchParams.set('starting_at', new Date(startMs).toISOString());
-    url.searchParams.set('ending_at', new Date(endMs).toISOString());
-    url.searchParams.set('bucket_width', '1d');
-    url.searchParams.set('limit', String(options.windowDays.length));
-    url.searchParams.append('group_by[]', 'workspace_id');
-    extraParams?.(url);
-    if (page) url.searchParams.set('page', page);
-    return url;
-  };
-  return fetchPaged(
-    options,
-    buildUrl,
-    {
-      'x-api-key': options.adminKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
-    (bucket) => {
-      const ms = parseTime(bucket.starting_at);
-      return ms === undefined ? undefined : utcDay(ms);
-    },
-    accumulator
-  );
-}
-
-/**
- * Whether an Anthropic result belongs to the scope. The default workspace
- * reports `workspace_id: null`. A scoped fetch fails closed on a result with
- * no `workspace_id` key at all: it was not grouped by workspace, so it may be
- * org-wide and cannot be attributed.
- */
-function inAnthropicScope(
-  result: Record<string, unknown>,
-  scopeId: string | undefined
-): boolean {
-  if (scopeId === undefined) return true;
-  if (!('workspace_id' in result)) {
-    throw new ProviderRequestError('result not grouped by workspace');
-  }
-  const workspaceId = result.workspace_id ?? ANTHROPIC_DEFAULT_WORKSPACE;
-  return workspaceId === scopeId;
 }
 
 /**
@@ -724,69 +447,6 @@ export function fetchAnthropicCosts(
         ? centsStringToMicroUsd(result.amount)
         : undefined;
     })
-  );
-}
-
-function tokenCount(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-    ? value
-    : undefined;
-}
-
-/**
- * One `usage_report/messages` result → tokens by class. Uncached input,
- * cache read and output are required; `cache_creation` must be an object
- * whose 5m / 1h tiers (absent = 0) are summed into the cache-write class.
- */
-export function usageResultTokens(
-  result: Record<string, unknown>
-): TokenCounts | undefined {
-  const uncachedInput = tokenCount(result.uncached_input_tokens);
-  const cacheRead = tokenCount(result.cache_read_input_tokens);
-  const output = tokenCount(result.output_tokens);
-  const creation = asRecord(result.cache_creation);
-  if (
-    uncachedInput === undefined ||
-    cacheRead === undefined ||
-    output === undefined ||
-    !creation
-  ) {
-    return undefined;
-  }
-  const tier = (value: unknown): number | undefined =>
-    value === undefined ? 0 : tokenCount(value);
-  const w5m = tier(creation.ephemeral_5m_input_tokens);
-  const w1h = tier(creation.ephemeral_1h_input_tokens);
-  if (w5m === undefined || w1h === undefined) return undefined;
-  return { uncachedInput, cacheRead, cacheWrite: w5m + w1h, output };
-}
-
-/**
- * Anthropic `usage_report/messages`: same buckets, paging and scope rules
- * as the cost report. A real workspace scope is also sent server-side as
- * `workspace_ids[]` (the default workspace has no ID to filter on).
- */
-export function fetchAnthropicUsage(
-  options: ProviderFetchOptions
-): Promise<ProviderTokens> {
-  const { scopeId } = options;
-  return fetchAnthropicDaily(
-    options,
-    ANTHROPIC_USAGE_ENDPOINT,
-    {
-      zero: emptyTokenCounts,
-      add: (total, result) => {
-        if (!inAnthropicScope(result, scopeId)) return total;
-        const tokens = usageResultTokens(result);
-        return tokens ? addTokenCounts(total, tokens) : undefined;
-      },
-      invalidMessage: 'unparsable token count',
-    },
-    (url) => {
-      if (scopeId !== undefined && scopeId !== ANTHROPIC_DEFAULT_WORKSPACE) {
-        url.searchParams.append('workspace_ids[]', scopeId);
-      }
-    }
   );
 }
 
@@ -844,32 +504,6 @@ export function fetchOpenAiCosts(
 }
 
 // ─── Reconciliation ─────────────────────────────────────────────────────
-
-export interface TokenClassComparison {
-  ledger: number;
-  /** null when the usage report was not queried or failed */
-  provider: number | null;
-  /** ledger − provider */
-  drift: number | null;
-  /** drift as % of the provider count; null when provider count is 0/absent */
-  driftPct: number | null;
-  /** Within ±10% or within the token variance band (null when not comparable) */
-  withinTolerance: boolean | null;
-  /** Tokens from estimated-token or midnight-straddling spawns */
-  band: number;
-}
-
-/** Ledger vs Anthropic usage report token counts for one day */
-export interface TokenReconcile {
-  /** Same status rules as the dollar row; `drift` when any class drifts */
-  status: ReconcileStatus;
-  classes: Record<TokenClass, TokenClassComparison>;
-  /** Classes outside tolerance (only when status is ok/drift) */
-  driftClasses: TokenClass[];
-  missingTokenSpawns: number;
-  estimatedTokenSpawns: number;
-  notes: string[];
-}
 
 export interface ReconcileRow {
   provider: ReconcileProvider;
@@ -960,109 +594,6 @@ function resolveScope(
   return value;
 }
 
-function compare(
-  ledger: number,
-  provider: number,
-  band: number
-): Pick<ReconcileRow, 'driftMicroUsd' | 'driftPct' | 'withinTolerance'> {
-  const drift = ledger - provider;
-  const driftPct =
-    provider !== 0 ? Math.round((drift / provider) * 10_000) / 100 : null;
-  const withinPct =
-    provider !== 0
-      ? Math.abs(drift) <= Math.abs(provider) * DRIFT_TOLERANCE
-      : drift === 0;
-  return {
-    driftMicroUsd: drift,
-    driftPct,
-    withinTolerance: withinPct || Math.abs(drift) <= band,
-  };
-}
-
-function tokenReconcile(args: {
-  day: LedgerDay;
-  date: string;
-  adminKey: string | undefined;
-  usage: ProviderTokens | undefined;
-  final: boolean;
-  scope: string | undefined;
-}): TokenReconcile {
-  const { day, date, adminKey, usage, final, scope } = args;
-  const providerTokens =
-    usage && !usage.error
-      ? (usage.byDay.get(date) ?? emptyTokenCounts())
-      : undefined;
-  const classes = {} as Record<TokenClass, TokenClassComparison>;
-  for (const cls of TOKEN_CLASSES) {
-    const ledger = day.tokens[cls];
-    const band = day.tokenBand[cls];
-    if (providerTokens === undefined) {
-      classes[cls] = {
-        ledger,
-        provider: null,
-        drift: null,
-        driftPct: null,
-        withinTolerance: null,
-        band,
-      };
-      continue;
-    }
-    const provider = providerTokens[cls];
-    const c = compare(ledger, provider, band);
-    classes[cls] = {
-      ledger,
-      provider,
-      drift: c.driftMicroUsd,
-      driftPct: c.driftPct,
-      withinTolerance: c.withinTolerance,
-      band,
-    };
-  }
-
-  const notes: string[] = [];
-  let status: ReconcileStatus;
-  let driftClasses: TokenClass[] = [];
-  if (!adminKey) {
-    status = 'non-reconcilable';
-    notes.push(`${ADMIN_KEY_ENV.anthropic} not set`);
-  } else if (usage?.error) {
-    status = 'error';
-    notes.push(usage.error);
-  } else if (!final) {
-    status = 'not-yet-final';
-    notes.push('provider figures not yet final');
-  } else if (!scope) {
-    status = 'non-attributable';
-    notes.push('org-wide provider usage');
-  } else {
-    driftClasses = TOKEN_CLASSES.filter(
-      (cls) => classes[cls].withinTolerance === false
-    );
-    status = driftClasses.length > 0 ? 'drift' : 'ok';
-  }
-  if (providerTokens !== undefined && !usage?.byDay.has(date)) {
-    notes.push('usage report returned no bucket for this day (counted as 0)');
-  }
-  if (day.missingTokenSpawns > 0) {
-    notes.push(
-      `${day.missingTokenSpawns} billed spawn(s) with no recorded tokens`
-    );
-  }
-  if (day.estimatedTokenSpawns > 0) {
-    notes.push(
-      `${day.estimatedTokenSpawns} billed spawn(s) with estimated tokens`
-    );
-  }
-  return {
-    status,
-    classes,
-    driftClasses,
-    missingTokenSpawns: day.missingTokenSpawns,
-    estimatedTokenSpawns: day.estimatedTokenSpawns,
-    notes: notes.map(redactSecrets),
-  };
-}
-
 /**
  * Reconcile ledger billed spend against provider cost reports for closed
  * UTC days. Never throws for provider failures or missing keys — those
@@ -1150,10 +681,15 @@ export async function reconcileUsage(
       const notes: string[] = [];
       const providerMicro =
         costs && !costs.error ? (costs.byDay.get(date) ?? 0) : null;
-      const comparison =
+      const cmp =
         providerMicro !== null
           ? compare(day.billedMicroUsd, providerMicro, day.band.totalMicroUsd)
-          : { driftMicroUsd: null, driftPct: null, withinTolerance: null };
+          : undefined;
+      const comparison = {
+        driftMicroUsd: cmp?.drift ?? null,
+        driftPct: cmp?.driftPct ?? null,
+        withinTolerance: cmp?.withinTolerance ?? null,
+      };
 
       let status: ReconcileStatus;
       if (!adminKey) {
@@ -1234,113 +770,6 @@ export async function reconcileUsage(
 
 function usd(micro: number | null): string {
   return micro === null ? '-' : formatMicroUsd(micro, { signed: true });
-}
-
-function statusCell(status: ReconcileStatus): string {
-  switch (status) {
-    case 'ok':
-      return chalk.green(status);
-    case 'drift':
-    case 'error':
-      return chalk.red(status);
-    default:
-      return chalk.yellow(status);
-  }
-}
-
-const TOKEN_CLASS_LABELS: Record<TokenClass, string> = {
-  uncachedInput: 'input (uncached)',
-  cacheRead: 'cache read',
-  cacheWrite: 'cache write',
-  output: 'output',
-};
-
-function count(value: number | null, signed = false): string {
-  if (value === null) return '-';
-  const text = Math.abs(value).toLocaleString('en-US');
-  if (value < 0) return `-${text}`;
-  return signed && value > 0 ? `+${text}` : text;
-}
-
-/** First `leftCols` columns left-aligned, the rest right; status colored */
-function renderTable(
-  headers: string[],
-  rows: string[][],
-  leftCols: number
-): string[] {
-  const widths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((row) => row[i].length))
-  );
-  const line = (cells: string[], colorStatus = false): string =>
-    '  ' +
-    cells
-      .map((c, i) => {
-        const padded =
-          i < leftCols ? c.padEnd(widths[i]) : c.padStart(widths[i]);
-        return colorStatus && i === cells.length - 1
-          ? statusCell(c as ReconcileStatus) + ' '.repeat(widths[i] - c.length)
-          : padded;
-      })
-      .join('  ');
-  return [
-    chalk.bold(line(headers)),
-    `  ${'─'.repeat(widths.reduce((a, w) => a + w, 0) + 2 * (widths.length - 1))}`,
-    ...rows.map((row) => line(row, true)),
-  ];
-}
-
-/** Anthropic token cross-check table + notes (empty when no token rows) */
-function formatTokenSection(report: ReconcileReport): string[] {
-  const tokenRows = report.rows.filter(
-    (r): r is ReconcileRow & { tokens: TokenReconcile } => r.tokens !== null
-  );
-  if (tokenRows.length === 0) return [];
-  const rows: string[][] = [];
-  for (const r of tokenRows) {
-    const comparable = r.tokens.status === 'ok' || r.tokens.status === 'drift';
-    for (const cls of TOKEN_CLASSES) {
-      const c = r.tokens.classes[cls];
-      rows.push([
-        r.date,
-        TOKEN_CLASS_LABELS[cls],
-        count(c.ledger),
-        count(c.provider),
-        count(c.drift, true),
-        c.driftPct === null ? '-' : `${c.driftPct.toFixed(2)}%`,
-        count(c.band),
-        comparable ? (c.withinTolerance ? 'ok' : 'drift') : r.tokens.status,
-      ]);
-    }
-  }
-  const out = [
-    '',
-    chalk.bold(
-      'Anthropic token cross-check (usage report, billed spawns only)'
-    ),
-    '',
-    ...renderTable(
-      [
-        'Day',
-        'Class',
-        'Ledger',
-        'Provider',
-        'Drift',
-        'Drift %',
-        'Band',
-        'Status',
-      ],
-      rows,
-      2
-    ),
-  ];
-  const noted = tokenRows.filter((r) => r.tokens.notes.length > 0);
-  if (noted.length > 0) {
-    out.push('', chalk.bold('Token notes'));
-    for (const r of noted) {
-      out.push(`  ${r.provider} ${r.date}: ${r.tokens.notes.join('; ')}`);
-    }
-  }
-  return out;
 }
 
 /** Human-readable table for `airunx costs reconcile` */

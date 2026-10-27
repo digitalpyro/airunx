@@ -942,6 +942,36 @@ describe('usageResultTokens', () => {
       })
     ).toBeUndefined();
   });
+
+  it('counts null cache tiers as 0 instead of failing', () => {
+    const base = {
+      uncached_input_tokens: 10,
+      cache_read_input_tokens: 20,
+      cache_creation: {
+        ephemeral_5m_input_tokens: 3,
+        ephemeral_1h_input_tokens: 4,
+      },
+      output_tokens: 5,
+    };
+    expect(usageResultTokens({ ...base, cache_creation: null })).toEqual({
+      uncachedInput: 10,
+      cacheRead: 20,
+      cacheWrite: 0,
+      output: 5,
+    });
+    expect(
+      usageResultTokens({
+        ...base,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 3,
+          ephemeral_1h_input_tokens: null,
+        },
+      })?.cacheWrite
+    ).toBe(3);
+    expect(
+      usageResultTokens({ ...base, cache_read_input_tokens: null })?.cacheRead
+    ).toBe(0);
+  });
 });
 
 describe('token cross-check', () => {
