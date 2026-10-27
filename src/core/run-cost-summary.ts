@@ -153,6 +153,13 @@ function eventTokens(
   return tokens;
 }
 
+/** One `llm_spawn` event's normalized tokens; undefined when none recorded */
+export function spawnEventTokens(
+  event: AuditEvent
+): NormalizedTokenUsage | undefined {
+  return eventTokens(event.details ?? {});
+}
+
 /** One `llm_spawn` event as a one-spawn CostSummary */
 export function spawnEventCostSummary(event: AuditEvent): CostSummary {
   const d = event.details ?? {};
