@@ -14,7 +14,12 @@ import type {
 } from '../../src/core/adapter-types.js';
 import type { CostSummary, FidelityParameters } from '../../src/core/types.js';
 import type { AdapterFactory } from '../../src/adapters/adapter-factory.js';
-import type { ProviderRouter } from '../../src/orchestrator/provider-router.js';
+import {
+  ProviderRouter,
+  createProviderRouter,
+} from '../../src/orchestrator/provider-router.js';
+import type { SystemConfig } from '../../src/core/adapter-types.js';
+import type { ParsedAgentDef } from '../../src/utils/agents-schema.js';
 import { spawnCostSummary } from '../../src/core/cost-accounting.js';
 import { ConfigurationError, TimeoutError } from '../../src/utils/errors.js';
 import {
@@ -876,6 +881,7 @@ describe('Agent Invoker attempt events (U4)', () => {
       setProviderAvailability: vi.fn(() => {
         unavailable = true;
       }),
+      getBackendOverride: vi.fn(() => undefined),
     };
     const adapterFactory = {
       getAdapter: vi.fn(async (backend: string) => adapters[backend]),
@@ -1022,5 +1028,152 @@ describe('Agent Invoker attempt events (U4)', () => {
       expect(result.success).toBe(false);
       expect(attempts.map((a) => a.outcome)).toEqual(['failure']);
     });
+  });
+});
+
+describe('Agent Invoker --backend override (issue #20)', () => {
+  const fidelity: FidelityParameters = {
+    temperature: 0.2,
+    maxTokens: 4096,
+    retryCount: 1,
+    useCaching: true,
+    enableVerification: true,
+    reviewIterations: 2,
+  };
+
+  const systemConfig: SystemConfig = {
+    agent_routing: { developer: 'claude-code' },
+    backends: {
+      'claude-code': { type: 'cli', executable: 'claude', timeout: 300 },
+      codex: { type: 'cli', executable: 'codex', timeout: 300 },
+    },
+    fallback_backend: 'claude-code',
+  } as unknown as SystemConfig;
+
+  const ok: ExecutionResult = {
+    success: true,
+    outputs: {},
+    metrics: { tokensUsed: 1, duration: 1 },
+    errors: [],
+  };
+
+  const developerDef = (model?: string): ParsedAgentDef => ({
+    role: 'developer',
+    purpose: 'Implement features',
+    responsibilities: ['write code'],
+    tools: ['Edit'],
+    output: 'code',
+    provider: 'claude-code',
+    ...(model ? { model } : {}),
+  });
+
+  const setup = (model?: string, backendOverride?: 'codex') => {
+    const adapters: Record<string, ExecutionAdapter> = {
+      'claude-code': {
+        execute: vi.fn().mockResolvedValue(ok),
+        name: 'claude-code',
+      } as unknown as ExecutionAdapter,
+      codex: {
+        execute: vi.fn().mockResolvedValue(ok),
+        name: 'codex',
+      } as unknown as ExecutionAdapter,
+    };
+    const adapterFactory = {
+      getAdapter: vi.fn(async (backend: string) => adapters[backend]),
+    };
+    const providerRouter = createProviderRouter(
+      [{ role: 'developer', provider: 'claude-code' }],
+      systemConfig,
+      undefined,
+      { backendOverride }
+    );
+    const invoker = new AgentInvoker({
+      adapterFactory: adapterFactory as unknown as AdapterFactory,
+      providerRouter,
+      fidelityParams: fidelity,
+    });
+    invoker.setLoadedAgents(new Map([['developer', developerDef(model)]]));
+    return { adapters, adapterFactory, invoker };
+  };
+
+  const run = (invoker: AgentInvoker) =>
+    invoker.execute({
+      role: 'developer',
+      task: 'Implement',
+      projectContext: { workingDirectory: '/test' },
+    });
+
+  it('spawns codex for an AGENTS.md claude-code agent when --backend codex is set', async () => {
+    const { adapters, adapterFactory, invoker } = setup(undefined, 'codex');
+
+    const result = await run(invoker);
+
+    expect(result.success).toBe(true);
+    expect(result.metrics.provider).toBe('codex');
+    expect(adapterFactory.getAdapter).toHaveBeenCalledWith('codex');
+    expect(adapterFactory.getAdapter).not.toHaveBeenCalledWith('claude-code');
+    expect(adapters.codex.execute).toHaveBeenCalledTimes(1);
+    expect(adapters['claude-code'].execute).not.toHaveBeenCalled();
+  });
+
+  it('does not pass the agent Claude model to codex', async () => {
+    const { adapters, invoker } = setup('opus', 'codex');
+
+    await run(invoker);
+
+    const call = vi.mocked(adapters.codex.execute).mock.calls[0][0];
+    expect(call.agent.preferredModel).toBeUndefined();
+  });
+
+  it('keeps the agent model when the override matches its family', async () => {
+    const { adapters, invoker } = setup('gpt-6.1-sol', 'codex');
+
+    await run(invoker);
+
+    const call = vi.mocked(adapters.codex.execute).mock.calls[0][0];
+    expect(call.agent.preferredModel).toBe('gpt-6.1-sol');
+  });
+
+  it('keeps AGENTS.md provider and model without an override', async () => {
+    const { adapters, invoker } = setup('opus');
+
+    const result = await run(invoker);
+
+    expect(result.metrics.provider).toBe('claude-code');
+    const call = vi.mocked(adapters['claude-code'].execute).mock.calls[0][0];
+    expect(call.agent.preferredModel).toBe('opus');
+    expect(adapters.codex.execute).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back to the AGENTS.md provider on a codex auth error', async () => {
+    const { adapters, invoker } = setup(undefined, 'codex');
+    vi.mocked(adapters.codex.execute).mockResolvedValue({
+      success: false,
+      outputs: {},
+      metrics: { tokensUsed: 0, duration: 1 },
+      errors: [new ConfigurationError('codex not logged in', 'authentication')],
+    });
+
+    const result = await run(invoker);
+
+    expect(adapters['claude-code'].execute).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.metrics.provider).toBe('codex');
+    expect(result.errors[0].message).toContain('codex not logged in');
+  });
+
+  it('fails clearly when the override backend cannot be initialized', async () => {
+    const { adapterFactory, invoker } = setup(undefined, 'codex');
+    adapterFactory.getAdapter.mockImplementation(async (backend: string) => {
+      if (backend === 'codex') {
+        throw new ConfigurationError('codex CLI missing', 'executable');
+      }
+      throw new Error(`unexpected backend ${backend}`);
+    });
+
+    await expect(run(invoker)).rejects.toThrow(
+      /Backend override 'codex' \(--backend\) is unavailable.*codex CLI missing/
+    );
+    expect(adapterFactory.getAdapter).not.toHaveBeenCalledWith('claude-code');
   });
 });
