@@ -20,7 +20,7 @@ describe('ProviderRouter', () => {
   const createDefaultSystemConfig = (): SystemConfig => ({
     agent_routing: {
       orchestrator: 'claude-code',
-      'developer': 'cursor',
+      developer: 'cursor',
       'code-reviewer': 'codex',
       'test-creator': 'codex',
       'code-judge': 'claude-code',
@@ -210,11 +210,7 @@ describe('ProviderRouter', () => {
       const systemConfig = createDefaultSystemConfig();
       const router = new ProviderRouter(agentsConfig, systemConfig);
 
-      const roles: AgentRole[] = [
-        'orchestrator',
-        'developer',
-        'code-reviewer',
-      ];
+      const roles: AgentRole[] = ['orchestrator', 'developer', 'code-reviewer'];
       const selections = router.selectProvidersForPipeline(roles);
 
       expect(selections.get('orchestrator')?.provider).toBe('claude-code');
@@ -380,6 +376,114 @@ describe('ProviderRouter', () => {
       // Reviewer unaffected
       expect(reviewerResult.provider).toBe('codex');
       expect(reviewerResult.usedFallback).toBe(false);
+    });
+  });
+
+  describe('CLI backend override', () => {
+    const overrideRouter = (
+      agentsConfig: AgentProviderConfig[],
+      backendOverride?: BackendType
+    ) =>
+      createProviderRouter(
+        agentsConfig,
+        createDefaultSystemConfig(),
+        undefined,
+        { backendOverride }
+      );
+
+    it('beats the AGENTS.md provider', () => {
+      const router = overrideRouter(
+        [{ role: 'developer', provider: 'claude-code' }],
+        'codex'
+      );
+
+      const result = router.selectProvider('developer');
+
+      expect(result).toEqual({
+        provider: 'codex',
+        source: 'cli-override',
+        usedFallback: false,
+        originalProvider: 'claude-code',
+      });
+      expect(router.getBackendOverride()).toBe('codex');
+    });
+
+    it('beats config.yml agent_routing', () => {
+      const router = overrideRouter([], 'codex');
+
+      const result = router.selectProvider('orchestrator');
+
+      expect(result.provider).toBe('codex');
+      expect(result.source).toBe('cli-override');
+      expect(result.originalProvider).toBe('claude-code');
+    });
+
+    it('beats fallback_backend for roles without routing', () => {
+      const systemConfig = createDefaultSystemConfig();
+      delete (
+        systemConfig.agent_routing as Partial<Record<AgentRole, BackendType>>
+      )['docs-generator'];
+      const router = createProviderRouter([], systemConfig, undefined, {
+        backendOverride: 'cursor',
+      });
+
+      const result = router.selectProvider('docs-generator');
+
+      expect(result.provider).toBe('cursor');
+      expect(result.source).toBe('cli-override');
+      expect(result.usedFallback).toBe(false);
+    });
+
+    it('omits originalProvider when nothing was replaced', () => {
+      const router = overrideRouter(
+        [{ role: 'code-reviewer', provider: 'codex' }],
+        'codex'
+      );
+
+      expect(router.selectProvider('code-reviewer').originalProvider).toBe(
+        undefined
+      );
+    });
+
+    it('throws instead of falling back when the override is unavailable', () => {
+      const router = overrideRouter(
+        [
+          {
+            role: 'developer',
+            provider: 'claude-code',
+            fallbackProvider: 'cursor',
+          },
+        ],
+        'codex'
+      );
+      router.setProviderAvailability('codex', false, 'not logged in');
+
+      expect(() => router.selectProvider('developer')).toThrow(
+        /Backend override 'codex' \(--backend\) is unavailable for role 'developer': not logged in/
+      );
+    });
+
+    it('shows cli-override in the provider summary', () => {
+      const router = overrideRouter(
+        [{ role: 'developer', provider: 'claude-code' }],
+        'codex'
+      );
+
+      expect(router.getProviderSummary(['developer'])).toContain(
+        'developer: codex [cli-override]'
+      );
+    });
+
+    it('leaves routing unchanged without an override', () => {
+      const router = overrideRouter([
+        { role: 'developer', provider: 'claude-code' },
+      ]);
+
+      expect(router.getBackendOverride()).toBeUndefined();
+      expect(router.selectProvider('developer').source).toBe('agents-md');
+      expect(router.selectProvider('orchestrator').source).toBe(
+        'config-routing'
+      );
     });
   });
 });

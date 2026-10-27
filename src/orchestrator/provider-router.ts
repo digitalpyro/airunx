@@ -2,7 +2,8 @@
  * Provider Router - Intelligent per-role provider selection
  *
  * Implements the provider routing priority:
- * 1. AGENTS.md provider field (highest priority)
+ * 0. Explicit CLI backend override (`--backend`), applies to every agent
+ * 1. AGENTS.md provider field
  * 2. config.yml agent_routing
  * 3. config.yml fallback_backend (lowest priority)
  *
@@ -38,9 +39,21 @@ export interface ProviderAvailability {
  */
 export interface ProviderSelectionResult {
   provider: BackendType;
-  source: 'agents-md' | 'config-routing' | 'fallback-backend';
+  source: 'cli-override' | 'agents-md' | 'config-routing' | 'fallback-backend';
   usedFallback: boolean;
   originalProvider?: BackendType;
+}
+
+/**
+ * Optional ProviderRouter behaviour
+ */
+export interface ProviderRouterOptions {
+  /**
+   * Explicit backend requested on the command line (`--backend`). Wins over
+   * AGENTS.md provider, config.yml agent_routing and fallback_backend for
+   * every role, and never falls back to another provider when unavailable.
+   */
+  backendOverride?: BackendType;
 }
 
 /**
@@ -55,11 +68,14 @@ export class ProviderRouter {
   private agentsConfig: Map<AgentRole, AgentProviderConfig>;
   private systemConfig: SystemConfig;
   private providerAvailability: Map<BackendType, boolean>;
+  private unavailableReasons = new Map<BackendType, string>();
+  private backendOverride: BackendType | undefined;
 
   constructor(
     agentsConfig: AgentProviderConfig[],
     systemConfig: SystemConfig,
-    providerAvailability?: Map<BackendType, boolean>
+    providerAvailability?: Map<BackendType, boolean>,
+    options: ProviderRouterOptions = {}
   ) {
     // Convert array to map for O(1) lookup
     this.agentsConfig = new Map(
@@ -68,6 +84,13 @@ export class ProviderRouter {
     this.systemConfig = systemConfig;
     // Default all providers to available if not specified
     this.providerAvailability = providerAvailability || new Map();
+    this.backendOverride = options.backendOverride;
+
+    if (this.backendOverride) {
+      logger.debug(
+        `ProviderRouter initialized with CLI backend override: ${this.backendOverride}`
+      );
+    }
 
     // Debug: Log AGENTS.md provider configs loaded into router
     const configsWithProvider = agentsConfig.filter((c) => c.provider);
@@ -96,9 +119,19 @@ export class ProviderRouter {
     reason?: string
   ): void {
     this.providerAvailability.set(provider, available);
-    if (!available) {
+    if (available) {
+      this.unavailableReasons.delete(provider);
+    } else {
+      if (reason) this.unavailableReasons.set(provider, reason);
       logger.warn(`Provider '${provider}' marked as unavailable: ${reason}`);
     }
+  }
+
+  /**
+   * The explicit CLI backend override, if one was given
+   */
+  getBackendOverride(): BackendType | undefined {
+    return this.backendOverride;
   }
 
   /**
@@ -113,6 +146,7 @@ export class ProviderRouter {
    * Select the best provider for an agent role
    *
    * Priority order:
+   * 0. CLI backend override (no fallback: throws when unavailable)
    * 1. AGENTS.md provider field (if available)
    * 2. AGENTS.md fallback-provider (if primary unavailable)
    * 3. config.yml agent_routing
@@ -121,8 +155,35 @@ export class ProviderRouter {
   selectProvider(role: AgentRole): ProviderSelectionResult {
     logger.debug(`Selecting provider for role: ${role}`);
 
-    // 1. Check AGENTS.md specification for this role
     const agentConfig = this.agentsConfig.get(role);
+
+    // 0. Explicit CLI override wins for every role. The user asked for this
+    // backend, so an unavailable override fails instead of silently routing
+    // to the AGENTS.md / config.yml provider.
+    if (this.backendOverride) {
+      const override = this.backendOverride;
+      if (!this.isProviderAvailable(override)) {
+        const reason = this.unavailableReasons.get(override);
+        throw new Error(
+          `Backend override '${override}' (--backend) is unavailable for role '${role}'` +
+            `${reason ? `: ${reason}` : ''}. ` +
+            `Not falling back to another provider because the backend was set explicitly.`
+        );
+      }
+      const replaced =
+        agentConfig?.provider ?? this.systemConfig.agent_routing[role];
+      logger.info(`Using CLI backend override for ${role}: ${override}`);
+      return {
+        provider: override,
+        source: 'cli-override',
+        usedFallback: false,
+        ...(replaced && replaced !== override
+          ? { originalProvider: replaced }
+          : {}),
+      };
+    }
+
+    // 1. Check AGENTS.md specification for this role
     if (agentConfig?.provider) {
       logger.debug(
         `Found AGENTS.md provider for ${role}: ${agentConfig.provider}`
@@ -306,7 +367,13 @@ export class ProviderRouter {
 export function createProviderRouter(
   agentsConfig: AgentProviderConfig[],
   systemConfig: SystemConfig,
-  providerAvailability?: Map<BackendType, boolean>
+  providerAvailability?: Map<BackendType, boolean>,
+  options?: ProviderRouterOptions
 ): ProviderRouter {
-  return new ProviderRouter(agentsConfig, systemConfig, providerAvailability);
+  return new ProviderRouter(
+    agentsConfig,
+    systemConfig,
+    providerAvailability,
+    options
+  );
 }
