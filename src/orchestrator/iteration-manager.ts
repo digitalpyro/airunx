@@ -6,6 +6,7 @@
 import type { JudgeResult } from './judge-agent.js';
 import { StateManager } from './state-manager.js';
 import { createLogger } from '../utils/logger.js';
+import { iterationsRun } from '../utils/iterations.js';
 
 const logger = createLogger('iteration-manager');
 
@@ -164,7 +165,7 @@ export class IterationManager {
     if (iterationCount === 0) {
       summary += '✓ Implementation completed on first attempt\n';
     } else {
-      summary += `Iterations: ${iterationCount}/${maxIterations}\n\n`;
+      summary += `Iterations: ${iterationsRun(context)}/${maxIterations}\n\n`;
       summary += 'The implementation went through multiple refinement cycles ';
       summary += 'to meet all acceptance criteria and quality standards.\n';
     }

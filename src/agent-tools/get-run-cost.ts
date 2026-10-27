@@ -23,9 +23,11 @@ const GetRunCostParamsSchema = z.object({
   workflowId: z.string().optional(),
 });
 
-export type GetRunCostResult =
-  | { success: true; found: true; summary: RunCostSummary }
-  | { success: false; found: false; workflowId: string; error: string };
+export type GetRunCostResult = {
+  success: true;
+  found: true;
+  summary: RunCostSummary;
+};
 
 export interface GetRunCostOptions {
   /** Override for tests; defaults to `.airunx-state/reports` */
@@ -37,16 +39,17 @@ export const getRunCostTool = {
   description:
     'Get the cost summary for a run: billed and API-equivalent totals, ' +
     'provenance mix, per-stage spend and top cost drivers (all money in ' +
-    'integer micro-USD). Defaults to the current workflow. Use this to ' +
-    'reason about spend mid-run. Returns aggregate numbers only.',
+    'integer micro-USD) for the current workflow. While the run is in ' +
+    'progress the totals are partial: they cover only spawns recorded so ' +
+    'far. Returns aggregate numbers only.',
   parameters: {
     type: 'object' as const,
     properties: {
       workflowId: {
         type: 'string',
         description:
-          'Run to summarize (default: the current workflow). ' +
-          "1-64 characters of A-Z, a-z, 0-9, '_' or '-'.",
+          'Optional; must equal the current workflow ID. Like ' +
+          'query_audit, this tool cannot read other runs.',
       },
     },
     required: [] as string[],
@@ -54,8 +57,8 @@ export const getRunCostTool = {
 
   /**
    * Execute the get_run_cost tool.
-   * Throws on an invalid workflow ID; reports `found: false` for an unknown
-   * run. The current workflow always yields a summary (possibly empty).
+   * Throws on an invalid workflow ID or one that is not the current
+   * workflow. The current workflow always yields a summary (possibly empty).
    */
   execute: async (
     rawParams: unknown,
@@ -66,6 +69,12 @@ export const getRunCostTool = {
     const workflowId = params.workflowId ?? context.workflowId;
     // Validate before any file access: rejects traversal such as `../etc`
     assertValidWorkflowId(workflowId);
+    // Same isolation rule as query_audit: an agent sees only its own run
+    if (workflowId !== context.workflowId) {
+      throw new Error(
+        `get_run_cost is limited to the current workflow (${context.workflowId})`
+      );
+    }
 
     const report = loadRunReport(
       workflowId,
@@ -75,15 +84,6 @@ export const getRunCostTool = {
     const { events, skipped } = auditAvailable
       ? await context.auditLogger.queryWithStats({ workflowId })
       : { events: [], skipped: 0 };
-
-    if (!report && events.length === 0 && workflowId !== context.workflowId) {
-      return {
-        success: false,
-        found: false,
-        workflowId,
-        error: `No run report or ledger events for ${workflowId}`,
-      };
-    }
 
     return {
       success: true,

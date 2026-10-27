@@ -108,13 +108,14 @@ describe('AdapterFactory Class', () => {
 
     it('should normalize backend mcp_config to an mcpConfig array', async () => {
       const systemConfig = createMockSystemConfig();
-      systemConfig.backends['claude-code']!.mcp_config = '.airunx/mcp.json';
+      systemConfig.backends['claude-code']!.mcp_config =
+        '/abs/.airunx/mcp.json';
       const factory = new AdapterFactory(systemConfig);
 
       const adapter = await factory.getAdapter('claude-code');
 
       expect(adapter.init).toHaveBeenCalledWith(
-        expect.objectContaining({ mcpConfig: ['.airunx/mcp.json'] })
+        expect.objectContaining({ mcpConfig: ['/abs/.airunx/mcp.json'] })
       );
     });
 

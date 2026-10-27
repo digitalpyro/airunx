@@ -101,29 +101,21 @@ describe('get_run_cost tool', () => {
     ]);
   });
 
-  it('accepts an explicit workflowId', async () => {
-    writeLedger([spawnLine('plan', 1_000_000, 'wf-other')]);
-    const result = await getRunCostTool.execute(
-      { workflowId: 'wf-other' },
-      context,
-      { reportsDir }
-    );
-    if (!result.found) throw new Error('expected a summary');
+  it('accepts the current workflowId passed explicitly', async () => {
+    writeLedger([spawnLine('plan', 1_000_000)]);
+    const result = await getRunCostTool.execute({ workflowId: WF }, context, {
+      reportsDir,
+    });
     expect(result.summary.totals.totalMicroUsd).toBe(1_000_000);
   });
 
-  it('reports found: false for an unknown workflow id', async () => {
-    writeLedger([spawnLine('plan', 1_000_000)]);
-    const result = await getRunCostTool.execute(
-      { workflowId: 'wf-missing' },
-      context,
-      { reportsDir }
-    );
-    expect(result).toMatchObject({
-      success: false,
-      found: false,
-      workflowId: 'wf-missing',
-    });
+  it('refuses to read another workflow, like query_audit', async () => {
+    writeLedger([spawnLine('plan', 1_000_000, 'wf-other')]);
+    await expect(
+      getRunCostTool.execute({ workflowId: 'wf-other' }, context, {
+        reportsDir,
+      })
+    ).rejects.toThrow(/limited to the current workflow/);
   });
 
   it('rejects a path-traversal workflow id before any file access', async () => {

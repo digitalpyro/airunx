@@ -3,6 +3,7 @@
  * Supports multiple execution backends: Claude Code CLI, Cursor CLI, SDK-based
  */
 
+import { isAbsolute } from 'path';
 import { z } from 'zod';
 import type {
   AgentRole,
@@ -47,6 +48,20 @@ export type AdapterType = 'cli' | 'sdk';
  * Zod schemas for runtime validation
  * Types are inferred from these schemas to ensure sync between validation and types
  */
+/**
+ * One --mcp-config entry: an absolute file path or an inline JSON object.
+ * Anything else (notably a value starting with '-') is rejected so config
+ * cannot inject extra CLI flags into the spawn's argv.
+ */
+const McpConfigEntrySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((s) => s.startsWith('{') || isAbsolute(s), {
+    message:
+      'mcp_config entries must be absolute file paths or inline JSON objects',
+  });
+
 export const BackendConfigSchema = z.object({
   type: z.enum(['cli', 'sdk']),
   executable: z.string().optional(),
@@ -62,9 +77,12 @@ export const BackendConfigSchema = z.object({
   /**
    * claude-code only: MCP server config(s) passed via --mcp-config (file
    * paths or JSON strings). Spawns always run with --strict-mcp-config, so
-   * these are the ONLY MCP servers a spawn sees.
+   * these are the ONLY MCP servers a spawn sees. Paths must be absolute:
+   * spawns run in a worktree, so a relative path would not resolve.
    */
-  mcp_config: z.union([z.string(), z.array(z.string())]).optional(),
+  mcp_config: z
+    .union([McpConfigEntrySchema, z.array(McpConfigEntrySchema)])
+    .optional(),
 });
 
 /**
