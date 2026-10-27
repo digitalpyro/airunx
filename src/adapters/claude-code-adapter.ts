@@ -132,11 +132,22 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
     // Claude CLI v2.1+ requires this for headless API key execution.
     const bareFlag = !this.useSubscriptionAuth ? ['--bare'] : [];
 
+    // Headless spawns must see only the MCP servers AIRunX intends. Without
+    // --strict-mcp-config the CLI loads the user's claude.ai connectors and
+    // ~/.claude.json / .mcp.json servers into every spawn (issue #20).
+    const mcpFlags = [
+      '--strict-mcp-config',
+      ...(this.config?.mcpConfig?.length
+        ? ['--mcp-config', ...this.config.mcpConfig]
+        : []),
+    ];
+
     const args = [
       '-p', // Print mode (non-interactive)
       '--output-format',
       'json',
       ...bareFlag,
+      ...mcpFlags,
       ...approvalFlags,
       ...disallowedToolsFlags,
       ...toolsFlags,
@@ -327,10 +338,14 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
     // the CLI handles auth internally via its OAuth token, and injecting an
     // API key would cause the CLI to use it instead of the subscription.
     // Setting it to `undefined` causes Node's spawn to omit it entirely.
+    // ENABLE_CLAUDEAI_MCP_SERVERS=false is belt-and-braces alongside
+    // --strict-mcp-config: never load the user's claude.ai connectors.
+    const mcpEnv = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
     if (this.useSubscriptionAuth) {
-      return { ANTHROPIC_API_KEY: undefined };
+      return { ...mcpEnv, ANTHROPIC_API_KEY: undefined };
     }
     return {
+      ...mcpEnv,
       ANTHROPIC_API_KEY:
         this.config?.apiKey || process.env.ANTHROPIC_API_KEY || '',
     };

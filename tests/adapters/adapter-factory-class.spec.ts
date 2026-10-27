@@ -40,7 +40,7 @@ describe('AdapterFactory Class', () => {
   const createMockSystemConfig = (): SystemConfig => ({
     agent_routing: {
       orchestrator: 'claude-code',
-      'developer': 'cursor',
+      developer: 'cursor',
       'code-reviewer': 'codex',
       'test-creator': 'codex',
       'code-judge': 'claude-code',
@@ -103,6 +103,18 @@ describe('AdapterFactory Class', () => {
           executable: 'claude',
           timeout: 300,
         })
+      );
+    });
+
+    it('should normalize backend mcp_config to an mcpConfig array', async () => {
+      const systemConfig = createMockSystemConfig();
+      systemConfig.backends['claude-code']!.mcp_config = '.airunx/mcp.json';
+      const factory = new AdapterFactory(systemConfig);
+
+      const adapter = await factory.getAdapter('claude-code');
+
+      expect(adapter.init).toHaveBeenCalledWith(
+        expect.objectContaining({ mcpConfig: ['.airunx/mcp.json'] })
       );
     });
 
@@ -252,7 +264,7 @@ describe('selectAdapterForRole with provider fallback', () => {
   const createMockSystemConfig = (): SystemConfig => ({
     agent_routing: {
       orchestrator: 'claude-code',
-      'developer': 'cursor',
+      developer: 'cursor',
       'code-reviewer': 'codex',
       'test-creator': 'codex',
       'code-judge': 'claude-code',
