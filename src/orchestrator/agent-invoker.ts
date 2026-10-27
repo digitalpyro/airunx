@@ -24,7 +24,11 @@ import type {
 } from '../core/types.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
-import { loadAgentsDefs, type ParsedAgentDef } from '../utils/agents-schema.js';
+import {
+  isModelCompatibleWithProvider,
+  loadAgentsDefs,
+  type ParsedAgentDef,
+} from '../utils/agents-schema.js';
 import { FIDELITY_CLI_TIMEOUT } from '../adapters/constants.js';
 import { loadSettings } from '../utils/settings.js';
 import { existsSync } from 'fs';
@@ -344,6 +348,16 @@ export class AgentInvoker {
     // Returns true if fallback was successful and caller should continue loop
     const tryFallbackOnConfigError = async (error: Error): Promise<boolean> => {
       if (triedFallback || !this.providerRouter) {
+        return false;
+      }
+
+      // An explicit --backend is never swapped for another provider
+      const override = this.providerRouter.getBackendOverride();
+      if (override) {
+        logger.error(
+          `Backend override '${override}' has a configuration/auth error for ${context.role}; ` +
+            `not falling back because --backend was set explicitly: ${error.message}`
+        );
         return false;
       }
 
@@ -738,7 +752,7 @@ export class AgentInvoker {
         capabilities: loadedDef.tools,
         contextRequired: loadedDef.responsibilities,
         systemPrompt: systemPrompt || this.buildPromptFromParsedDef(loadedDef),
-        preferredModel: loadedDef.model,
+        preferredModel: this.resolvePreferredModel(loadedDef),
         provider: loadedDef.provider,
         fallbackProvider: loadedDef.fallbackProvider,
         providerConfig: loadedDef.providerConfig,
@@ -761,6 +775,30 @@ export class AgentInvoker {
       contextRequired: defaultConfig.contextRequired,
       systemPrompt: systemPrompt || defaultConfig.defaultPrompt,
     };
+  }
+
+  /**
+   * The AGENTS.md model for an agent, unless a CLI backend override routes
+   * the agent to a provider that model does not belong to (e.g. a Claude
+   * model on a claude-code agent run with `--backend codex`). The override
+   * backend then uses its own configured/default model.
+   */
+  private resolvePreferredModel(def: ParsedAgentDef): string | undefined {
+    const override = this.providerRouter?.getBackendOverride();
+    if (!def.model || !override) return def.model;
+
+    // Registry knows the model's family: trust it. Otherwise fall back to
+    // comparing the agent's declared provider with the override.
+    const compatible =
+      isModelCompatibleWithProvider(def.model, override) ??
+      (def.provider === undefined || def.provider === override);
+    if (compatible) return def.model;
+
+    logger.info(
+      `Ignoring AGENTS.md model '${def.model}' for ${def.role}: ` +
+        `it targets ${def.provider ?? 'another provider'}, but --backend ${override} overrides the provider`
+    );
+    return undefined;
   }
 
   /**

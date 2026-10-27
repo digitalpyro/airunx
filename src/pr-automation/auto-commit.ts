@@ -12,6 +12,7 @@ import type { WorkflowContext } from '../core/types.js';
 import { createLogger } from '../utils/logger.js';
 import { toError } from '../utils/error-handlers.js';
 import { formatDuration } from '../utils/formatting.js';
+import { iterationsRun } from '../utils/iterations.js';
 import { PR_AUTOMATION_DEFAULTS } from './constants.js';
 import { generateConventionalTitle } from './title-utils.js';
 import { GIT_OPERATION_TIMEOUT } from '../tools/git-worktree.js';
@@ -233,7 +234,7 @@ export class AutoCommit {
     const backend = context.backend || PR_AUTOMATION_DEFAULTS.BACKEND;
     const maxIterations =
       context.maxIterations || PR_AUTOMATION_DEFAULTS.MAX_ITERATIONS;
-    const iterations = `${context.iterationCount || 0}/${maxIterations}`;
+    const iterations = `${iterationsRun(context)}/${maxIterations}`;
 
     // Use custom template if provided, otherwise use default format
     if (customTemplate) {

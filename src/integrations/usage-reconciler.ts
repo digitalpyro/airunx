@@ -7,6 +7,12 @@
  *     amounts are decimal strings in cents)
  *   - OpenAI `GET /v1/organization/costs` (daily buckets, float dollars)
  *
+ * Token cross-check (Anthropic only): ledger token counts per class
+ * (uncached input, cache read, cache write, output) against the Admin API
+ * `GET /v1/organizations/usage_report/messages`, with the same key, scope,
+ * finality and fail-closed rules as the cost report. Catches token
+ * normalization or cache-accounting drift that dollar totals can hide.
+ *
  * Day assignment: a spawn belongs to the UTC day of its `started_at`
  * (fallback `ended_at`, then the event timestamp). A spawn whose start and
  * end fall on different UTC days is flagged as straddling midnight; its cost
@@ -30,34 +36,82 @@ import {
   usdToMicroUsdOrUndefined,
 } from '../core/cost-accounting.js';
 import { redactSecrets } from '../utils/redaction.js';
+import {
+  ADMIN_KEY_ENV,
+  DAY_MS,
+  DRIFT_TOLERANCE,
+  asRecord,
+  compare,
+  dayStartMs,
+  fetchAnthropicDaily,
+  fetchPaged,
+  inAnthropicScope,
+  parseTime,
+  renderTable,
+  utcDay,
+  windowBounds,
+  type Accumulator,
+  type FetchLike,
+  type ProviderDaily,
+  type ProviderFetchOptions,
+  type ReconcileProvider,
+  type ReconcileStatus,
+} from './usage-reconciler-shared.js';
+import {
+  addTokenCounts,
+  emptyTokenCounts,
+  fetchAnthropicUsage,
+  formatTokenSection,
+  spawnTokenCounts,
+  tokenReconcile,
+  type ProviderTokens,
+  type LedgerTokenDay,
+  type TokenReconcile,
+} from './usage-reconciler-tokens.js';
+
+// Re-exports: the public surface of this module is unchanged
+export {
+  ADMIN_KEY_ENV,
+  ANTHROPIC_DEFAULT_WORKSPACE,
+  DRIFT_TOLERANCE,
+} from './usage-reconciler-shared.js';
+export type {
+  FetchLike,
+  ProviderDaily,
+  ProviderFetchOptions,
+  ReconcileProvider,
+  ReconcileStatus,
+} from './usage-reconciler-shared.js';
+export {
+  ANTHROPIC_USAGE_ENDPOINT,
+  TOKEN_CLASSES,
+  fetchAnthropicUsage,
+  spawnTokenCounts,
+  usageResultTokens,
+} from './usage-reconciler-tokens.js';
+export type {
+  ProviderTokens,
+  TokenClass,
+  TokenClassComparison,
+  TokenCounts,
+  TokenReconcile,
+} from './usage-reconciler-tokens.js';
 
 /** Bumped when the JSON shape of ReconcileReport changes incompatibly */
 export const RECONCILE_REPORT_VERSION = 1;
-
-export type ReconcileProvider = 'anthropic' | 'openai';
 
 export const RECONCILE_PROVIDERS: readonly ReconcileProvider[] = [
   'anthropic',
   'openai',
 ];
 
-export type ReconcileStatus =
-  | 'ok'
-  | 'drift'
-  | 'not-yet-final'
-  | 'non-reconcilable'
-  | 'non-attributable'
-  | 'error';
-
-/** Drift within this share of the provider total is "ok" */
-export const DRIFT_TOLERANCE = 0.1;
 /** Pagination stops (and the provider is reported as error) past this */
 export const DEFAULT_PAGE_CAP = 20;
 export const DEFAULT_TIMEOUT_MS = 30_000;
 /** Longest window accepted by `--days` (Anthropic 1d buckets cap at 31) */
 export const MAX_RECONCILE_DAYS = 31;
 
-const DAY_MS = 86_400_000;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const HOUR_MS = 3_600_000;
 
 /** How long after a UTC day closes the provider's figures are final */
@@ -77,23 +131,13 @@ export const PROVIDER_ENDPOINTS = {
   anthropic: 'https://api.anthropic.com/v1/organizations/cost_report',
   openai: 'https://api.openai.com/v1/organization/costs',
 } as const;
-const ALLOWED_HOSTS = new Set(['api.anthropic.com', 'api.openai.com']);
-const ANTHROPIC_VERSION = '2023-06-01';
 
-export const ADMIN_KEY_ENV: Record<ReconcileProvider, string> = {
-  anthropic: 'ANTHROPIC_ADMIN_KEY',
-  openai: 'OPENAI_ADMIN_KEY',
-};
 export const SCOPE_ENV: Record<ReconcileProvider, string> = {
   anthropic: 'AIRUNX_ANTHROPIC_WORKSPACE_ID',
   openai: 'AIRUNX_OPENAI_PROJECT_ID',
 };
 
 const SCOPE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
-/** Scope value that selects Anthropic's default workspace (`workspace_id: null`). */
-export const ANTHROPIC_DEFAULT_WORKSPACE = 'default';
-const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 // ─── Money ──────────────────────────────────────────────────────────────
 
@@ -138,14 +182,6 @@ export function dollarsToMicroUsd(dollars: unknown): number | undefined {
 }
 
 // ─── Window ─────────────────────────────────────────────────────────────
-
-function dayStartMs(day: string): number {
-  return Date.parse(`${day}T00:00:00Z`);
-}
-
-function utcDay(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 10);
-}
 
 /** Validate a YYYY-MM-DD calendar date */
 export function isValidUtcDate(day: string): boolean {
@@ -203,7 +239,7 @@ export interface VarianceBand {
   straddleMicroUsd: number;
 }
 
-export interface LedgerDay {
+export interface LedgerDay extends LedgerTokenDay {
   billedMicroUsd: number;
   billedSpawns: number;
   /** Billed spawns with no cost figure (unknown, not $0) */
@@ -236,17 +272,15 @@ function emptyLedgerDay(): LedgerDay {
     },
     nonReconcilableSpawns: 0,
     nonReconcilableMicroUsd: 0,
+    tokens: emptyTokenCounts(),
+    tokenBand: emptyTokenCounts(),
+    missingTokenSpawns: 0,
+    estimatedTokenSpawns: 0,
   };
 }
 
 function ledgerKey(provider: ReconcileProvider, day: string): string {
   return `${provider}|${day}`;
-}
-
-function parseTime(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined;
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : undefined;
 }
 
 function spawnBasis(
@@ -333,6 +367,8 @@ export function summarizeLedger(
     const straddles = startDay !== endDay;
     const estimated = summary.estimatedSpawns > 0;
     const unmodeled = summary.unmodeledModifiers.length > 0;
+    const tokens = spawnTokenCounts(event);
+    const tokensEstimated = d.token_provenance === 'estimated';
 
     if (inWindow.has(startDay)) {
       const entry = dayFor(provider, startDay);
@@ -343,6 +379,15 @@ export function summarizeLedger(
       if (unmodeled) entry.band.unmodeledMicroUsd += micro;
       if (estimated || unmodeled || straddles)
         entry.band.totalMicroUsd += micro;
+      if (!tokens) {
+        entry.missingTokenSpawns++;
+      } else {
+        entry.tokens = addTokenCounts(entry.tokens, tokens);
+        if (tokensEstimated) {
+          entry.estimatedTokenSpawns++;
+          entry.tokenBand = addTokenCounts(entry.tokenBand, tokens);
+        }
+      }
     }
     if (straddles) {
       for (const day of touched) {
@@ -351,6 +396,10 @@ export function summarizeLedger(
         entry.band.straddleMicroUsd += micro;
         // Start-day band already includes this spawn above
         if (day !== startDay) entry.band.totalMicroUsd += micro;
+        // Start-day token band already includes an estimated spawn
+        if (tokens && (day !== startDay || !tokensEstimated)) {
+          entry.tokenBand = addTokenCounts(entry.tokenBand, tokens);
+        }
       }
     }
   }
@@ -359,175 +408,19 @@ export function summarizeLedger(
 
 // ─── Provider side ──────────────────────────────────────────────────────
 
-export type FetchLike = (
-  input: string,
-  init: {
-    method: 'GET';
-    headers: Record<string, string>;
-    redirect: 'error';
-    signal: AbortSignal;
-  }
-) => Promise<{
-  ok: boolean;
-  status: number;
-  json(): Promise<unknown>;
-  body?: { cancel(): Promise<void> } | null;
-}>;
+/** UTC day → billed micro-USD */
+export type ProviderCosts = ProviderDaily<number>;
 
-export interface ProviderFetchOptions {
-  adminKey: string;
-  windowDays: readonly string[];
-  /** Workspace (Anthropic) / project (OpenAI) to restrict to */
-  scopeId?: string;
-  fetchImpl: FetchLike;
-  timeoutMs: number;
-  pageCap: number;
-}
-
-export interface ProviderCosts {
-  /** UTC day → billed micro-USD */
-  byDay: Map<string, number>;
-  /** Sanitized failure reason; when set, byDay is incomplete */
-  error?: string;
-}
-
-class ProviderRequestError extends Error {}
-
-async function getJson(
-  url: URL,
-  headers: Record<string, string>,
-  fetchImpl: FetchLike,
-  timeoutMs: number
-): Promise<unknown> {
-  // Defense in depth: only the fixed provider hosts, only https
-  if (url.protocol !== 'https:' || !ALLOWED_HOSTS.has(url.hostname)) {
-    throw new ProviderRequestError('refused non-provider URL');
-  }
-  let response: Awaited<ReturnType<FetchLike>>;
-  try {
-    response = await fetchImpl(url.toString(), {
-      method: 'GET',
-      headers,
-      redirect: 'error',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (error) {
-    const name = error instanceof Error ? error.name : 'Error';
-    throw new ProviderRequestError(
-      name === 'TimeoutError' || name === 'AbortError'
-        ? 'request timed out'
-        : 'request failed'
-    );
-  }
-  if (!response.ok) {
-    try {
-      await response.body?.cancel();
-    } catch {
-      // Body already consumed or unsupported — nothing to release
-    }
-    throw new ProviderRequestError(`HTTP ${response.status}`);
-  }
-  try {
-    return await response.json();
-  } catch {
-    throw new ProviderRequestError('invalid JSON response');
-  }
-}
-
-interface Page {
-  buckets: Array<{ day: string; results: unknown[] }>;
-  hasMore: boolean;
-  nextPage?: string;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function parsePage(
-  body: unknown,
-  bucketDay: (b: Record<string, unknown>) => string | undefined
-): Page {
-  const root = asRecord(body);
-  if (!root || !Array.isArray(root.data)) {
-    throw new ProviderRequestError('unexpected response shape');
-  }
-  const buckets: Page['buckets'] = [];
-  for (const raw of root.data) {
-    const bucket = asRecord(raw);
-    const day = bucket ? bucketDay(bucket) : undefined;
-    if (!bucket || !day || !Array.isArray(bucket.results)) {
-      throw new ProviderRequestError('unexpected response shape');
-    }
-    buckets.push({ day, results: bucket.results });
-  }
-  const nextPage =
-    typeof root.next_page === 'string' && root.next_page.length > 0
-      ? root.next_page
-      : undefined;
-  return { buckets, hasMore: root.has_more === true, nextPage };
-}
-
-async function fetchPaged(
-  options: ProviderFetchOptions,
-  buildUrl: (page?: string) => URL,
-  headers: Record<string, string>,
-  bucketDay: (b: Record<string, unknown>) => string | undefined,
+function microSum(
   resultMicro: (r: Record<string, unknown>) => number | undefined
-): Promise<ProviderCosts> {
-  const byDay = new Map<string, number>();
-  const inWindow = new Set(options.windowDays);
-  let page: string | undefined;
-  try {
-    for (let n = 0; ; n++) {
-      if (n >= options.pageCap) {
-        throw new ProviderRequestError(
-          `page cap (${options.pageCap}) reached; totals incomplete`
-        );
-      }
-      const body = await getJson(
-        buildUrl(page),
-        headers,
-        options.fetchImpl,
-        options.timeoutMs
-      );
-      const parsed = parsePage(body, bucketDay);
-      for (const bucket of parsed.buckets) {
-        if (!inWindow.has(bucket.day)) continue;
-        let total = byDay.get(bucket.day) ?? 0;
-        for (const raw of bucket.results) {
-          const result = asRecord(raw);
-          const micro = result ? resultMicro(result) : undefined;
-          if (micro === undefined) {
-            throw new ProviderRequestError('unparsable cost amount');
-          }
-          total += micro;
-        }
-        byDay.set(bucket.day, total);
-      }
-      if (!parsed.hasMore) break;
-      if (!parsed.nextPage) {
-        throw new ProviderRequestError('has_more without next_page');
-      }
-      page = parsed.nextPage;
-    }
-  } catch (error) {
-    const message =
-      error instanceof ProviderRequestError ? error.message : 'request failed';
-    return { byDay, error: redactSecrets(message) };
-  }
-  return { byDay };
-}
-
-function windowBounds(windowDays: readonly string[]): {
-  startMs: number;
-  endMs: number;
-} {
+): Accumulator<number> {
   return {
-    startMs: dayStartMs(windowDays[0]),
-    endMs: dayStartMs(windowDays[windowDays.length - 1]) + DAY_MS,
+    zero: () => 0,
+    add: (total, result): number | undefined => {
+      const micro = resultMicro(result);
+      return micro === undefined ? undefined : total + micro;
+    },
+    invalidMessage: 'unparsable cost amount',
   };
 }
 
@@ -539,34 +432,11 @@ function windowBounds(windowDays: readonly string[]): {
 export function fetchAnthropicCosts(
   options: ProviderFetchOptions
 ): Promise<ProviderCosts> {
-  const { startMs, endMs } = windowBounds(options.windowDays);
-  const buildUrl = (page?: string): URL => {
-    const url = new URL(PROVIDER_ENDPOINTS.anthropic);
-    url.searchParams.set('starting_at', new Date(startMs).toISOString());
-    url.searchParams.set('ending_at', new Date(endMs).toISOString());
-    url.searchParams.set('bucket_width', '1d');
-    url.searchParams.set('limit', String(options.windowDays.length));
-    url.searchParams.append('group_by[]', 'workspace_id');
-    if (page) url.searchParams.set('page', page);
-    return url;
-  };
-  return fetchPaged(
+  return fetchAnthropicDaily(
     options,
-    buildUrl,
-    {
-      'x-api-key': options.adminKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
-    (bucket) => {
-      const ms = parseTime(bucket.starting_at);
-      return ms === undefined ? undefined : utcDay(ms);
-    },
-    (result) => {
-      // The default workspace reports `workspace_id: null`.
-      const workspaceId = result.workspace_id ?? ANTHROPIC_DEFAULT_WORKSPACE;
-      if (options.scopeId !== undefined && workspaceId !== options.scopeId) {
-        return 0;
-      }
+    PROVIDER_ENDPOINTS.anthropic,
+    microSum((result) => {
+      if (!inAnthropicScope(result, options.scopeId)) return 0;
       if (
         typeof result.currency === 'string' &&
         result.currency.toUpperCase() !== 'USD'
@@ -576,7 +446,7 @@ export function fetchAnthropicCosts(
       return typeof result.amount === 'string'
         ? centsStringToMicroUsd(result.amount)
         : undefined;
-    }
+    })
   );
 }
 
@@ -612,7 +482,7 @@ export function fetchOpenAiCosts(
       Number.isFinite(bucket.start_time)
         ? utcDay(bucket.start_time * 1000)
         : undefined,
-    (result) => {
+    microSum((result) => {
       if (
         options.scopeId !== undefined &&
         result.project_id !== undefined &&
@@ -629,7 +499,7 @@ export function fetchOpenAiCosts(
         return undefined;
       }
       return dollarsToMicroUsd(amount.value);
-    }
+    })
   );
 }
 
@@ -658,6 +528,8 @@ export interface ReconcileRow {
   scope: string | null;
   final: boolean;
   notes: string[];
+  /** Token cross-check (Anthropic only; null for other providers) */
+  tokens: TokenReconcile | null;
 }
 
 export interface ReconcileReport {
@@ -722,25 +594,6 @@ function resolveScope(
   return value;
 }
 
-function compare(
-  ledger: number,
-  provider: number,
-  band: number
-): Pick<ReconcileRow, 'driftMicroUsd' | 'driftPct' | 'withinTolerance'> {
-  const drift = ledger - provider;
-  const driftPct =
-    provider !== 0 ? Math.round((drift / provider) * 10_000) / 100 : null;
-  const withinPct =
-    provider !== 0
-      ? Math.abs(drift) <= Math.abs(provider) * DRIFT_TOLERANCE
-      : drift === 0;
-  return {
-    driftMicroUsd: drift,
-    driftPct,
-    withinTolerance: withinPct || Math.abs(drift) <= band,
-  };
-}
-
 /**
  * Reconcile ledger billed spend against provider cost reports for closed
  * UTC days. Never throws for provider failures or missing keys — those
@@ -781,6 +634,7 @@ export async function reconcileUsage(
     const adminKey = env[ADMIN_KEY_ENV[provider]]?.trim();
     const scope = scopes[provider];
     let costs: ProviderCosts | undefined;
+    let usage: ProviderTokens | undefined;
     if (!adminKey) {
       warnings.push(
         `${provider}: ${ADMIN_KEY_ENV[provider]} not set; billed spend is non-reconcilable`
@@ -803,6 +657,21 @@ export async function reconcileUsage(
           `${provider}: no ${provider === 'anthropic' ? 'workspace' : 'project'} scope; provider totals are org-wide (non-attributable)`
         );
       }
+      if (provider === 'anthropic') {
+        usage = await fetchAnthropicUsage({
+          adminKey,
+          windowDays,
+          scopeId: scope,
+          fetchImpl,
+          timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          pageCap: options.pageCap ?? DEFAULT_PAGE_CAP,
+        });
+        if (usage.error) {
+          warnings.push(
+            redactSecrets(`${provider}: usage report failed (${usage.error})`)
+          );
+        }
+      }
     }
 
     for (const date of windowDays) {
@@ -812,10 +681,15 @@ export async function reconcileUsage(
       const notes: string[] = [];
       const providerMicro =
         costs && !costs.error ? (costs.byDay.get(date) ?? 0) : null;
-      const comparison =
+      const cmp =
         providerMicro !== null
           ? compare(day.billedMicroUsd, providerMicro, day.band.totalMicroUsd)
-          : { driftMicroUsd: null, driftPct: null, withinTolerance: null };
+          : undefined;
+      const comparison = {
+        driftMicroUsd: cmp?.drift ?? null,
+        driftPct: cmp?.driftPct ?? null,
+        withinTolerance: cmp?.withinTolerance ?? null,
+      };
 
       let status: ReconcileStatus;
       if (!adminKey) {
@@ -866,6 +740,10 @@ export async function reconcileUsage(
         scope: scope ?? null,
         final,
         notes: notes.map(redactSecrets),
+        tokens:
+          provider === 'anthropic'
+            ? tokenReconcile({ day, date, adminKey, usage, final, scope })
+            : null,
       });
     }
   }
@@ -894,18 +772,6 @@ function usd(micro: number | null): string {
   return micro === null ? '-' : formatMicroUsd(micro, { signed: true });
 }
 
-function statusCell(status: ReconcileStatus): string {
-  switch (status) {
-    case 'ok':
-      return chalk.green(status);
-    case 'drift':
-    case 'error':
-      return chalk.red(status);
-    default:
-      return chalk.yellow(status);
-  }
-}
-
 /** Human-readable table for `airunx costs reconcile` */
 export function formatReconcileReport(report: ReconcileReport): string {
   const headers = [
@@ -928,28 +794,12 @@ export function formatReconcileReport(report: ReconcileReport): string {
     usd(r.band.totalMicroUsd),
     r.status,
   ]);
-  const widths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((row) => row[i].length))
-  );
-  const line = (cells: string[], colorStatus = false): string =>
-    '  ' +
-    cells
-      .map((c, i) => {
-        const padded = i <= 1 ? c.padEnd(widths[i]) : c.padStart(widths[i]);
-        return colorStatus && i === cells.length - 1
-          ? statusCell(c as ReconcileStatus) + ' '.repeat(widths[i] - c.length)
-          : padded;
-      })
-      .join('  ');
-
   const out = [
     chalk.bold(
       `Cost reconciliation — ${report.days[0]}${report.days.length > 1 ? ` … ${report.days[report.days.length - 1]}` : ''} (UTC, billed spend only)`
     ),
     '',
-    chalk.bold(line(headers)),
-    `  ${'─'.repeat(widths.reduce((a, w) => a + w, 0) + 2 * (widths.length - 1))}`,
-    ...rows.map((row) => line(row, true)),
+    ...renderTable(headers, rows, 2),
   ];
 
   const noted = report.rows.filter((r) => r.notes.length > 0);
@@ -959,6 +809,7 @@ export function formatReconcileReport(report: ReconcileReport): string {
       out.push(`  ${r.provider} ${r.date}: ${r.notes.join('; ')}`);
     }
   }
+  out.push(...formatTokenSection(report));
   if (report.skippedLines > 0) {
     out.push(
       '',
@@ -968,7 +819,7 @@ export function formatReconcileReport(report: ReconcileReport): string {
   out.push(
     '',
     chalk.dim(
-      `  ok = within ±${DRIFT_TOLERANCE * 100}% or within the variance band (estimated + unmodeled + midnight-straddling spend)`
+      `  ok = within ±${DRIFT_TOLERANCE * 100}% or within the variance band (estimated + unmodeled + midnight-straddling spend; for tokens, estimated-token + straddling spawns)`
     )
   );
   return out.join('\n');

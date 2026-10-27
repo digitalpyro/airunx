@@ -8,6 +8,7 @@ import { readdir } from 'fs/promises';
 import { StateManager } from '../../orchestrator/state-manager.js';
 import { DEFAULT_STATE_DIR } from '../../orchestrator/constants.js';
 import type { WorkflowContext } from '../../core/types.js';
+import { iterationsRun } from '../../utils/iterations.js';
 
 interface StatusOptions {
   all?: boolean;
@@ -110,7 +111,7 @@ async function displayWorkflowStatus(workflow: WorkflowContext): Promise<void> {
     `Status: ${chalk[statusColor](workflow.status)}`,
     workflow.currentStage ? `Phase: ${workflow.currentStage}` : null,
     workflow.iterationCount !== undefined
-      ? `Iteration: ${workflow.iterationCount}/${workflow.maxIterations || 3}`
+      ? `Iteration: ${iterationsRun(workflow)}/${workflow.maxIterations || 3}`
       : null,
   ].filter(Boolean);
 

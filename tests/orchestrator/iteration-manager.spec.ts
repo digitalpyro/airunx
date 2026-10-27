@@ -284,9 +284,8 @@ describe('Iteration Manager', () => {
     it('should return summary for first attempt completion', async () => {
       vi.mocked(stateManager.load).mockResolvedValue(mockContext);
 
-      const summary = await iterationManager.getIterationSummary(
-        'test-workflow'
-      );
+      const summary =
+        await iterationManager.getIterationSummary('test-workflow');
 
       expect(summary).toContain('## Iteration Summary');
       expect(summary).toContain('completed on first attempt');
@@ -301,20 +300,19 @@ describe('Iteration Manager', () => {
 
       vi.mocked(stateManager.load).mockResolvedValue(contextWithIterations);
 
-      const summary = await iterationManager.getIterationSummary(
-        'test-workflow'
-      );
+      const summary =
+        await iterationManager.getIterationSummary('test-workflow');
 
-      expect(summary).toContain('Iterations: 2/3');
+      // 2 re-iterations after the first pass = 3 iterations run
+      expect(summary).toContain('Iterations: 3/3');
       expect(summary).toContain('refinement cycles');
     });
 
     it('should return empty string when workflow not found', async () => {
       vi.mocked(stateManager.load).mockResolvedValue(null);
 
-      const summary = await iterationManager.getIterationSummary(
-        'non-existent'
-      );
+      const summary =
+        await iterationManager.getIterationSummary('non-existent');
 
       expect(summary).toBe('');
     });
@@ -361,9 +359,8 @@ describe('Iteration Manager', () => {
     it('should return false when under max iterations', async () => {
       vi.mocked(stateManager.load).mockResolvedValue(mockContext);
 
-      const wouldExceed = await iterationManager.wouldExceedMaxIterations(
-        'test-workflow'
-      );
+      const wouldExceed =
+        await iterationManager.wouldExceedMaxIterations('test-workflow');
 
       expect(wouldExceed).toBe(false);
     });
@@ -377,9 +374,8 @@ describe('Iteration Manager', () => {
 
       vi.mocked(stateManager.load).mockResolvedValue(contextAtMax);
 
-      const wouldExceed = await iterationManager.wouldExceedMaxIterations(
-        'test-workflow'
-      );
+      const wouldExceed =
+        await iterationManager.wouldExceedMaxIterations('test-workflow');
 
       expect(wouldExceed).toBe(true);
     });
@@ -387,9 +383,8 @@ describe('Iteration Manager', () => {
     it('should return true when workflow not found (safe default)', async () => {
       vi.mocked(stateManager.load).mockResolvedValue(null);
 
-      const wouldExceed = await iterationManager.wouldExceedMaxIterations(
-        'non-existent'
-      );
+      const wouldExceed =
+        await iterationManager.wouldExceedMaxIterations('non-existent');
 
       expect(wouldExceed).toBe(true);
     });

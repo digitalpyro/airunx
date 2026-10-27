@@ -9,7 +9,11 @@ import type {
   ExecutionAdapter,
   ExecutionResult,
 } from '../../src/core/adapter-types.js';
-import type { Pipeline, WorkflowContext } from '../../src/core/types.js';
+import type {
+  Pipeline,
+  RunReport,
+  WorkflowContext,
+} from '../../src/core/types.js';
 import { StateManager } from '../../src/orchestrator/state-manager.js';
 import {
   JudgeAgent,
@@ -1232,6 +1236,61 @@ describe('LangGraph Runner', () => {
       });
       expect(calls[0][1].projectedRerunCostUsd).toBeUndefined();
       expect(calls[0][1].iterationCostUsd).toBeCloseTo(0.03);
+    });
+
+    describe('run report iterationCount (1-indexed iterations run)', () => {
+      /** Capture reports instead of writing them to disk */
+      const captureReports = (runner: LangGraphRunner): RunReport[] => {
+        const reports: RunReport[] = [];
+        vi.spyOn(
+          runner as unknown as {
+            persistRunReport: (r: RunReport) => void;
+          },
+          'persistRunReport'
+        ).mockImplementation((r) => {
+          reports.push(r);
+        });
+        return reports;
+      };
+
+      it('1-pass run (judge PROCEEDs first time) reports 1 iteration', async () => {
+        useMemoryState();
+        vi.spyOn(JudgeAgent.prototype, 'judgeExtended').mockResolvedValueOnce(
+          judgeResult('PROCEED', [])
+        );
+        const runner = new LangGraphRunner(
+          mockAdapter,
+          stateManager,
+          judgePipeline,
+          testContext
+        );
+        const reports = captureReports(runner);
+
+        await runner.execute();
+
+        expect(stateManager.incrementIteration).not.toHaveBeenCalled();
+        expect(reports.length).toBeGreaterThan(0);
+        expect(reports.at(-1)?.iterationCount).toBe(1);
+      });
+
+      it('2-pass run (one ITERATE verdict) reports 2 iterations', async () => {
+        useMemoryState();
+        vi.spyOn(JudgeAgent.prototype, 'judgeExtended')
+          .mockResolvedValueOnce(judgeResult('ITERATE', ['missing tests']))
+          .mockResolvedValueOnce(judgeResult('PROCEED', []));
+        const runner = new LangGraphRunner(
+          mockAdapter,
+          stateManager,
+          judgePipeline,
+          testContext
+        );
+        const reports = captureReports(runner);
+
+        await runner.execute();
+
+        expect(stateManager.incrementIteration).toHaveBeenCalledTimes(1);
+        expect(reports.at(-1)?.iterationCount).toBe(2);
+      });
     });
   });
 });

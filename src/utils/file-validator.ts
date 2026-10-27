@@ -223,9 +223,9 @@ function zodErrorToIssues(
     let suggestion: string | undefined;
 
     // Add suggestions for enum errors
-    if (issue.code === z.ZodIssueCode.invalid_enum_value) {
-      const received = issue.received as string;
-      const options = issue.options as string[];
+    if (issue.code === 'invalid_value') {
+      const received = String(issue.input);
+      const options = issue.values.map(String);
 
       const closest = getClosestMatch(received, options);
       if (closest) {
@@ -239,7 +239,10 @@ function zodErrorToIssues(
       severity: mode === 'lenient' ? 'warning' : 'error',
       path: path || '(root)',
       message: issue.message,
-      value: 'received' in issue ? issue.received : undefined,
+      value:
+        issue.code === 'invalid_type' || issue.code === 'invalid_value'
+          ? issue.input
+          : undefined,
       suggestion,
     } satisfies ValidationIssue;
   });
@@ -277,7 +280,7 @@ function validateParsedData(
   }
 
   // Validate with Zod
-  const parseResult = schema.safeParse(data);
+  const parseResult = schema.safeParse(data, { reportInput: true });
   if (!parseResult.success) {
     const zodIssues = zodErrorToIssues(parseResult.error, mode);
     result.issues.push(...zodIssues);

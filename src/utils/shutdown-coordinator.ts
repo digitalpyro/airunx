@@ -22,6 +22,7 @@ import type {
   SpawnRecord,
 } from '../core/adapter-types.js';
 import { spawnCostSummary } from '../core/cost-accounting.js';
+import { terminalDeliveredSigint } from './foreground-process-group.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('shutdown');
@@ -319,13 +320,6 @@ const SIGNAL_EXIT_CODES: Record<'SIGINT' | 'SIGTERM', number> = {
   SIGTERM: 143,
 };
 
-/**
- * Terminal Ctrl-C signals the whole foreground process group; a detached
- * `run` (heartbeat) has no terminal and only ever gets signals addressed to it
- */
-const attachedToTerminal = (): boolean =>
-  Boolean(process.stdin.isTTY || process.stderr.isTTY);
-
 export interface ShutdownSignalHandlerOptions {
   /** Called once shutdown finished (or on a second signal) */
   exit: (code: number) => void;
@@ -333,7 +327,11 @@ export interface ShutdownSignalHandlerOptions {
   shutdownOptions?: Omit<ShutdownOptions, 'alreadySignaled'>;
   /** Signal source (default: process; tests pass an EventEmitter) */
   target?: Pick<EventEmitter, 'on' | 'off'>;
-  /** Override the terminal check (tests) */
+  /**
+   * Override the "terminal already sent SIGINT to the process group" check,
+   * evaluated when SIGINT arrives (default: terminalDeliveredSigint — TTY
+   * and `run` in the terminal's foreground process group)
+   */
   attachedToTerminal?: () => boolean;
 }
 
@@ -341,10 +339,11 @@ export interface ShutdownSignalHandlerOptions {
  * Install SIGINT/SIGTERM handlers that drive a graceful shutdown.
  *
  * - SIGTERM (heartbeat stop/timeout, `kill`): CLIs get SIGINT from us.
- * - SIGINT with a terminal attached (Ctrl-C): the terminal already
- *   delivered SIGINT to the whole foreground group, CLIs included, so we do
- *   not send another; the ladder continues with SIGTERM/SIGKILL. Without a
- *   terminal, SIGINT is treated like SIGTERM.
+ * - SIGINT while `run` is the terminal's foreground process group (Ctrl-C):
+ *   the terminal already delivered SIGINT to the whole group, CLIs included,
+ *   so we do not send another; the ladder continues with SIGTERM/SIGKILL.
+ *   Otherwise (no terminal, background job, `kill -INT`, probe failure)
+ *   SIGINT is treated like SIGTERM. See foreground-process-group.ts.
  * - A second signal while shutting down exits immediately.
  *
  * Returns an uninstall function.
@@ -354,8 +353,15 @@ export function installShutdownSignalHandlers(
 ): () => void {
   const coordinator = options.coordinator ?? shutdownCoordinator;
   const target = options.target ?? process;
-  const isTerminal = options.attachedToTerminal ?? attachedToTerminal;
+  const isTerminal = options.attachedToTerminal ?? terminalDeliveredSigint;
   let handling = false;
+  const terminalSignaled = (): boolean => {
+    try {
+      return isTerminal();
+    } catch {
+      return false;
+    }
+  };
 
   const handler = (signal: 'SIGINT' | 'SIGTERM'): void => {
     const code = SIGNAL_EXIT_CODES[signal];
@@ -369,7 +375,7 @@ export function installShutdownSignalHandlers(
     void coordinator
       .shutdown({
         ...options.shutdownOptions,
-        alreadySignaled: signal === 'SIGINT' && isTerminal(),
+        alreadySignaled: signal === 'SIGINT' && terminalSignaled(),
       })
       .finally(() => options.exit(code));
   };

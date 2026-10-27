@@ -303,6 +303,20 @@ function getModelFamily(model: string): 'anthropic' | 'openai' | null {
 }
 
 /**
+ * Whether a model id (or alias) belongs to the model family a provider runs.
+ * Returns null when either the provider or the model is not in the registry.
+ */
+export function isModelCompatibleWithProvider(
+  model: string,
+  provider: string
+): boolean | null {
+  const providerConfig = PROVIDER_MODEL_FAMILIES[provider];
+  const modelFamily = getModelFamily(model);
+  if (!providerConfig || !modelFamily) return null;
+  return modelFamily === providerConfig.family;
+}
+
+/**
  * Check model-provider compatibility and create issue if incompatible
  * Uses PROVIDER_MODEL_FAMILIES configuration for maintainability
  */

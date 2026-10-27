@@ -19,6 +19,7 @@ import {
   type ReconcileReport,
   type ReconcileRow,
   ANTHROPIC_DEFAULT_WORKSPACE,
+  usageResultTokens,
 } from '../../src/integrations/usage-reconciler.js';
 import { reconcileCommand } from '../../src/cli/commands/costs.js';
 import type { AuditEvent } from '../../src/task-queue/types.js';
@@ -54,6 +55,9 @@ interface SpawnOpts {
   start: string;
   end?: string;
   unmodeled?: string[];
+  /** Ledger tokens (input inclusive of cache, as normalized) */
+  usage?: { input: number; read?: number; write?: number; output?: number };
+  tokenProvenance?: 'reported' | 'estimated';
 }
 
 function spawn(o: SpawnOpts): AuditEvent {
@@ -74,6 +78,17 @@ function spawn(o: SpawnOpts): AuditEvent {
       unmodeled_modifiers: o.unmodeled ?? [],
       started_at: o.start,
       ended_at: o.end ?? o.start,
+      ...(o.usage
+        ? {
+            token_provenance: o.tokenProvenance ?? 'reported',
+            usage: {
+              input_tokens: o.usage.input,
+              output_tokens: o.usage.output ?? 0,
+              cache_read_input_tokens: o.usage.read ?? 0,
+              cache_write_input_tokens: o.usage.write ?? 0,
+            },
+          }
+        : {}),
     },
   } as AuditEvent;
 }
@@ -150,9 +165,49 @@ function openaiPage(
   };
 }
 
-/** Routes by host; each handler gets the parsed URL */
+type UsageResult = {
+  uncached?: number;
+  read?: number;
+  w5m?: number;
+  w1h?: number;
+  output?: number;
+  ws?: string | null;
+};
+
+function usagePage(
+  buckets: Array<{ day: string; results: UsageResult[] }>,
+  nextPage?: string
+): unknown {
+  return {
+    data: buckets.map((b) => ({
+      starting_at: `${b.day}T00:00:00Z`,
+      ending_at: `${b.day}T23:59:59Z`,
+      results: b.results.map((r) => ({
+        uncached_input_tokens: r.uncached ?? 0,
+        cache_read_input_tokens: r.read ?? 0,
+        cache_creation: {
+          ephemeral_5m_input_tokens: r.w5m ?? 0,
+          ephemeral_1h_input_tokens: r.w1h ?? 0,
+        },
+        output_tokens: r.output ?? 0,
+        server_tool_use: { web_search_requests: 0 },
+        workspace_id: r.ws === undefined ? 'w1' : r.ws,
+      })),
+    })),
+    has_more: nextPage !== undefined,
+    next_page: nextPage ?? null,
+  };
+}
+
+const USAGE_PATH = '/v1/organizations/usage_report/messages';
+
+/**
+ * Routes by host; each handler gets the parsed URL. Anthropic usage-report
+ * requests go to `anthropicUsage` (default: an empty page).
+ */
 function mockFetch(handlers: {
   anthropic?: (url: URL) => MockResponse | Promise<MockResponse>;
+  anthropicUsage?: (url: URL) => MockResponse | Promise<MockResponse>;
   openai?: (url: URL) => MockResponse | Promise<MockResponse>;
 }) {
   const fn = vi.fn(async (input: string, init: Parameters<FetchLike>[1]) => {
@@ -161,7 +216,9 @@ function mockFetch(handlers: {
     expect(init.signal).toBeInstanceOf(AbortSignal);
     const handler =
       url.hostname === 'api.anthropic.com'
-        ? handlers.anthropic
+        ? url.pathname === USAGE_PATH
+          ? (handlers.anthropicUsage ?? (() => json(usagePage([]))))
+          : handlers.anthropic
         : url.hostname === 'api.openai.com'
           ? handlers.openai
           : undefined;
@@ -554,7 +611,10 @@ describe('reconcileUsage', () => {
       anthropicWorkspace: 'w1',
       pageCap: 5,
     });
-    expect(endless).toHaveBeenCalledTimes(5);
+    const costCalls = endless.mock.calls.filter(
+      ([u]) => new URL(u).pathname !== USAGE_PATH
+    );
+    expect(costCalls).toHaveLength(5);
     const a = row(capped, 'anthropic', DAY);
     expect(a.status).toBe('error');
     expect(a.providerMicroUsd).toBeNull();
@@ -717,6 +777,31 @@ describe('reconcileUsage', () => {
     expect(report.warnings.join('\n')).toMatch(/non-attributable/);
   });
 
+  it('fails closed when a scoped cost report result has no workspace_id', async () => {
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: () =>
+          json({
+            data: [
+              {
+                starting_at: `${DAY}T00:00:00Z`,
+                results: [{ currency: 'USD', amount: '100' }],
+              },
+            ],
+            has_more: false,
+          }),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: ANTHROPIC_DEFAULT_WORKSPACE,
+    });
+    const a = row(report, 'anthropic', DAY);
+    expect(a.status).toBe('error');
+    expect(a.notes).toContain('result not grouped by workspace');
+  });
+
   it('reads scopes from the environment and validates them', async () => {
     const fetchImpl = mockFetch({
       openai: (url) => {
@@ -735,6 +820,57 @@ describe('reconcileUsage', () => {
       auditDir,
     });
     expect(row(report, 'openai', DAY).scope).toBe('proj_env');
+
+    const anthropicFetch = mockFetch({
+      anthropic: () =>
+        json(
+          anthropicPage([
+            {
+              day: DAY,
+              amounts: [
+                ['100', 'wrkspc_env'],
+                ['999', 'wrkspc_other'],
+              ],
+            },
+          ])
+        ),
+      anthropicUsage: (url) => {
+        expect(url.searchParams.getAll('workspace_ids[]')).toEqual([
+          'wrkspc_env',
+        ]);
+        return json(usagePage([]));
+      },
+    });
+    const anthropicReport = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: {
+        ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY,
+        AIRUNX_ANTHROPIC_WORKSPACE_ID: 'wrkspc_env',
+      },
+      fetchImpl: anthropicFetch as unknown as FetchLike,
+      auditDir,
+    });
+    const a = row(anthropicReport, 'anthropic', DAY);
+    expect(a.scope).toBe('wrkspc_env');
+    expect(a.providerMicroUsd).toBe(1_000_000);
+    expect(a.status).toBe('drift');
+    expect(anthropicReport.warnings.join('\n')).not.toMatch(/non-attributable/);
+    // An explicit --anthropic-workspace wins over the environment
+    const explicit = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: {
+        ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY,
+        AIRUNX_ANTHROPIC_WORKSPACE_ID: 'wrkspc_env',
+      },
+      fetchImpl: mockFetch({
+        anthropic: () => json(anthropicPage([])),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'wrkspc_flag',
+    });
+    expect(row(explicit, 'anthropic', DAY).scope).toBe('wrkspc_flag');
     await expect(
       reconcileUsage({
         date: DAY,
@@ -760,6 +896,480 @@ describe('reconcileUsage', () => {
   });
 });
 
+describe('usageResultTokens', () => {
+  it('maps usage report fields and sums both cache-write tiers', () => {
+    expect(
+      usageResultTokens({
+        uncached_input_tokens: 10,
+        cache_read_input_tokens: 20,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 3,
+          ephemeral_1h_input_tokens: 4,
+        },
+        output_tokens: 5,
+      })
+    ).toEqual({ uncachedInput: 10, cacheRead: 20, cacheWrite: 7, output: 5 });
+    // A missing tier is 0; a missing class or non-integer fails
+    expect(
+      usageResultTokens({
+        uncached_input_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation: { ephemeral_5m_input_tokens: 2 },
+        output_tokens: 0,
+      })?.cacheWrite
+    ).toBe(2);
+    expect(
+      usageResultTokens({
+        uncached_input_tokens: 1,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+      })
+    ).toBeUndefined();
+    expect(
+      usageResultTokens({
+        uncached_input_tokens: '1',
+        cache_read_input_tokens: 0,
+        cache_creation: {},
+        output_tokens: 0,
+      })
+    ).toBeUndefined();
+    expect(
+      usageResultTokens({
+        uncached_input_tokens: 1,
+        cache_read_input_tokens: -1,
+        cache_creation: {},
+        output_tokens: 0,
+      })
+    ).toBeUndefined();
+  });
+
+  it('counts null cache tiers as 0 instead of failing', () => {
+    const base = {
+      uncached_input_tokens: 10,
+      cache_read_input_tokens: 20,
+      cache_creation: {
+        ephemeral_5m_input_tokens: 3,
+        ephemeral_1h_input_tokens: 4,
+      },
+      output_tokens: 5,
+    };
+    expect(usageResultTokens({ ...base, cache_creation: null })).toEqual({
+      uncachedInput: 10,
+      cacheRead: 20,
+      cacheWrite: 0,
+      output: 5,
+    });
+    expect(
+      usageResultTokens({
+        ...base,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 3,
+          ephemeral_1h_input_tokens: null,
+        },
+      })?.cacheWrite
+    ).toBe(3);
+    expect(
+      usageResultTokens({ ...base, cache_read_input_tokens: null })?.cacheRead
+    ).toBe(0);
+  });
+});
+
+describe('token cross-check', () => {
+  const DAY = '2026-10-14';
+
+  /** Billed ledger totals: uncached 300, read 5000, write 800, output 900 */
+  function writeTokenLedger(): void {
+    writeAudit([
+      spawn({
+        micro: 1_000_000,
+        start: `${DAY}T10:00:00Z`,
+        usage: { input: 2_100, read: 1_500, write: 500, output: 400 },
+      }),
+      spawn({
+        micro: 500_000,
+        start: `${DAY}T11:00:00Z`,
+        usage: { input: 4_000, read: 3_500, write: 300, output: 500 },
+      }),
+      // Subscription spawn: never compared
+      spawn({
+        micro: 9_000_000,
+        basis: 'api_equivalent',
+        start: `${DAY}T12:00:00Z`,
+        usage: { input: 99_999, read: 0, write: 0, output: 99_999 },
+      }),
+    ]);
+  }
+
+  const MATCHING: UsageResult[] = [
+    { uncached: 200, read: 5_000, w5m: 600, w1h: 0, output: 600 },
+    { uncached: 100, read: 0, w5m: 0, w1h: 200, output: 300 },
+    // Another workspace: ignored when scoped
+    { uncached: 1e6, read: 1e6, w5m: 1e6, w1h: 1e6, output: 1e6, ws: 'w2' },
+  ];
+
+  function costFor(amount = '150'): () => MockResponse {
+    return () => json(anthropicPage([{ day: DAY, amounts: [[amount, 'w1']] }]));
+  }
+
+  it('reports no drift when every token class matches', async () => {
+    writeTokenLedger();
+    const usageUrls: URL[] = [];
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: (url) => {
+          usageUrls.push(url);
+          return json(usagePage([{ day: DAY, results: MATCHING }]));
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+
+    expect(usageUrls).toHaveLength(1);
+    const url = usageUrls[0];
+    expect(url.searchParams.get('starting_at')).toBe(
+      '2026-10-14T00:00:00.000Z'
+    );
+    expect(url.searchParams.get('ending_at')).toBe('2026-10-15T00:00:00.000Z');
+    expect(url.searchParams.get('bucket_width')).toBe('1d');
+    expect(url.searchParams.getAll('group_by[]')).toEqual(['workspace_id']);
+    expect(url.searchParams.getAll('workspace_ids[]')).toEqual(['w1']);
+
+    const a = row(report, 'anthropic', DAY);
+    expect(a.status).toBe('ok');
+    expect(a.tokens?.status).toBe('ok');
+    expect(a.tokens?.driftClasses).toEqual([]);
+    expect(a.tokens?.classes).toMatchObject({
+      uncachedInput: { ledger: 300, provider: 300, drift: 0 },
+      cacheRead: { ledger: 5_000, provider: 5_000, drift: 0 },
+      cacheWrite: { ledger: 800, provider: 800, drift: 0 },
+      output: { ledger: 900, provider: 900, drift: 0 },
+    });
+    expect(row(report, 'openai', DAY).tokens).toBeNull();
+
+    const text = formatReconcileReport(report);
+    expect(text).toContain('Anthropic token cross-check');
+    expect(text).toContain('cache write');
+    expect(text).toContain('5,000');
+  });
+
+  it('reports drift for the drifting class only', async () => {
+    writeTokenLedger();
+    const results = MATCHING.map((r, i) =>
+      i === 0 ? { ...r, read: 10_000 } : r
+    );
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () => json(usagePage([{ day: DAY, results }])),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    const a = row(report, 'anthropic', DAY);
+    // Dollars still reconcile; tokens catch the cache-read drift
+    expect(a.status).toBe('ok');
+    expect(a.tokens?.status).toBe('drift');
+    expect(a.tokens?.driftClasses).toEqual(['cacheRead']);
+    const read = a.tokens!.classes.cacheRead;
+    expect(read.drift).toBe(-5_000);
+    expect(read.driftPct).toBe(-50);
+    expect(read.withinTolerance).toBe(false);
+    for (const cls of ['uncachedInput', 'cacheWrite', 'output'] as const) {
+      expect(a.tokens!.classes[cls].withinTolerance).toBe(true);
+    }
+    const lines = formatReconcileReport(report).split('\n');
+    expect(lines.find((l) => l.includes('cache read'))).toContain('drift');
+    expect(lines.find((l) => l.includes('cache write'))).not.toContain('drift');
+  });
+
+  it('bands estimated-token spawns and notes spawns with no tokens', async () => {
+    writeAudit([
+      spawn({
+        micro: 1_000_000,
+        start: `${DAY}T10:00:00Z`,
+        usage: { input: 1_000, output: 1_000 },
+        tokenProvenance: 'estimated',
+      }),
+      spawn({ micro: 500_000, start: `${DAY}T11:00:00Z` }),
+    ]);
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () =>
+          json(
+            usagePage([{ day: DAY, results: [{ uncached: 400, output: 0 }] }])
+          ),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    const t = row(report, 'anthropic', DAY).tokens!;
+    // Drift (600 / 1,000) is inside the estimated-token band
+    expect(t.classes.uncachedInput.band).toBe(1_000);
+    expect(t.classes.output.band).toBe(1_000);
+    expect(t.status).toBe('ok');
+    expect(t.missingTokenSpawns).toBe(1);
+    expect(t.estimatedTokenSpawns).toBe(1);
+    expect(t.notes.join(' ')).toMatch(
+      /1 billed spawn\(s\) with no recorded tokens/
+    );
+  });
+
+  it('excludes open (non-final) UTC days', async () => {
+    const report = await reconcileUsage({
+      date: '2026-10-16',
+      days: 2,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: () => json(anthropicPage([])),
+        anthropicUsage: () =>
+          json(
+            usagePage([
+              { day: '2026-10-15', results: [] },
+              { day: '2026-10-16', results: [{ uncached: 5, output: 5 }] },
+            ])
+          ),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    const open = row(report, 'anthropic', '2026-10-16').tokens!;
+    expect(open.status).toBe('not-yet-final');
+    expect(open.driftClasses).toEqual([]);
+    expect(row(report, 'anthropic', '2026-10-15').tokens?.status).toBe('ok');
+
+    // Just after midnight the closed day is still inside the 1h delay
+    const early = await reconcileUsage({
+      date: '2026-10-15',
+      now: new Date('2026-10-16T00:30:00Z'),
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: () => json(anthropicPage([])),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    expect(row(early, 'anthropic', '2026-10-15').tokens?.status).toBe(
+      'not-yet-final'
+    );
+  });
+
+  it('selects the default workspace client-side without workspace_ids[]', async () => {
+    writeAudit([
+      spawn({
+        micro: 1_000_000,
+        start: `${DAY}T10:00:00Z`,
+        usage: { input: 100, output: 50 },
+      }),
+    ]);
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: () =>
+          json(anthropicPage([{ day: DAY, amounts: [['100', null]] }])),
+        anthropicUsage: (url) => {
+          expect(url.searchParams.has('workspace_ids[]')).toBe(false);
+          return json(
+            usagePage([
+              {
+                day: DAY,
+                results: [
+                  { uncached: 100, output: 50, ws: null },
+                  { uncached: 7, output: 7, ws: 'w2' },
+                ],
+              },
+            ])
+          );
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: ANTHROPIC_DEFAULT_WORKSPACE,
+    });
+    const t = row(report, 'anthropic', DAY).tokens!;
+    expect(t.status).toBe('ok');
+    expect(t.classes.uncachedInput.provider).toBe(100);
+  });
+
+  it('fails closed when the usage endpoint errors, keeping the dollar row', async () => {
+    writeTokenLedger();
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () => ({
+          ok: false,
+          status: 500,
+          json: async () => ({ detail: `RAW_BODY_MARKER ${ANTHROPIC_KEY}` }),
+          body: null,
+        }),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    const a = row(report, 'anthropic', DAY);
+    expect(a.status).toBe('ok');
+    expect(a.tokens?.status).toBe('error');
+    expect(a.tokens?.notes).toContain('HTTP 500');
+    expect(a.tokens?.classes.cacheRead).toMatchObject({
+      ledger: 5_000,
+      provider: null,
+      drift: null,
+      withinTolerance: null,
+    });
+    expect(report.warnings.join('\n')).toMatch(
+      /anthropic: usage report failed \(HTTP 500\)/
+    );
+    const serialized = JSON.stringify(report) + formatReconcileReport(report);
+    expect(serialized).not.toContain('RAW_BODY_MARKER');
+    expect(serialized).not.toContain('SECRET');
+  });
+
+  it('fails closed on unscoped or unparsable usage data', async () => {
+    writeTokenLedger();
+    const ungrouped = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () => {
+          const page = usagePage([{ day: DAY, results: MATCHING }]) as {
+            data: Array<{ results: Array<Record<string, unknown>> }>;
+          };
+          delete page.data[0].results[0].workspace_id;
+          return json(page);
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    const t = row(ungrouped, 'anthropic', DAY).tokens!;
+    expect(t.status).toBe('error');
+    expect(t.notes).toContain('result not grouped by workspace');
+
+    const malformed = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () =>
+          json({
+            data: [
+              {
+                starting_at: `${DAY}T00:00:00Z`,
+                results: [{ workspace_id: 'w1', output_tokens: 1 }],
+              },
+            ],
+            has_more: false,
+          }),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    expect(row(malformed, 'anthropic', DAY).tokens?.notes).toContain(
+      'unparsable token count'
+    );
+
+    // No scope at all: compared but non-attributable, like the dollar row
+    const unscoped = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: (url) => {
+          expect(url.searchParams.has('workspace_ids[]')).toBe(false);
+          return json(usagePage([{ day: DAY, results: MATCHING }]));
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+    });
+    const u = row(unscoped, 'anthropic', DAY).tokens!;
+    expect(u.status).toBe('non-attributable');
+    expect(u.driftClasses).toEqual([]);
+    // Org-wide totals include the other workspace
+    expect(u.classes.output.provider).toBe(1_000_900);
+  });
+
+  it('is non-reconcilable without an admin key', async () => {
+    writeTokenLedger();
+    const fetchImpl = vi.fn();
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: {},
+      fetchImpl: fetchImpl as unknown as FetchLike,
+      auditDir,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const t = row(report, 'anthropic', DAY).tokens!;
+    expect(t.status).toBe('non-reconcilable');
+    expect(t.classes.output.ledger).toBe(900);
+  });
+
+  it('sums every usage page and enforces the page cap', async () => {
+    writeTokenLedger();
+    const seen: Array<string | null> = [];
+    const pages = [
+      usagePage([{ day: DAY, results: [MATCHING[0]] }], 'u2'),
+      usagePage([{ day: DAY, results: [MATCHING[1]] }]),
+    ];
+    const report = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: (url) => {
+          seen.push(url.searchParams.get('page'));
+          return json(pages[seen.length - 1]);
+        },
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+    });
+    expect(seen).toEqual([null, 'u2']);
+    const t = row(report, 'anthropic', DAY).tokens!;
+    expect(t.status).toBe('ok');
+    expect(t.classes.cacheWrite.provider).toBe(800);
+
+    const capped = await reconcileUsage({
+      date: DAY,
+      now: NOW,
+      env: { ANTHROPIC_ADMIN_KEY: ANTHROPIC_KEY },
+      fetchImpl: mockFetch({
+        anthropic: costFor(),
+        anthropicUsage: () =>
+          json(usagePage([{ day: DAY, results: [MATCHING[0]] }], 'more')),
+      }) as unknown as FetchLike,
+      auditDir,
+      anthropicWorkspace: 'w1',
+      pageCap: 3,
+    });
+    const c = row(capped, 'anthropic', DAY);
+    expect(c.status).toBe('ok');
+    expect(c.tokens?.status).toBe('error');
+    expect(c.tokens?.notes.join(' ')).toMatch(/page cap \(3\)/);
+  });
+});
+
 describe('reconcileCommand', () => {
   it('exits 0 with a non-reconcilable notice when keys are missing', async () => {
     const DAY = '2026-10-14';
@@ -779,6 +1389,14 @@ describe('reconcileCommand', () => {
     expect(exit).toHaveBeenCalledWith(0);
     const out = JSON.parse(String(log.mock.calls[0][0])) as ReconcileReport;
     expect(out.rows.every((r) => r.status === 'non-reconcilable')).toBe(true);
+    const tokens = out.rows.find((r) => r.provider === 'anthropic')?.tokens;
+    expect(tokens?.status).toBe('non-reconcilable');
+    expect(Object.keys(tokens?.classes ?? {})).toEqual([
+      'uncachedInput',
+      'cacheRead',
+      'cacheWrite',
+      'output',
+    ]);
     expect(err.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(
       /non-reconcilable/
     );

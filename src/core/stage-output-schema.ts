@@ -49,7 +49,9 @@ export const StageOutputSchema = z.object({
     .int()
     .nonnegative()
     .describe('Time taken to execute'),
-  output: z.record(z.unknown()).describe('Stage-specific output data'),
+  output: z
+    .record(z.string(), z.unknown())
+    .describe('Stage-specific output data'),
   context_for_next: StageContextSchema.describe(
     'Context to pass to next stage'
   ),

@@ -704,16 +704,31 @@ export async function runOrchestrator(
         const { createProviderRouter } = await import(
           '../../orchestrator/provider-router.js'
         );
+        // An explicit --backend beats AGENTS.md providers for every agent
+        const backendOverride = options.backend as BackendType | undefined;
         const providerRouter = createProviderRouter(
           agentProviderConfigs,
-          config
+          config,
+          undefined,
+          { backendOverride }
         );
 
         // Log provider routing summary if agents have custom providers
         const agentsWithProviders = agentProviderConfigs.filter(
           (a) => a.provider
         );
-        if (agentsWithProviders.length > 0) {
+        if (backendOverride) {
+          const replaced = agentsWithProviders.filter(
+            (a) => a.provider !== backendOverride
+          ).length;
+          if (replaced > 0) {
+            console.log(
+              chalk.dim(
+                `  Backend override: ${backendOverride} (replaces AGENTS.md provider for ${replaced} agent(s))`
+              )
+            );
+          }
+        } else if (agentsWithProviders.length > 0) {
           console.log(
             chalk.dim(
               `  Provider routing: ${agentsWithProviders.length} agent(s) with custom providers`

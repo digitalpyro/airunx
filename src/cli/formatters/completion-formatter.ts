@@ -11,6 +11,7 @@
 
 import chalk from 'chalk';
 import type { WorkflowContext, WorkflowStatus } from '../../core/types.js';
+import { iterationsRun } from '../../utils/iterations.js';
 import {
   formatCostSummaryLine,
   formatEstimationWarning,
@@ -125,7 +126,7 @@ export function formatCompletionJson(context: WorkflowContext): object {
       tokensUsed: context.metrics.totalTokens || 0,
       cost: context.metrics.totalCost || 0,
       durationMs: context.metrics.totalRuntimeMs || 0,
-      iterations: context.iterationCount || 0,
+      iterations: iterationsRun(context),
       ...costSummaryJson(context),
     },
     startedAt: context.createdAt?.toISOString?.() ?? new Date().toISOString(),
@@ -182,8 +183,8 @@ export function displayCompletion(
   // Display workflow ID and basic info
   console.log(chalk.dim(`  Workflow ID: ${context.id}`));
   console.log(chalk.dim(`  Status: ${context.status}`));
-  if (context.iterationCount) {
-    console.log(chalk.dim(`  Iterations: ${context.iterationCount}`));
+  if (iterationsRun(context)) {
+    console.log(chalk.dim(`  Iterations: ${iterationsRun(context)}`));
   }
 
   // Display failed stages if any

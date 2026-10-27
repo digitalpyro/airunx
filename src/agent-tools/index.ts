@@ -17,6 +17,7 @@ import {
   iterationHistoryTool,
   getIterationHistoryToolDefinition,
 } from './iteration-history.js';
+import { getRunCostTool, getGetRunCostToolDefinition } from './get-run-cost.js';
 import { updateTaskTool, getUpdateTaskToolDefinition } from './update-task.js';
 import { cancelTaskTool, getCancelTaskToolDefinition } from './cancel-task.js';
 import { getTaskTool, getGetTaskToolDefinition } from './get-task.js';
@@ -41,6 +42,8 @@ export {
   getQueryAuditToolDefinition,
   iterationHistoryTool,
   getIterationHistoryToolDefinition,
+  getRunCostTool,
+  getGetRunCostToolDefinition,
   updateTaskTool,
   getUpdateTaskToolDefinition,
   cancelTaskTool,
@@ -64,6 +67,7 @@ export const agentTools = [
   createTaskTool,
   queryAuditTool,
   iterationHistoryTool,
+  getRunCostTool,
   updateTaskTool,
   cancelTaskTool,
   getTaskTool,
@@ -90,6 +94,7 @@ export function getAllAgentToolDefinitions(): Array<{
     getCreateTaskToolDefinition(),
     getQueryAuditToolDefinition(),
     getIterationHistoryToolDefinition(),
+    getGetRunCostToolDefinition(),
     getUpdateTaskToolDefinition(),
     getCancelTaskToolDefinition(),
     getGetTaskToolDefinition(),

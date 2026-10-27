@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-27
+
+### Added
+
+- `get_run_cost` agent tool: returns the current run's cost summary (billed and API-equivalent totals, provenance mix, per-stage spend, top drivers) so agents can reason about spend mid-run. Aggregate numbers only, and limited to the agent's own run, like `query_audit`. Totals are partial while the run is in progress.
+- `airunx costs reconcile` now also checks Anthropic token counts against the Admin API usage report for each closed UTC day. It reports drift per token class (uncached input, cache read, cache write, output), using the same admin key, workspace scope, finality and fail-closed rules as the dollar check. `--json` rows gain a `tokens` object.
+- `mcp_config` setting on the `claude-code` backend: one or more absolute paths or inline JSON objects, passed to every spawn with `--mcp-config`
+
+### Changed
+
+- **Breaking:** requires Node.js 20 or later (`@langchain/core` 1.x dropped Node 18). CI now tests Node 20, 22 and 24
+- Enum-keyed config maps (`agent_routing`, `backends`, fidelity `levels`) stay partial under zod 4 (`z.partialRecord`)
+- **`--backend` now overrides the provider of every agent**, including agents that set `provider` in AGENTS.md. Logs show `[cli-override]`. If the chosen backend is unavailable, the run fails instead of falling back to the AGENTS.md provider. A per-agent AGENTS.md model meant for a different provider is ignored, with an info log, so a Claude model is never passed to codex.
+- **Headless `claude` spawns no longer load your MCP servers.** Each spawn runs with `--strict-mcp-config` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`, so claude.ai connectors and `~/.claude.json` / `.mcp.json` servers are not loaded. Use the new `mcp_config` setting to give spawns specific servers.
+- `Iterations` in the run summary, `run --format json` metrics, run reports, PR and commit bodies, and heartbeat issue comments now counts the iterations actually run: 1 for a run accepted on the first pass. Reports written by older versions still hold the old count, which was one lower.
+- Ctrl-C detection: `run` now skips its own SIGINT to child CLIs only when it is the terminal's foreground process group, checked with `ps` when the signal arrives. If the check fails, it sends SIGINT.
+
+### Security
+
+- Cleared every `npm audit` finding (26 in the repo, 8 shipped to installs, 3 critical): upgraded `zod` 3 → 4, `@langchain/core` 0.3 → 1.x and `@langchain/langgraph` 0.2 → 1.x, and raised the floors for `handlebars`, `figlet`, `yaml` and `vitest`
+
+### Fixed
+
+- `--backend codex` was ignored for agents with a `provider` in AGENTS.md (#20)
+- In headless runs the orchestrator could see only the user's claude.ai connector tools, such as Claude Docs, and stop, treating itself as blocked (#20)
+- Heartbeat completion comments showed `Iterations: 0` for a completed run (#20)
+- A background (`&`) or `kill -INT`'d `run` attached to a TTY skipped SIGINT for its child CLIs, so Claude never got the chance to report its spend (#19)
+- A `null` cache tier in provider usage data is treated as 0 instead of failing the reconcile
+
 ## [0.1.6] - 2026-10-19
 
 ### Added

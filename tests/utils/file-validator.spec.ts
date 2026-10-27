@@ -182,6 +182,17 @@ pipelines:
       expect(result.valid).toBe(true);
     });
 
+    it('should suggest the closest enum value for a schema typo', () => {
+      const content = JSON.stringify({ default_fidelity: 'standrd' });
+
+      const result = validateContent(content, 'settings');
+
+      expect(result.valid).toBe(false);
+      const issue = result.issues.find((i) => i.path === 'default_fidelity');
+      expect(issue?.value).toBe('standrd');
+      expect(issue?.suggestion).toBe("Did you mean 'standard'?");
+    });
+
     it('should return warning for empty content', () => {
       const result = validateContent('   ', 'settings');
 

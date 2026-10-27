@@ -256,7 +256,7 @@ export const FidelityConfigSchema = z.object({
   // Users provide partial snake_case config. We validate that and transform to partial camelCase.
   // The final merging with defaults is handled by the `getFidelityConfig` resolver.
   levels: z
-    .record(
+    .partialRecord(
       ExecutionFidelityLevelSchema,
       PartialFidelityParametersSchema.transform((data) => {
         const mapping: Record<string, string> = {
