@@ -118,6 +118,8 @@ describe.sequential('Todo Manager', () => {
   describe('Update Status', () => {
     it('should update todo status', async () => {
       const todo = await todoManager.create({ title: 'Test task' });
+      // updatedAt has millisecond resolution; let the clock tick
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
       const updated = await todoManager.updateStatus(todo.id, 'in_progress');
 

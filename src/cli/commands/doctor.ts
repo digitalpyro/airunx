@@ -49,10 +49,10 @@ export async function doctorCommand(): Promise<void> {
 
     spinner.stop();
     console.log(chalk.bold('📦 Node.js:'));
-    if (nodeMajor >= 18) {
+    if (nodeMajor >= 20) {
       console.log(chalk.green(`  ✓ ${nodeVersion} (supported)\n`));
     } else {
-      console.log(chalk.red(`  ✗ ${nodeVersion} (requires >= 18.0.0)\n`));
+      console.log(chalk.red(`  ✗ ${nodeVersion} (requires >= 20.0.0)\n`));
     }
 
     // 2. Check environment variables
@@ -338,7 +338,7 @@ export async function doctorCommand(): Promise<void> {
             )
           );
         } else {
-          const errorMessages = result.error.errors.map(
+          const errorMessages = result.error.issues.map(
             (e) => `${e.path.join('.')}: ${e.message}`
           );
           console.log(

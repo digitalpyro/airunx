@@ -96,13 +96,13 @@ type StageOutput =
 /**
  * Graph state for LangGraph
  */
-interface GraphState {
+type GraphState = {
   workflowId: string;
   currentStage: string;
   stageOutputs: Record<string, StageOutput>;
   shouldIterate: boolean;
   iterationTarget?: string;
-}
+};
 
 /**
  * Options for creating a LangGraphRunner

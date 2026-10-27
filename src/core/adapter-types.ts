@@ -106,8 +106,8 @@ export const BackendTypeSchema = z.enum(BACKEND_TYPES);
 
 export const SystemConfigSchema = z
   .object({
-    agent_routing: z.record(AgentRoleSchema, BackendTypeSchema),
-    backends: z.record(BackendTypeSchema, BackendConfigSchema),
+    agent_routing: z.partialRecord(AgentRoleSchema, BackendTypeSchema),
+    backends: z.partialRecord(BackendTypeSchema, BackendConfigSchema),
     fallback_backend: BackendTypeSchema,
     verify_on_start: z.boolean().optional(),
     cache_ttl_minutes: z.number().int().positive().optional(),

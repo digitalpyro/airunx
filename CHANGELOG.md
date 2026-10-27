@@ -16,10 +16,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking:** requires Node.js 20 or later (`@langchain/core` 1.x dropped Node 18). CI now tests Node 20, 22 and 24
+- Enum-keyed config maps (`agent_routing`, `backends`, fidelity `levels`) stay partial under zod 4 (`z.partialRecord`)
 - **`--backend` now overrides the provider of every agent**, including agents that set `provider` in AGENTS.md. Logs show `[cli-override]`. If the chosen backend is unavailable, the run fails instead of falling back to the AGENTS.md provider. A per-agent AGENTS.md model meant for a different provider is ignored, with an info log, so a Claude model is never passed to codex.
 - **Headless `claude` spawns no longer load your MCP servers.** Each spawn runs with `--strict-mcp-config` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`, so claude.ai connectors and `~/.claude.json` / `.mcp.json` servers are not loaded. Use the new `mcp_config` setting to give spawns specific servers.
 - `Iterations` in the run summary, `run --format json` metrics, run reports, PR and commit bodies, and heartbeat issue comments now counts the iterations actually run: 1 for a run accepted on the first pass. Reports written by older versions still hold the old count, which was one lower.
 - Ctrl-C detection: `run` now skips its own SIGINT to child CLIs only when it is the terminal's foreground process group, checked with `ps` when the signal arrives. If the check fails, it sends SIGINT.
+
+### Security
+
+- Cleared every `npm audit` finding (26 in the repo, 8 shipped to installs, 3 critical): upgraded `zod` 3 → 4, `@langchain/core` 0.3 → 1.x and `@langchain/langgraph` 0.2 → 1.x, and raised the floors for `handlebars`, `figlet`, `yaml` and `vitest`
 
 ### Fixed
 

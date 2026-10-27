@@ -3,7 +3,7 @@
 > Vendor-neutral Agent Orchestrator for developer workflows with LangGraph, AGENTS.md, and multi-agent pipelines
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node.js Version](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![CI](https://github.com/digitalpyro/airunx/actions/workflows/ci.yml/badge.svg)](https://github.com/digitalpyro/airunx/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/airunx)](https://www.npmjs.com/package/airunx)
 [![AIRunX Powered](https://img.shields.io/badge/AIRunX-Powered-black?style=flat-square&labelColor=1E3A8A)](https://github.com/digitalpyro/airunx)
@@ -407,7 +407,7 @@ airunx doctor
 
 **What it checks:**
 
-- Node.js version (>= 18.0.0 required)
+- Node.js version (>= 20.0.0 required)
 - Environment variables
 - Backend availability (Claude Code, Cursor, Codex)
 - GitHub CLI authentication
@@ -2054,7 +2054,7 @@ your-project/
 
 ### Prerequisites
 
-- **Node.js**: >= 18.0.0 (Node 20+ recommended — coverage requires `node:inspector/promises` which is unavailable on Node 18)
+- **Node.js**: >= 20.0.0
 - **npm**: >= 8.0.0
 
 ### Setup & Install

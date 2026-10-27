@@ -254,7 +254,7 @@ export function validatePipelinesConfig(filePath: string): ValidationResult {
   } catch (error) {
     let details: string[];
     if (error instanceof ZodError) {
-      details = error.errors.map((e) => `${e.path.join('.')}: ${e.message}`);
+      details = error.issues.map((e) => `${e.path.join('.')}: ${e.message}`);
     } else {
       details = [error instanceof Error ? error.message : String(error)];
     }
